@@ -1,20 +1,20 @@
-"""Custom exception hierarchy for llamacpp-tuner."""
+"""Custom exception hierarchy for lct."""
 
 
 class LlamaTunerError(Exception):
-    """Base exception for all llamacpp-tuner errors."""
+    """Base exception for all lct errors."""
 
     pass
 
 
 class HardwareNotDetectedError(LlamaTunerError):
-    """Hardware has not been detected. Run 'llamacpp-tuner setup' first."""
+    """Hardware has not been detected. Run 'lct setup' first."""
 
     pass
 
 
 class LlamaNotInstalledError(LlamaTunerError):
-    """llama.cpp is not installed. Run 'llamacpp-tuner setup' first."""
+    """llama.cpp is not installed. Run 'lct setup' first."""
 
     pass
 

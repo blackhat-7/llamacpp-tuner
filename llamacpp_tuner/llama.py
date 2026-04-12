@@ -279,7 +279,7 @@ def run_server(args: list[str]) -> None:
     binary = get_llama_binary()
     if not binary:
         print(
-            "llama.cpp not installed. Run 'llamacpp-tuner setup' first.",
+            "llama.cpp not installed. Run 'lct setup' first.",
             file=sys.stderr,
         )
         sys.exit(1)

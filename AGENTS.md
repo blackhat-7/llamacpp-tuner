@@ -133,7 +133,7 @@ def process_model(repo_id: str, quant: str) -> None:
 ```python
 # Good: Actionable
 raise HardwareNotDetectedError(
-    "Hardware not detected. Run 'llamacpp-tuner setup' first."
+    "Hardware not detected. Run 'lct setup' first."
 )
 
 # Bad: Vague

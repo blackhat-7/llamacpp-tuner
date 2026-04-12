@@ -8,6 +8,8 @@ import urllib.request
 from dataclasses import dataclass
 from typing import Any
 
+from rich.progress import Progress, SpinnerColumn, TextColumn, TimeElapsedColumn
+
 from llamacpp_tuner.cache import CACHE_DIR
 from llamacpp_tuner.llama import get_llama_binary
 
@@ -154,59 +156,77 @@ def benchmark_server(
         return ""
 
     try:
-        # Give the server a moment to start
-        time.sleep(0.5)
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            TimeElapsedColumn(),
+            transient=True,
+        ) as progress:
+            task = progress.add_task("Starting server...", total=None)
+            time.sleep(0.5)
 
-        # Read initial logs
-        initial_logs = _read_logs()
-        if initial_logs:
-            server_logs.append(initial_logs)
+            initial_logs = _read_logs()
+            if initial_logs:
+                server_logs.append(initial_logs)
 
-        if not _wait_for_server(url, timeout=60.0):
-            # Server failed to start, capture logs
-            remaining_logs = _read_logs()
-            if remaining_logs:
-                server_logs.append(remaining_logs)
+            progress.update(task, description="Waiting for server...")
+            if not _wait_for_server(url, timeout=60.0):
+                remaining_logs = _read_logs()
+                if remaining_logs:
+                    server_logs.append(remaining_logs)
 
-            print(
-                "\nBenchmark failed: Server failed to start within timeout.",
-                file=sys.stderr,
-            )
-            if server_logs:
-                print("\nServer logs:", file=sys.stderr)
-                print("-" * 60, file=sys.stderr)
-                print("".join(server_logs)[-2000:], file=sys.stderr)  # Last 2000 chars
-                print("-" * 60, file=sys.stderr)
-            return None
+                print(
+                    "\nBenchmark failed: Server failed to start within timeout.",
+                    file=sys.stderr,
+                )
+                if server_logs:
+                    print("\nServer logs:", file=sys.stderr)
+                    print("-" * 60, file=sys.stderr)
+                    print("".join(server_logs)[-2000:], file=sys.stderr)
+                    print("-" * 60, file=sys.stderr)
+                return None
 
-        # Warmup run
-        if warmup:
-            _send_completion(url, "Hello, this is a warmup.", max_tokens=32)
+            if warmup:
+                progress.update(task, description="Warming up...")
+                _send_completion(url, "Hello, this is a warmup.", max_tokens=32)
 
-        # Benchmark prompt processing (long prompt)
-        long_prompt = prompt * 10
-        prompt_start = time.time()
-        prompt_result = _send_completion(url, long_prompt, max_tokens=8)
-        prompt_end = time.time()
+            progress.update(task, description="Processing prompt...")
+            long_prompt = prompt * 10
+            prompt_start = time.time()
+            prompt_result = _send_completion(url, long_prompt, max_tokens=8)
+            prompt_end = time.time()
 
-        prompt_tokens = 0
-        prompt_time_ms = 0.0
-        if prompt_result and "usage" in prompt_result:
-            usage = prompt_result["usage"]
-            prompt_tokens = usage.get("prompt_tokens", 0)
-            prompt_time_ms = (prompt_end - prompt_start) * 1000
+            prompt_tokens = 0
+            prompt_time_ms = 0.0
+            if prompt_result and "usage" in prompt_result:
+                usage = prompt_result["usage"]
+                prompt_tokens = usage.get("prompt_tokens", 0)
+                prompt_time_ms = (prompt_end - prompt_start) * 1000
 
-        # Benchmark generation (short prompt, more tokens)
-        gen_start = time.time()
-        gen_result = _send_completion(url, prompt, max_tokens=max_tokens)
-        gen_end = time.time()
+            progress.update(task, description=f"Generating {max_tokens} tokens...")
+            gen_start = time.time()
+            gen_result = _send_completion(url, prompt, max_tokens=max_tokens)
+            gen_end = time.time()
 
         gen_tokens = 0
         gen_time_ms = 0.0
-        if gen_result and "usage" in gen_result:
-            usage = gen_result["usage"]
-            gen_tokens = usage.get("completion_tokens", 0)
-            gen_time_ms = (gen_end - gen_start) * 1000
+        if gen_result:
+            if "usage" in gen_result:
+                usage = gen_result["usage"]
+                gen_tokens = usage.get("completion_tokens", 0)
+                gen_time_ms = (gen_end - gen_start) * 1000
+            elif "error" in gen_result:
+                print(
+                    f"\nGeneration error: {gen_result.get('error', 'unknown')}",
+                    file=sys.stderr,
+                )
+            else:
+                print(
+                    f"\nWarning: unexpected response format: {list(gen_result.keys())}",
+                    file=sys.stderr,
+                )
+        else:
+            print("\nWarning: generation request returned no result", file=sys.stderr)
 
         total_time_ms = prompt_time_ms + gen_time_ms
 
@@ -215,7 +235,6 @@ def benchmark_server(
         )
         gen_tps = (gen_tokens / gen_time_ms * 1000) if gen_time_ms > 0 else 0
 
-        # Parse args into dict for storage
         args_dict: dict[str, Any] = {}
         i = 0
         while i < len(server_args):

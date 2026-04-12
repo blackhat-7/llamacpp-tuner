@@ -63,6 +63,106 @@ def _quant_to_pattern(quant: Quant) -> str:
     return mapping[quant]
 
 
+def find_mmproj_file(repo_id: str) -> str | None:
+    """Find mmproj file in a HuggingFace repo."""
+    try:
+        files = list_repo_files(repo_id)
+    except RepositoryNotFoundError:
+        return None
+
+    mmproj_files = [f for f in files if f.startswith("mmproj") and f.endswith(".gguf")]
+    if not mmproj_files:
+        return None
+
+    priority = ["f16", "bf16", "q8", "q6", "q5", "q4", "f32"]
+    for p in priority:
+        for f in mmproj_files:
+            if p in f.lower():
+                return f
+
+    return mmproj_files[0] if mmproj_files else None
+
+
+def download_mmproj(repo_id: str, force: bool = False) -> Path | None:
+    """Download mmproj file from HuggingFace repo."""
+    filename = find_mmproj_file(repo_id)
+    if not filename:
+        return None
+
+    models_dir = get_models_dir()
+    local_path = models_dir / filename
+
+    if local_path.exists() and not force:
+        expected_size = _get_expected_size(filename)
+        if expected_size and local_path.stat().st_size >= expected_size:
+            return local_path
+
+    file_size = _get_file_size(repo_id, filename)
+    if file_size:
+        _save_expected_size(filename, file_size)
+
+    size_str = _format_size(file_size) if file_size else "unknown size"
+    print(f"Downloading mmproj: {filename} ({size_str})...")
+
+    url = _get_download_url(repo_id, filename)
+
+    downloaded_size = 0
+    for attempt in range(MAX_RETRIES):
+        try:
+            downloaded_size = _download_with_progress(
+                url, local_path, file_size, filename
+            )
+
+            if file_size and downloaded_size < file_size:
+                print(
+                    f"\nDownload incomplete: {downloaded_size}/{file_size} bytes",
+                    file=sys.stderr,
+                )
+                if attempt < MAX_RETRIES - 1:
+                    print(
+                        f"Retrying in {RETRY_DELAY} seconds... (attempt {attempt + 2}/{MAX_RETRIES})"
+                    )
+                    import time
+
+                    time.sleep(RETRY_DELAY)
+                    continue
+                else:
+                    print("Max retries reached. Download incomplete.", file=sys.stderr)
+                    return None
+            break
+        except requests.exceptions.RequestException as e:
+            if local_path.exists():
+                local_path.unlink()
+            if attempt < MAX_RETRIES - 1:
+                print(f"Download error: {e}", file=sys.stderr)
+                print(
+                    f"Retrying in {RETRY_DELAY} seconds... (attempt {attempt + 2}/{MAX_RETRIES})"
+                )
+                import time
+
+                time.sleep(RETRY_DELAY)
+            else:
+                print(
+                    f"Download failed after {MAX_RETRIES} attempts: {e}",
+                    file=sys.stderr,
+                )
+                return None
+
+    return local_path
+
+
+def get_mmproj_path(repo_id: str) -> Path | None:
+    """Get path to downloaded mmproj file."""
+    filename = find_mmproj_file(repo_id)
+    if not filename:
+        return None
+    models_dir = get_models_dir()
+    local_path = models_dir / filename
+    if local_path.exists():
+        return local_path
+    return None
+
+
 def find_gguf_file(repo_id: str, quant: Quant) -> str | None:
     pattern = _quant_to_pattern(quant)
 

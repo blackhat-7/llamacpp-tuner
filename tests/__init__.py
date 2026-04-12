@@ -1,1 +1,1 @@
-"""Tests for llamacpp-tuner."""
+"""Tests for lct."""

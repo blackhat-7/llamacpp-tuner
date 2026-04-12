@@ -22,9 +22,7 @@ def validate_hardware_cache() -> HardwareProfile:
     """
     cached = load_cache("hardware")
     if not cached:
-        raise HardwareNotDetectedError(
-            "Hardware not detected. Run 'llamacpp-tuner setup' first."
-        )
+        raise HardwareNotDetectedError("Hardware not detected. Run 'lct setup' first.")
     return HardwareProfile.from_dict(cached)
 
 
@@ -35,14 +33,10 @@ def validate_llama_installed() -> Path:
         LlamaNotInstalledError: If llama.cpp is not installed
     """
     if not is_llama_installed():
-        raise LlamaNotInstalledError(
-            "llama.cpp not installed. Run 'llamacpp-tuner setup' first."
-        )
+        raise LlamaNotInstalledError("llama.cpp not installed. Run 'lct setup' first.")
     binary = get_llama_binary()
     if not binary:
-        raise LlamaNotInstalledError(
-            "llama.cpp not installed. Run 'llamacpp-tuner setup' first."
-        )
+        raise LlamaNotInstalledError("llama.cpp not installed. Run 'lct setup' first.")
     return binary
 
 

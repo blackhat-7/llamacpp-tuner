@@ -1,4 +1,4 @@
-# llamacpp-tuner
+# lct
 
 Auto-optimize llama.cpp parameters for your hardware.
 
@@ -6,19 +6,19 @@ Auto-optimize llama.cpp parameters for your hardware.
 
 ```bash
 # Setup (detect hardware + install llama.cpp)
-uv run llamacpp-tuner setup
+uv run lct setup
 
 # Download a model
-uv run llamacpp-tuner pull bartowski/Qwen2.5-0.5B-Instruct-GGUF
+uv run lct pull bartowski/Qwen2.5-0.5B-Instruct-GGUF
 
 # Benchmark default args
-uv run llamacpp-tuner benchmark bartowski/Qwen2.5-0.5B-Instruct-GGUF
+uv run lct benchmark bartowski/Qwen2.5-0.5B-Instruct-GGUF
 
 # Benchmark optimized args
-uv run llamacpp-tuner benchmark bartowski/Qwen2.5-0.5B-Instruct-GGUF --args optimal
+uv run lct benchmark bartowski/Qwen2.5-0.5B-Instruct-GGUF --args optimal
 
 # Run server
-uv run llamacpp-tuner serve bartowski/Qwen2.5-0.5B-Instruct-GGUF --ctx 4096
+uv run lct serve bartowski/Qwen2.5-0.5B-Instruct-GGUF --ctx 4096
 ```
 
 ## Commands
@@ -38,15 +38,14 @@ uv run llamacpp-tuner serve bartowski/Qwen2.5-0.5B-Instruct-GGUF --ctx 4096
 
 ```bash
 # 1. Benchmark baseline
-uv run llamacpp-tuner benchmark unsloth/Phi-4-GGUF --quant Q4_K_M
+uv run lct benchmark unsloth/Phi-4-GGUF --quant Q4_K_M
 
 # 2. See optimized args
-uv run llamacpp-tuner args unsloth/Phi-4-GGUF --quant Q4_K_M --ctx 8192
+uv run lct args unsloth/Phi-4-GGUF --quant Q4_K_M --ctx 8192
 
 # 3. Benchmark optimized
-uv run llamacpp-tuner benchmark unsloth/Phi-4-GGUF --quant Q4_K_M --args optimal
+uv run lct benchmark unsloth/Phi-4-GGUF --quant Q4_K_M --args optimal
 
 # 4. Run server
-uv run llamacpp-tuner serve unsloth/Phi-4-GGUF --quant Q4_K_M --port 8080
+uv run lct serve unsloth/Phi-4-GGUF --quant Q4_K_M --port 8080
 ```
-# llamacpp-tuner

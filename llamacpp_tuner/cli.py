@@ -1,4 +1,4 @@
-"""CLI commands for llamacpp-tuner."""
+"""CLI commands for lct."""
 
 import sys
 
@@ -17,7 +17,9 @@ from llamacpp_tuner.constants import (
     DEFAULT_QUANT,
 )
 from llamacpp_tuner.downloader import (
+    download_mmproj,
     download_model,
+    get_mmproj_path,
     list_downloaded_models,
     list_invalid_models,
     list_valid_models,
@@ -61,7 +63,7 @@ def main() -> None:
 
 @main.command()
 def setup() -> None:
-    """Setup llamacpp-tuner: detect hardware and install llama.cpp."""
+    """Setup lct: detect hardware and install llama.cpp."""
     from llamacpp_tuner.hardware import detect_hardware
 
     print("Detecting hardware...")
@@ -124,15 +126,24 @@ def setup() -> None:
 )
 @click.option("--force", "-f", is_flag=True, help="Re-download if already exists")
 def pull(repo_id: str, quant: str, force: bool) -> None:
-    """Download a model from HuggingFace Hub."""
+    """Download a model (and mmproj if available) from HuggingFace Hub."""
     print(f"Looking for {quant} in {repo_id}...")
     path = download_model(repo_id, quant, force=force)  # type: ignore[arg-type]
 
-    if path:
-        print(f"Downloaded to: {path}")
-    else:
+    if not path:
         print(f"Could not find {quant} in {repo_id}", file=sys.stderr)
         sys.exit(1)
+
+    if force or not path.exists():
+        print(f"Model downloaded: {path}")
+    else:
+        print(f"Model already exists: {path}")
+
+    mmproj_path = get_mmproj_path(repo_id)
+    if mmproj_path and not force:
+        print(f"mmproj already exists: {mmproj_path}")
+    elif mmproj_path := download_mmproj(repo_id, force=force):
+        print(f"mmproj downloaded: {mmproj_path}")
 
 
 @main.command()
@@ -169,9 +180,17 @@ def args(repo_id: str, quant: str, ctx: int) -> None:
     print("Optimal arguments:")
     print(format_args(optimal))
     print("")
+
+    mmproj_path = get_mmproj_path(repo_id)
+    if mmproj_path:
+        print(f"Multimodal: {mmproj_path}")
+        print("")
+
     print("Full command:")
     cmd_args = optimal.to_list(str(model_path))
     cmd_args.extend(["--host", DEFAULT_HOST, "--port", str(DEFAULT_PORT)])
+    if mmproj_path:
+        cmd_args.extend(["--mmproj", str(mmproj_path)])
     print(f"llama-server {' '.join(cmd_args)}")
 
     if warnings:
@@ -205,8 +224,27 @@ def args(repo_id: str, quant: str, ctx: int) -> None:
     default="",
     help="Extra args to pass to llama-server (e.g., '--no-prefill-assistant')",
 )
+@click.option(
+    "--no-mmproj",
+    is_flag=True,
+    default=False,
+    help="Disable multimodal support (don't use mmproj)",
+)
+@click.option(
+    "--no-mmproj-offload",
+    is_flag=True,
+    default=False,
+    help="Disable GPU offloading for mmproj",
+)
 def serve(
-    repo_id: str, quant: str, ctx: int, port: int, host: str, extra_args: str
+    repo_id: str,
+    quant: str,
+    ctx: int,
+    port: int,
+    host: str,
+    extra_args: str,
+    no_mmproj: bool,
+    no_mmproj_offload: bool,
 ) -> None:
     """Run llama.cpp server with optimal arguments."""
     try:
@@ -231,6 +269,20 @@ def serve(
 
     cmd_args = optimal.to_list(str(model_path))
     cmd_args.extend(["--host", host, "--port", str(port)])
+
+    mmproj_path = None
+    if not no_mmproj:
+        mmproj_path = get_mmproj_path(repo_id)
+        if not mmproj_path:
+            mmproj_path = download_mmproj(repo_id)
+        if mmproj_path:
+            cmd_args.extend(["--mmproj", str(mmproj_path)])
+            print(f"Multimodal: {mmproj_path}")
+    else:
+        print("Multimodal: disabled")
+
+    if mmproj_path and no_mmproj_offload:
+        cmd_args.append("--no-mmproj-offload")
 
     if extra_args:
         cmd_args.extend(extra_args.split())
@@ -450,7 +502,7 @@ def models() -> None:
             size_kb = m.stat().st_size / 1024
             print(f"  {m.name} ({size_kb:.1f} KB) - incomplete")
         print("")
-        print("Run 'llamacpp-tuner clean' to remove incomplete models.")
+        print("Run 'lct clean' to remove incomplete models.")
 
 
 @main.command()
@@ -493,7 +545,7 @@ def status() -> None:
         print("Cached hardware profile:")
         print(format_hardware(hardware))
     else:
-        print("No hardware profile cached. Run 'llamacpp-tuner setup'.")
+        print("No hardware profile cached. Run 'lct setup'.")
 
     print("")
 
@@ -510,7 +562,9 @@ def status() -> None:
         print(f"Downloaded models: {len(downloaded)}")
         for m in downloaded:
             size_mb = m.stat().st_size / (1024 * 1024)
-            print(f"  - {m.name} ({size_mb:.1f} MB)")
+            is_mmproj = "mmproj" in m.name.lower()
+            mmproj_tag = " [mmproj]" if is_mmproj else ""
+            print(f"  - {m.name} ({size_mb:.1f} MB){mmproj_tag}")
     else:
         print("No models downloaded.")
 
