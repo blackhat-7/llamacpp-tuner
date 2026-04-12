@@ -58,6 +58,9 @@ class TestOptimalArgsToList:
             numa=False,
             cache_type_k="f16",
             cache_type_v="f16",
+            flash_attn="auto",
+            batch_size=None,
+            ubatch_size=None,
         )
         result = args.to_list("/path/to/model.gguf")
 

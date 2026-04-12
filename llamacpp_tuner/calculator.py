@@ -18,8 +18,22 @@ from llamacpp_tuner.constants import (
     VRAM_HEADROOM_FACTOR,
     VRAM_USAGE_FACTOR,
 )
+
 from llamacpp_tuner.hardware import HardwareProfile
 from llamacpp_tuner.types import Quant
+
+# KV cache bytes per element by type (relative to f16 = 2 bytes)
+KV_BYTES: dict[str, float] = {
+    "f32": 4.0,
+    "f16": 2.0,
+    "bf16": 2.0,
+    "q8_0": 1.0,
+    "q4_0": 0.5,
+    "q4_1": 0.5,
+    "q5_0": 0.625,
+    "q5_1": 0.625,
+    "iq4_nl": 0.5,
+}
 
 BYTES_PER_PARAM: dict[Quant, float] = {
     "Q4_K_M": BYTES_PER_PARAM_Q4_K_M,
@@ -79,6 +93,9 @@ class OptimalArgs:
     numa: bool
     cache_type_k: str
     cache_type_v: str
+    flash_attn: str  # "on", "off", or "auto"
+    batch_size: int | None  # None = use llama.cpp default
+    ubatch_size: int | None  # None = use llama.cpp default
 
     def to_list(self, model_path: str) -> list[str]:
         """Convert to llama-server command-line arguments."""
@@ -103,10 +120,18 @@ class OptimalArgs:
         if self.split_mode != "layer":
             args.extend(["--split-mode", self.split_mode])
 
+        if self.flash_attn != "auto":
+            args.extend(["-fa", self.flash_attn])
+
         if self.cache_type_k != "f16":
             args.extend(["-ctk", self.cache_type_k])
         if self.cache_type_v != "f16":
             args.extend(["-ctv", self.cache_type_v])
+
+        if self.batch_size is not None:
+            args.extend(["-b", str(self.batch_size)])
+        if self.ubatch_size is not None:
+            args.extend(["-ub", str(self.ubatch_size)])
 
         if self.mlock:
             args.append("--mlock")
@@ -153,12 +178,19 @@ def _estimate_layers(model_name: str) -> int:
 
 
 def _estimate_vram_usage(
-    params_b: float, quant: Quant, ctx_size: int, layers: int
+    params_b: float,
+    quant: Quant,
+    ctx_size: int,
+    layers: int,
+    cache_type_k: str = "f16",
+    cache_type_v: str = "f16",
 ) -> float:
     """Estimate VRAM usage in MB."""
     model_size = params_b * 1_000_000_000 * BYTES_PER_PARAM[quant] / (1024 * 1024)
-    # KV cache: 2 (K+V) * layers * ctx * 128 (head_dim) * 2 (bytes per fp16)
-    kv_cache = 2 * layers * ctx_size * 128 * 2 / (1024 * 1024)
+    # KV cache: 2 (K+V) * layers * ctx * 128 (head_dim) * bytes_per_element
+    kv_bytes_k = KV_BYTES.get(cache_type_k, 2.0)
+    kv_bytes_v = KV_BYTES.get(cache_type_v, 2.0)
+    kv_cache = layers * ctx_size * 128 * (kv_bytes_k + kv_bytes_v) / (1024 * 1024)
     # Add overhead for activations, buffers (estimate 10%)
     overhead = model_size * 0.1
     return model_size + kv_cache + overhead
@@ -183,11 +215,37 @@ def calculate_optimal_args(
     total_vram = sum(g.vram_mb for g in hardware.gpus) if hardware.gpus else 0
     has_gpu = llama_has_gpu and total_vram > 0 and hardware.backend == "cuda"
 
-    estimated = _estimate_vram_usage(params, quant, ctx_size, n_layers)
-    model_size_mb = params * 1_000_000_000 * BYTES_PER_PARAM[quant] / (1024 * 1024)
-
     n_gpu_layers = 0
+
+    mlock = False
+    mmap = True
+    tensor_split = None
+    split_mode = "layer"
+    numa = hardware.cpu_cores > NUMA_CORE_THRESHOLD and not has_gpu
+
+    # KV cache quantization: q8_0 on GPU (no quality loss, ~50% VRAM savings)
     if has_gpu:
+        cache_type_k = "q8_0"
+        cache_type_v = "q8_0"
+    else:
+        cache_type_k = "f16"
+        cache_type_v = "f16"
+
+    # Flash attention: explicit on GPU (guarantees it; also required for KV quant)
+    flash_attn = "on" if has_gpu else "auto"
+
+    # Batch sizes: only override for CPU (GPU defaults of 2048/512 are fine)
+    batch_size: int | None = None
+    ubatch_size: int | None = None
+    if not has_gpu:
+        batch_size = BATCH_SIZE_CPU
+        ubatch_size = UBATCH_SIZE_CPU
+
+    # Re-check VRAM fit with actual KV cache quantization applied
+    if has_gpu:
+        estimated = _estimate_vram_usage(
+            params, quant, ctx_size, n_layers, cache_type_k, cache_type_v
+        )
         usable_vram = total_vram * VRAM_USAGE_FACTOR
         if estimated <= usable_vram:
             n_gpu_layers = -1
@@ -198,19 +256,10 @@ def calculate_optimal_args(
                 f"Using auto GPU layer offloading."
             )
 
-    mlock = False
-    mmap = True
-    tensor_split = None
-    split_mode = "layer"
-    cache_type_k = "f16"
-    cache_type_v = "f16"
-
     if has_gpu and len(hardware.gpus) > 1:
         ratios = [g.vram_mb / total_vram for g in hardware.gpus]
         tensor_split = ",".join(f"{r:.2f}" for r in ratios)
         split_mode = "row"
-
-    numa = hardware.cpu_cores > NUMA_CORE_THRESHOLD and not has_gpu
 
     args = OptimalArgs(
         ctx_size=ctx_size,
@@ -222,6 +271,9 @@ def calculate_optimal_args(
         numa=numa,
         cache_type_k=cache_type_k,
         cache_type_v=cache_type_v,
+        flash_attn=flash_attn,
+        batch_size=batch_size,
+        ubatch_size=ubatch_size,
     )
 
     return args, warnings
@@ -239,9 +291,12 @@ def format_args(args: OptimalArgs) -> str:
     lines = [
         f"Context size: {args.ctx_size}",
         f"GPU layers: {gpu_layers_str}",
+        f"Flash attention: {args.flash_attn}",
         f"KV cache (K): {args.cache_type_k}",
         f"KV cache (V): {args.cache_type_v}",
     ]
+    if args.batch_size is not None:
+        lines.append(f"Batch size: {args.batch_size} / {args.ubatch_size}")
     if args.tensor_split:
         lines.append(f"Tensor split: {args.tensor_split}")
     if args.split_mode != "layer":
