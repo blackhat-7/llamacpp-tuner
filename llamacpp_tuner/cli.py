@@ -236,6 +236,13 @@ def args(repo_id: str, quant: str, ctx: int) -> None:
     default=False,
     help="Disable GPU offloading for mmproj",
 )
+@click.option(
+    "--default",
+    "use_default",
+    is_flag=True,
+    default=False,
+    help="Use llama.cpp default args instead of optimized args",
+)
 def serve(
     repo_id: str,
     quant: str,
@@ -245,6 +252,7 @@ def serve(
     extra_args: str,
     no_mmproj: bool,
     no_mmproj_offload: bool,
+    use_default: bool,
 ) -> None:
     """Run llama.cpp server with optimal arguments."""
     try:
@@ -254,20 +262,25 @@ def serve(
     except (LlamaNotInstalledError, HardwareNotDetectedError, ModelNotFoundError) as e:
         _handle_error(e)
 
-    optimal, warnings = calculate_optimal_args(
-        hardware=hardware,
-        model_name=repo_id,
-        quant=quant,  # type: ignore[arg-type]
-        ctx_size=ctx,
-        llama_has_gpu=llama_has_gpu_support(),
-    )
+    if use_default:
+        print("Using default llama.cpp arguments")
+        cmd_args = ["-m", str(model_path), "-c", str(ctx)]
+    else:
+        optimal, warnings = calculate_optimal_args(
+            hardware=hardware,
+            model_name=repo_id,
+            quant=quant,  # type: ignore[arg-type]
+            ctx_size=ctx,
+            llama_has_gpu=llama_has_gpu_support(),
+        )
 
-    if warnings:
-        for w in warnings:
-            click.echo(click.style(f"Warning: {w}", fg="yellow"))
-        print("")
+        if warnings:
+            for w in warnings:
+                click.echo(click.style(f"Warning: {w}", fg="yellow"))
+            print("")
 
-    cmd_args = optimal.to_list(str(model_path))
+        cmd_args = optimal.to_list(str(model_path))
+
     cmd_args.extend(["--host", host, "--port", str(port)])
 
     mmproj_path = None

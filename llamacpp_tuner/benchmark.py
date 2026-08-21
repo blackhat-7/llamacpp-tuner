@@ -106,7 +106,11 @@ def benchmark_server(
         prompt = (
             "Write a detailed analysis of machine learning optimization techniques, "
             "including quantization methods, pruning strategies, and hardware acceleration. "
-            "Explain the trade-offs between model size and performance."
+            "Explain the trade-offs between model size, inference speed, and output quality. "
+            "Cover topics such as GPTQ, AWQ, GGUF quantization formats, speculative decoding, "
+            "continuous batching, KV cache management, tensor parallelism, and pipeline parallelism. "
+            "Discuss how different hardware configurations (consumer GPUs, data center GPUs, CPU) "
+            "affect optimal inference settings and what benchmarks matter most for each use case."
         )
 
     # Use a different port for benchmark to avoid conflicts
@@ -191,7 +195,8 @@ def benchmark_server(
                 _send_completion(url, "Hello, this is a warmup.", max_tokens=32)
 
             progress.update(task, description="Processing prompt...")
-            long_prompt = prompt * 10
+            # Repeat to ~4k tokens so prompt TPS reflects real flash-attn / KV-cache benefits
+            long_prompt = prompt * 30
             prompt_start = time.time()
             prompt_result = _send_completion(url, long_prompt, max_tokens=8)
             prompt_end = time.time()

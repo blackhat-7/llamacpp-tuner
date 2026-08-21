@@ -61,6 +61,7 @@ class TestOptimalArgsToList:
             flash_attn="auto",
             batch_size=None,
             ubatch_size=None,
+            poll=None,
         )
         result = args.to_list("/path/to/model.gguf")
 

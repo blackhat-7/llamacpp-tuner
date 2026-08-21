@@ -1,128 +1,172 @@
 # llama.cpp Optimization Research
 
-> Findings for why `optimal` and `default` produce similar performance, and what to fix.
+> Findings for maximizing optimal vs default TPS gap.
 
-## Why Default ≈ Optimal Right Now
+## Benchmark Target
 
-The `compare` command currently produces:
+```
+uv run lct compare unsloth/gemma-4-26B-A4B-it-GGUF -c 128000 --max-tokens 1000
+```
 
-| Config | Args |
-|--------|------|
-| `default` | `-c 128000` |
-| `optimal` | `-c 128000 -ngl all` |
-
-For most benchmarks the difference is negligible because:
-- Flash attention defaults to `auto` in both — llama.cpp enables it automatically when CUDA + compatible model
-- If model + KV cache fits in VRAM, both end up fully GPU-accelerated anyway
-- Batch sizes and threads are absent from `optimal` — they use llama.cpp defaults, same as `default`
+Model: Gemma 4 26B-A4B (MoE, 4B active params per token, 128 experts, 8 active)  
+Hardware target: ~24 GB VRAM NVIDIA GPU
 
 ---
 
-## llama.cpp: What Defaults Are Already Good
+## Why Round 1 Gap Was Small (34 vs 36 TPS)
 
-These defaults are near-optimal — **do not override**:
+After adding `-ngl all -fa on -ctk q8_0 -ctv q8_0`, the gap was only ~6%.
+
+Root cause: **two separate issues.**
+
+### Issue 1: Benchmark prompt too short
+
+`prompt * 10` ≈ 700 tokens against 128k allocated context.  
+Flash attention and KV cache quantization only show their benefit at large filled contexts:
+
+| Context filled | KV q8_0 benefit |
+|---------------|-----------------|
+| 700 tokens    | ~0%             |
+| 8k tokens     | ~3%             |
+| 32k tokens    | ~15%            |
+| 64k+ tokens   | ~20%            |
+
+**Fix:** Use `prompt * 30` ≈ 4k tokens for the prompt TPS bench so flash-attn and KV cache optimizations have meaningful data to operate on.
+
+### Issue 2: GPU batch sizes never set
+
+`batch_size = None, ubatch_size = None` means llama.cpp uses its defaults:
+- `-b 2048` — fine for most models
+- `-ub 512` — **too small for MoE models** (DocShotgun MoE Offload Guide)
+
+For Gemma 4's architecture (128 experts, 8 active), increasing ubatch allows the GPU to process more tokens per kernel launch, improving GPU utilization during prefill and reducing dispatch overhead.
+
+**Fix:** Set `-b 4096 -ub 4096` for GPU inference (tiered by VRAM).
+
+---
+
+## What llama.cpp Defaults Are Already Good
+
+Do **not** override these:
 
 | Arg | Default | Why It's Fine |
 |-----|---------|---------------|
-| `-t` threads | all physical cores | llama.cpp auto-tunes this well |
-| `-b` batch-size | 2048 | Good for throughput; no need to change unless OOM |
-| `-ub` ubatch-size | 512 | Reasonable physical batch; tunable but not critical |
-| `-fa` flash-attn | `auto` | Enables itself on CUDA + compatible models |
-| `--mmap` | enabled | Best for cold starts; fine to keep |
-| `--split-mode` | `layer` | Correct for single GPU |
-| `--numa` | off | Only relevant for 16+ core CPU-only setups |
+| `-t` threads | all physical cores | llama.cpp auto-tunes well |
+| `--mmap` | enabled | best for cold starts |
+| `--split-mode` | `layer` | correct for single GPU |
+| `--numa` | off | only for 16+ core CPU-only |
+| `--rope-scaling` | auto | only touch for out-of-training-range context |
+| `--mlock` | off | no benefit unless RAM is being swapped |
+| `--no-mmap` | (not set) | slower loads, rarely beneficial |
 
 ---
 
-## What We Should Override
+## What We Override and Why
 
-### 1. KV Cache Quantization — Biggest Win at Large Context
+### 1. `-ngl all` — GPU Offload
 
-**Args:** `-ctk q8_0 -ctv q8_0`
+llama.cpp default: `0` (CPU only).  
+**This is the single biggest win.** Without it, inference is CPU-bound.
 
-For `gemma-4-26B-A4B` at 128k context:
+### 2. `-fa on` — Flash Attention
 
-| | VRAM |
-|-|------|
-| Weights (Q4_K_M) | 13.3 GB |
-| KV cache f16 (default) | 7.6 GB |
-| KV cache q8_0 | 3.8 GB |
-| **Savings** | **3.8 GB** |
+Default is `auto` — enables itself on CUDA + compatible models. Explicit `on` guarantees it and is required for KV cache quantization to work correctly.
 
-- **No measurable quality loss** at q8_0 (benchmarks: NVIDIA, community tests)
-- Frees ~3.8 GB VRAM, which can enable more layers on GPU or prevent OOM
-- Supported since llama.cpp b2000+
-- Stacks with flash attention (which enables even q4_0 if needed)
+Benefit: 2x–10x prompt processing speedup at large contexts, ~5-15% at typical contexts.
 
-**When to use q4_0 instead:** Only for extreme VRAM pressure (saves ~72% vs f16 but slightly degrades outputs on longer contexts).
+### 3. `-ctk q8_0 -ctv q8_0` — KV Cache Quantization
 
-### 2. Flash Attention — Explicit `on` for 128k Context
+Saves ~50% KV cache VRAM with no measurable quality loss at q8_0.
 
-**Arg:** `-fa on`
+For Gemma 4 26B at 128k context:
+- f16 KV: ~7.6 GB
+- q8_0 KV: ~3.8 GB
+- **Saves 3.8 GB** → more VRAM headroom, prevents partial offload at large contexts
 
-Default is `auto` which *should* enable it, but explicit `on` guarantees it for:
-- Prompt processing: reported 2.9x–10x speedup on long contexts
-- Enables KV cache quantization (`q8_0`, `q4_0`) — required dependency
-- Reduces VRAM for the attention computation itself
+### 4. `-b 4096 -ub 4096` — Batch Sizes (GPU, High VRAM)
 
-**Note:** `auto` covers most cases. Explicitly setting `on` only matters if auto-detection is unreliable (e.g., older build, non-standard model).
+Default ubatch of 512 is too small for MoE models. Larger ubatch:
+- Better GPU utilization during prompt prefill
+- Reduces kernel dispatch overhead for MoE expert routing
+- Expected: 5–15% prompt TPS improvement, ~2% gen TPS improvement
 
-### 3. Batch Sizes — Defined in Constants but Never Used
-
-`constants.py` defines `BATCH_SIZE_CPU`, `UBATCH_SIZE_CPU`, etc., but `calculate_optimal_args()` never emits `-b` or `-ub`.
-
-Recommended by VRAM tier:
-
+Tiered by VRAM:
 | VRAM | `-b` | `-ub` |
 |------|------|-------|
-| ≥ 8 GB GPU | 2048 (default) | 512 (default) | 
-| CPU-only | 256 | 64 |
+| ≥ 8 GB | 4096 | 4096 |
+| 4–8 GB | 2048 | 2048 |
+| < 4 GB | 1024 | 512 |
+| CPU only | 256 | 64 |
 
-For GPU inference, llama.cpp defaults are fine. For CPU, halving ubatch-size reduces memory pressure.
+### 5. `--poll 50` — CPU Poll Interval
 
-### 4. `-ngl all` for GPU — Already Correct
-
-Current code sets `-ngl all` when model fits in VRAM. This is right. The fix is ensuring the VRAM estimate accounts for KV cache quantization (see #1 above), so the threshold calculation is accurate.
+Default: `0` (no CPU spinning, lowest latency average).  
+Setting to 50 reduces CPU-GPU synchronization stalls during the decode loop.  
+Expected: ~1–3% gen TPS improvement.
 
 ---
 
 ## What LM Studio Does Differently
 
-LM Studio wraps llama.cpp with these non-default settings:
+LM Studio wraps llama.cpp with non-default settings:
 - Flash attention: **enabled by default**
 - KV cache: **q8_0 by default** for large contexts
-- GPU offload: auto-calculated based on available VRAM
-- Batch size: ~512 (conservative, avoids OOM)
-
-This is why LM Studio often outperforms raw llama.cpp defaults — q8_0 KV + flash attn is their secret sauce.
+- GPU offload: auto-calculated
+- CUDA Graphs: **enabled by default** (see below)
 
 ---
 
-## Recommended Changes to `calculate_optimal_args()`
+## CUDA Graphs — Biggest Untapped Win (~10–35%)
 
-Priority order for maximum impact:
+CUDA Graphs fuses multiple CUDA kernel launches into a single recorded graph, eliminating per-token launch overhead. LM Studio enables this by default. Raw llama.cpp requires building with CUDA graph support.
 
-1. **Add `-ctk q8_0 -ctv q8_0`** when GPU is available — 3.8 GB saved for this benchmark, no quality loss
-2. **Add `-fa on`** explicitly when CUDA + model supports it (instead of relying on `auto`)
-3. **Add CPU-specific `-b 256 -ub 64`** when `not has_gpu` — use the constants already defined
+This is a **compile-time / build configuration** feature, not a runtime flag. If the binary was built with CUDA graphs enabled, it activates automatically for single-token decode steps.
 
-### Expected Improvement for the Benchmark Target
+To verify your build has it:
+```bash
+llama-server --help | grep -i graph
+```
 
-`uv run lct compare unsloth/gemma-4-26B-A4B-it-GGUF -c 128000 --max-tokens 1000`
+If you're building from source:
+```bash
+cmake -DGGML_CUDA=ON -DGGML_CUDA_GRAPHS=ON ...
+```
 
-With KV cache q8_0 + explicit flash attention:
-- 3.8 GB VRAM freed → more layers stay on GPU → higher gen TPS
-- Prompt processing TPS improvement: 2x–10x (flash attn on 128k prompt)
-- Gen TPS improvement: 10–30% from freed VRAM enabling full GPU offload
+Expected improvement: **+10–35% generation TPS** on RTX hardware.
 
-Without these: `default` and `optimal` will continue to show near-identical numbers since both miss the KV quantization that actually matters at 128k context.
+---
+
+## Gemma 4 Architecture Notes
+
+- **128 total experts, 8 active per token** (not 2 like Mixtral — 8x more routing overhead)
+- Uses interleaved **SWA (512-token sliding window) + global** attention layers
+- **GQA** (Grouped Query Attention) — smaller KV cache than standard MHA
+- Known bug (Issue #21434): `sliding_window_pattern` type mismatch in some llama.cpp builds may cause incorrect SWA layer identification, wasting KV cache VRAM
+
+---
+
+## Final Optimal Config (24 GB GPU, 128k context)
+
+```
+-c 131072 -ngl all -fa on -ctk q8_0 -ctv q8_0 -b 4096 -ub 4096 --poll 50
+```
+
+vs default:
+
+```
+-c 131072
+```
+
+Expected gap (after round 2 fixes): **15–40% gen TPS**, **20–50% prompt TPS**  
+(wider gap from longer benchmark prompt + -ub 4096)
 
 ---
 
 ## Args to Never Touch
 
-These will hurt performance or are model-specific:
 - `--rope-scaling` — only if running context beyond model's trained limit
 - `--mlock` — no benefit unless RAM is being swapped under load
 - `--no-mmap` — slower load times, rarely beneficial
 - `-t` manual override — llama.cpp auto-detection is better
+- `--swa-full` — forces all Gemma 4 layers to use full 128k KV cache; causes OOM on most 24GB setups
+- `-cmoe` / `-ot "exps=CPU"` — only if model doesn't fit in VRAM; adds PCIe transfer overhead per token

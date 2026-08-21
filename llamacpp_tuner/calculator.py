@@ -4,18 +4,23 @@ import re
 from dataclasses import dataclass
 
 from llamacpp_tuner.constants import (
-    BATCH_SIZE_CPU,
+    BATCH_SIZE_HIGH_VRAM,
+    BATCH_SIZE_LOW_VRAM,
+    BATCH_SIZE_MED_VRAM,
     BYTES_PER_PARAM_IQ4_XS,
     BYTES_PER_PARAM_Q4_K_M,
     BYTES_PER_PARAM_Q4_K_S,
     BYTES_PER_PARAM_Q5_K_M,
     BYTES_PER_PARAM_Q5_K_S,
     BYTES_PER_PARAM_Q8_0,
+    HIGH_VRAM_THRESHOLD_MB,
+    MED_VRAM_THRESHOLD_MB,
     NUMA_CORE_THRESHOLD,
-    RAM_MODEL_LOCK_FACTOR,
-    RAM_MODEL_MMAP_FACTOR,
-    UBATCH_SIZE_CPU,
-    VRAM_HEADROOM_FACTOR,
+    PARTIAL_OFFLOAD_FIXED_VRAM_MB,
+    POLL_GPU,
+    UBATCH_SIZE_HIGH_VRAM,
+    UBATCH_SIZE_LOW_VRAM,
+    UBATCH_SIZE_MED_VRAM,
     VRAM_USAGE_FACTOR,
 )
 
@@ -73,6 +78,7 @@ MODEL_LAYERS: dict[str, int] = {
     "8b": 32,
     "9b": 48,
     "14b": 48,
+    "26b": 30,
     "27b": 48,
     "32b": 64,
     "35b": 64,
@@ -96,6 +102,7 @@ class OptimalArgs:
     flash_attn: str  # "on", "off", or "auto"
     batch_size: int | None  # None = use llama.cpp default
     ubatch_size: int | None  # None = use llama.cpp default
+    poll: int | None  # CPU poll interval for GPU sync (ms); None = default (0)
 
     def to_list(self, model_path: str) -> list[str]:
         """Convert to llama-server command-line arguments."""
@@ -133,6 +140,9 @@ class OptimalArgs:
         if self.ubatch_size is not None:
             args.extend(["-ub", str(self.ubatch_size)])
 
+        if self.poll is not None:
+            args.extend(["--poll", str(self.poll)])
+
         if self.mlock:
             args.append("--mlock")
         if not self.mmap:
@@ -159,15 +169,17 @@ def _estimate_params(model_name: str) -> float:
 
 
 def _estimate_layers(model_name: str) -> int:
-    lowered = model_name.lower()
-    # Sort keys by length descending to match longer patterns first
-    for key, value in sorted(
-        MODEL_LAYERS.items(), key=lambda x: len(x[0]), reverse=True
-    ):
-        if key in lowered:
-            return value
-    # Default based on param count
+    # Base on param count (avoids false substring matches like "4b" inside "A4B")
     params = _estimate_params(model_name)
+    # Find exact match in MODEL_LAYERS by value
+    key = f"{int(params)}b" if params == int(params) else f"{params}b"
+    if key in MODEL_LAYERS:
+        return MODEL_LAYERS[key]
+    # Closest key by parameter count
+    closest = min(MODEL_LAYERS.keys(), key=lambda k: abs(float(k[:-1]) - params))
+    if abs(float(closest[:-1]) - params) <= 3:
+        return MODEL_LAYERS[closest]
+    # Fallback by size range
     if params <= 4:
         return 32
     elif params <= 14:
@@ -215,8 +227,44 @@ def calculate_optimal_args(
     total_vram = sum(g.vram_mb for g in hardware.gpus) if hardware.gpus else 0
     has_gpu = llama_has_gpu and total_vram > 0 and hardware.backend == "cuda"
 
+    # --- Step 1: Determine GPU layer count (VRAM check comes first) ---
+    # Use q8_0 KV bytes for the estimate since we'll set q8_0 below for GPU paths.
     n_gpu_layers = 0
+    is_full_gpu = False
+    if has_gpu:
+        model_size_mb = params * 1_000_000_000 * BYTES_PER_PARAM[quant] / (1024 * 1024)
+        kv_per_layer_mb = ctx_size * 128 * (KV_BYTES["q8_0"] + KV_BYTES["q8_0"]) / (1024 * 1024)
+        kv_total_mb = n_layers * kv_per_layer_mb
+        full_estimated = model_size_mb + kv_total_mb + model_size_mb * 0.1
+        usable_vram = total_vram * VRAM_USAGE_FACTOR
 
+        if full_estimated <= usable_vram:
+            # Everything fits — full GPU offload
+            n_gpu_layers = -1
+            is_full_gpu = True
+        else:
+            # Model doesn't fully fit. Check if enough VRAM for partial offload to be worthwhile.
+            # We can't accurately calculate the correct layer count without reading the GGUF
+            # metadata (actual head_dim and n_kv_heads vary widely by architecture). Use
+            # -ngl auto and let llama.cpp read the model and determine the optimal count.
+            model_weight_fit_fraction = usable_vram / (model_size_mb + model_size_mb * 0.1)
+            if model_weight_fit_fraction >= 0.30:
+                # At least 30% of model weights could fit — GPU partial offload is worth trying.
+                # llama.cpp auto-calculates the correct layer count from actual model metadata.
+                n_gpu_layers = -2  # auto
+                warnings.append(
+                    f"Model exceeds VRAM ({full_estimated:.0f}MB estimated, {usable_vram:.0f}MB usable). "
+                    f"Using auto GPU layer offloading — llama.cpp will fit as many layers as possible."
+                )
+            else:
+                # Less than 30% of weights fit — PCIe overhead will outweigh the GPU benefit.
+                has_gpu = False
+                warnings.append(
+                    f"Model weights ({model_size_mb:.0f}MB) far exceed VRAM ({usable_vram:.0f}MB). "
+                    f"GPU acceleration not possible. Use a smaller model or lower quantization (IQ4_XS)."
+                )
+
+    # --- Step 2: Set all GPU-specific flags based on final has_gpu ---
     mlock = False
     mmap = True
     tensor_split = None
@@ -234,27 +282,30 @@ def calculate_optimal_args(
     # Flash attention: explicit on GPU (guarantees it; also required for KV quant)
     flash_attn = "on" if has_gpu else "auto"
 
-    # Batch sizes: only override for CPU (GPU defaults of 2048/512 are fine)
+    # Batch sizes:
+    # - Full GPU: maximize ubatch for MoE prompt throughput (default 512 is too small)
+    # - Partial offload: use medium-tier to avoid VRAM pressure from activation buffers
+    # - CPU only: use llama.cpp defaults (None) — small ubatch values hurt CPU throughput
     batch_size: int | None = None
     ubatch_size: int | None = None
-    if not has_gpu:
-        batch_size = BATCH_SIZE_CPU
-        ubatch_size = UBATCH_SIZE_CPU
-
-    # Re-check VRAM fit with actual KV cache quantization applied
+    poll: int | None = None
     if has_gpu:
-        estimated = _estimate_vram_usage(
-            params, quant, ctx_size, n_layers, cache_type_k, cache_type_v
-        )
-        usable_vram = total_vram * VRAM_USAGE_FACTOR
-        if estimated <= usable_vram:
-            n_gpu_layers = -1
+        if is_full_gpu:
+            if total_vram >= HIGH_VRAM_THRESHOLD_MB:
+                batch_size = BATCH_SIZE_HIGH_VRAM
+                ubatch_size = UBATCH_SIZE_HIGH_VRAM
+            elif total_vram >= MED_VRAM_THRESHOLD_MB:
+                batch_size = BATCH_SIZE_MED_VRAM
+                ubatch_size = UBATCH_SIZE_MED_VRAM
+            else:
+                batch_size = BATCH_SIZE_LOW_VRAM
+                ubatch_size = UBATCH_SIZE_LOW_VRAM
         else:
-            n_gpu_layers = -2
-            warnings.append(
-                f"Model exceeds VRAM ({estimated:.0f}MB needed, {usable_vram:.0f}MB usable). "
-                f"Using auto GPU layer offloading."
-            )
+            # Partial offload: conservative to avoid VRAM pressure
+            batch_size = BATCH_SIZE_MED_VRAM
+            ubatch_size = UBATCH_SIZE_MED_VRAM
+        poll = POLL_GPU
+    # CPU-only: leave batch_size/ubatch_size as None (llama.cpp defaults are fine)
 
     if has_gpu and len(hardware.gpus) > 1:
         ratios = [g.vram_mb / total_vram for g in hardware.gpus]
@@ -274,6 +325,7 @@ def calculate_optimal_args(
         flash_attn=flash_attn,
         batch_size=batch_size,
         ubatch_size=ubatch_size,
+        poll=poll,
     )
 
     return args, warnings
@@ -297,6 +349,8 @@ def format_args(args: OptimalArgs) -> str:
     ]
     if args.batch_size is not None:
         lines.append(f"Batch size: {args.batch_size} / {args.ubatch_size}")
+    if args.poll is not None:
+        lines.append(f"Poll: {args.poll}")
     if args.tensor_split:
         lines.append(f"Tensor split: {args.tensor_split}")
     if args.split_mode != "layer":
