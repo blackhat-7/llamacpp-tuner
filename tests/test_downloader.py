@@ -1,200 +1,154 @@
-"""Tests for downloader module."""
+"""Tests for GGUF discovery and download."""
 
-from llamacpp_tuner.downloader import (
-    _is_valid_model,
-    _quant_to_pattern,
-    find_gguf_file,
-    get_model_path,
-    list_invalid_models,
-    list_valid_models,
-    remove_model,
-)
+from pathlib import Path
+
+import pytest
+
+from llamacpp_tuner import downloader
 
 
-class TestQuantToPattern:
-    def test_q4_k_m(self):
-        assert _quant_to_pattern("Q4_K_M") == "q4_k_m"
+def test_repository_storage_is_namespaced(monkeypatch, tmp_path):
+    monkeypatch.setattr(downloader, "get_models_dir", lambda: tmp_path)
 
-    def test_q4_k_s(self):
-        assert _quant_to_pattern("Q4_K_S") == "q4_k_s"
-
-    def test_q8_0(self):
-        assert _quant_to_pattern("Q8_0") == "q8_0"
+    assert downloader._repository_dir("owner/model") == tmp_path / "owner%2Fmodel"
+    assert downloader._repository_dir("model") == tmp_path / "model"
 
 
-class TestIsValidModel:
-    def test_nonexistent_file(self, tmp_path):
-        assert _is_valid_model(tmp_path / "fake.gguf") is False
+def test_accepts_any_exact_quant():
+    files = ["model-Q4_K_M.gguf", "model-Q6_K.gguf"]
 
-    def test_empty_file(self, tmp_path):
-        empty = tmp_path / "empty.gguf"
-        empty.write_text("")
-        assert _is_valid_model(empty) is False
-
-    def test_too_small_file(self, tmp_path):
-        small = tmp_path / "small.gguf"
-        small.write_bytes(b"GGUF")  # 4 bytes
-        assert _is_valid_model(small) is False
-
-    def test_valid_file(self, tmp_path):
-        valid = tmp_path / "valid.gguf"
-        valid.write_bytes(b"x" * 2048)  # 2KB
-        assert _is_valid_model(valid) is True
+    assert downloader._select_model(files, quant="Q6_K") == ["model-Q6_K.gguf"]
+    assert downloader._select_model(files, quant="Q6") == []
 
 
-class TestGetModelPath:
-    def test_no_models_returns_none(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(
-            "llamacpp_tuner.downloader.get_models_dir", lambda: tmp_path
-        )
-        monkeypatch.setattr(
-            "llamacpp_tuner.downloader.find_gguf_file", lambda repo, quant: None
-        )
-        assert get_model_path("owner/repo", "Q4_K_M") is None
+def test_rejects_ambiguous_quant():
+    files = ["model-Q6_K.gguf", "model-vision-Q6_K.gguf"]
 
-    def test_returns_local_path_when_file_exists(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(
-            "llamacpp_tuner.downloader.get_models_dir", lambda: tmp_path
-        )
-        monkeypatch.setattr(
-            "llamacpp_tuner.downloader.find_gguf_file",
-            lambda repo, quant: "model-q4_k_m.gguf",
-        )
-        model = tmp_path / "model-q4_k_m.gguf"
-        model.write_bytes(b"x" * 2048)
+    with pytest.raises(ValueError, match="--file"):
+        downloader._select_model(files, quant="Q6_K")
 
-        result = get_model_path("owner/repo", "Q4_K_M")
-        assert result == model
-
-    def test_returns_none_when_local_file_invalid(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(
-            "llamacpp_tuner.downloader.get_models_dir", lambda: tmp_path
-        )
-        monkeypatch.setattr(
-            "llamacpp_tuner.downloader.find_gguf_file",
-            lambda repo, quant: "model-q4_k_m.gguf",
-        )
-        model = tmp_path / "model-q4_k_m.gguf"
-        model.write_bytes(b"x" * 10)  # Too small, invalid
-
-        result = get_model_path("owner/repo", "Q4_K_M")
-        assert result is None
-
-    def test_returns_none_when_repo_has_no_gguf(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(
-            "llamacpp_tuner.downloader.get_models_dir", lambda: tmp_path
-        )
-        monkeypatch.setattr(
-            "llamacpp_tuner.downloader.find_gguf_file", lambda repo, quant: None
-        )
-        # Local file exists but should be ignored
-        local = tmp_path / "other-model-q4_k_m.gguf"
-        local.write_bytes(b"x" * 2048)
-
-        result = get_model_path("owner/repo", "Q4_K_M")
-        assert result is None
+    assert downloader._select_model(files, filename="model-Q6_K.gguf") == [
+        "model-Q6_K.gguf"
+    ]
 
 
-class TestFindGgufFile:
-    def test_returns_none_for_invalid_repo(self, monkeypatch):
-        from unittest.mock import Mock
+def test_returns_nested_shards_in_order():
+    files = [
+        "quants/model-Q6_K-00002-of-00002.gguf",
+        "quants/model-Q6_K-00001-of-00002.gguf",
+    ]
 
-        from huggingface_hub.errors import RepositoryNotFoundError
-
-        def mock_list_repo_files(repo_id):
-            mock_response = Mock()
-            mock_response.status_code = 404
-            raise RepositoryNotFoundError("Repo not found", response=mock_response)
-
-        monkeypatch.setattr(
-            "llamacpp_tuner.downloader.list_repo_files", mock_list_repo_files
-        )
-        result = find_gguf_file("bad/repo", "Q4_K_M")
-        assert result is None
-
-    def test_finds_exact_quant_match(self, monkeypatch):
-        files = [
-            "model-q4_k_m.gguf",
-            "model-q5_k_m.gguf",
-            "model-q8_0.gguf",
-        ]
-
-        def mock_list_repo_files(repo_id):
-            return files
-
-        monkeypatch.setattr(
-            "llamacpp_tuner.downloader.list_repo_files", mock_list_repo_files
-        )
-        assert find_gguf_file("owner/repo", "Q4_K_M") == "model-q4_k_m.gguf"
-
-    def test_falls_back_to_any_q4(self, monkeypatch):
-        files = ["model-q4_0.gguf"]  # not q4_k_m
-
-        def mock_list_repo_files(repo_id):
-            return files
-
-        monkeypatch.setattr(
-            "llamacpp_tuner.downloader.list_repo_files", mock_list_repo_files
-        )
-        assert find_gguf_file("owner/repo", "Q4_K_M") == "model-q4_0.gguf"
+    assert downloader._select_model(files, quant="Q6_K") == [
+        "quants/model-Q6_K-00001-of-00002.gguf",
+        "quants/model-Q6_K-00002-of-00002.gguf",
+    ]
 
 
-class TestListValidInvalidModels:
-    def test_lists_valid_models(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(
-            "llamacpp_tuner.downloader.get_models_dir", lambda: tmp_path
-        )
-        valid1 = tmp_path / "model1-q4_k_m.gguf"
-        valid1.write_bytes(b"x" * 2048)
-        valid2 = tmp_path / "model2-q5_k_m.gguf"
-        valid2.write_bytes(b"x" * 4096)
-        invalid = tmp_path / "incomplete.gguf"
-        invalid.write_bytes(b"x" * 10)
+def test_rejects_incomplete_shards():
+    files = [
+        "quants/model-Q6_K-00001-of-00003.gguf",
+        "quants/model-Q6_K-00003-of-00003.gguf",
+    ]
 
-        result = list_valid_models()
-        assert len(result) == 2
-        assert valid1 in result
-        assert valid2 in result
-
-    def test_lists_invalid_models(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(
-            "llamacpp_tuner.downloader.get_models_dir", lambda: tmp_path
-        )
-        valid = tmp_path / "valid.gguf"
-        valid.write_bytes(b"x" * 2048)
-        invalid1 = tmp_path / "incomplete1.gguf"
-        invalid1.write_bytes(b"x" * 10)
-        invalid2 = tmp_path / "incomplete2.gguf"
-        invalid2.write_text("")
-
-        result = list_invalid_models()
-        assert len(result) == 2
-        assert invalid1 in result
-        assert invalid2 in result
-
-    def test_empty_dir_returns_empty_list(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(
-            "llamacpp_tuner.downloader.get_models_dir", lambda: tmp_path
-        )
-        assert list_valid_models() == []
-        assert list_invalid_models() == []
+    with pytest.raises(ValueError, match="Incomplete"):
+        downloader._select_model(files, quant="Q6_K")
 
 
-class TestRemoveModel:
-    def test_removes_gguf_file(self, tmp_path):
-        model = tmp_path / "test.gguf"
-        model.write_bytes(b"x" * 2048)
+def test_downloads_every_shard(monkeypatch, tmp_path):
+    files = ["model-00001-of-00002.gguf", "model-00002-of-00002.gguf"]
+    monkeypatch.setattr(downloader, "find_gguf_files", lambda *args, **kwargs: files)
+    downloaded: list[str] = []
 
-        assert model.exists()
-        assert remove_model(model) is True
-        assert not model.exists()
+    def fake_download(repo: str, filename: str, force: bool) -> Path:
+        downloaded.append(filename)
+        return tmp_path / filename
 
-    def test_returns_false_for_nonexistent(self, tmp_path):
-        missing = tmp_path / "missing.gguf"
-        assert remove_model(missing) is False
+    monkeypatch.setattr(downloader, "_download", fake_download)
 
-    def test_returns_false_for_non_gguf(self, tmp_path):
-        other = tmp_path / "test.txt"
-        other.write_text("hello")
-        assert remove_model(other) is False
-        assert other.exists()
+    result = downloader.download_model("owner/model", quant="Q6_K")
+
+    assert result == tmp_path / files[0]
+    assert downloaded == files
+
+
+def test_requires_explicit_projector_when_multiple_exist():
+    files = ["model.mmproj-Q8_0.gguf", "model.mmproj-f16.gguf"]
+
+    with pytest.raises(ValueError, match="--mmproj-file"):
+        downloader._select_projector(files)
+    assert (
+        downloader._select_projector(files, filename="model.mmproj-f16.gguf")
+        == "model.mmproj-f16.gguf"
+    )
+
+
+def test_requires_explicit_projector_across_families():
+    files = ["model-a-mmproj-f16.gguf", "model-b-mmproj-f16.gguf"]
+
+    with pytest.raises(ValueError, match="--mmproj-file"):
+        downloader._select_projector(files)
+
+
+def test_downloaded_repo_resolution_is_offline(monkeypatch, tmp_path):
+    monkeypatch.setattr(downloader, "get_models_dir", lambda: tmp_path)
+    repo_dir = tmp_path / "owner%2Fmodel"
+    repo_dir.mkdir(parents=True)
+    model = repo_dir / "model-Q6_K.gguf"
+    model.touch()
+    monkeypatch.setattr(
+        downloader,
+        "_repo_files",
+        lambda repo: (_ for _ in ()).throw(AssertionError("network accessed")),
+    )
+
+    assert downloader.get_model_path("owner/model", quant="Q6_K") == model
+
+
+def test_same_filename_in_different_repositories_stays_isolated(monkeypatch, tmp_path):
+    monkeypatch.setattr(downloader, "get_models_dir", lambda: tmp_path)
+    first = tmp_path / "one%2Fmodel" / "model-Q6_K.gguf"
+    second = tmp_path / "two%2Fmodel" / "model-Q6_K.gguf"
+    first.parent.mkdir(parents=True)
+    second.parent.mkdir(parents=True)
+    first.touch()
+    second.touch()
+
+    assert downloader.get_model_path("one/model", quant="Q6_K") == first
+    assert downloader.get_model_path("two/model", quant="Q6_K") == second
+
+
+def test_bare_filename_must_be_unambiguous(monkeypatch, tmp_path):
+    monkeypatch.setattr(downloader, "get_models_dir", lambda: tmp_path)
+    for owner in ("one", "two"):
+        path = tmp_path / owner / "model.gguf"
+        path.parent.mkdir()
+        path.touch()
+
+    with pytest.raises(ValueError, match="Multiple local files"):
+        downloader.resolve_model("model.gguf")
+
+
+def test_missing_explicit_path_does_not_fall_back_by_basename(monkeypatch, tmp_path):
+    monkeypatch.setattr(downloader, "get_models_dir", lambda: tmp_path)
+    cached = tmp_path / "owner" / "model.gguf"
+    cached.parent.mkdir()
+    cached.touch()
+
+    with pytest.raises(FileNotFoundError):
+        downloader.resolve_model("/missing/model.gguf")
+
+
+def test_repository_id_ending_in_gguf_uses_selector(monkeypatch, tmp_path):
+    expected = tmp_path / "model.gguf"
+    monkeypatch.setattr(downloader, "get_model_path", lambda *args, **kwargs: expected)
+
+    assert downloader.resolve_model("owner/repo.gguf", quant="Q6_K") == expected
+
+
+def test_lists_nested_downloads(monkeypatch, tmp_path):
+    monkeypatch.setattr(downloader, "get_models_dir", lambda: tmp_path)
+    model = tmp_path / "owner" / "repo" / "model.gguf"
+    model.parent.mkdir(parents=True)
+    model.touch()
+
+    assert downloader.list_downloaded_models() == [model]

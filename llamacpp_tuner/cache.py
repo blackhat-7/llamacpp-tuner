@@ -1,45 +1,27 @@
-"""Cache utilities for hardware profile and model metadata."""
+"""Writable paths managed by lct."""
 
-import json
+import os
 from pathlib import Path
-from typing import Any
 
-CACHE_DIR = Path(__file__).parent.parent / "tmp"
-CACHE_DIR.mkdir(parents=True, exist_ok=True)
+_PROJECT_ROOT = Path(__file__).parent.parent
 
 
-def _convert_tuples(obj: Any) -> Any:
-    if isinstance(obj, tuple):
-        return [_convert_tuples(item) for item in obj]
-    if isinstance(obj, list):
-        return [_convert_tuples(item) for item in obj]
-    if isinstance(obj, dict):
-        return {k: _convert_tuples(v) for k, v in obj.items()}
-    return obj
-
-
-def load_cache(key: str) -> Any | None:
-    cache_file = CACHE_DIR / f"{key}.json"
-    if not cache_file.exists():
-        return None
-    with open(cache_file) as f:
-        return json.load(f)
-
-
-def save_cache(key: str, data: Any) -> None:
-    cache_file = CACHE_DIR / f"{key}.json"
-    data = _convert_tuples(data)
-    with open(cache_file, "w") as f:
-        json.dump(data, f, indent=2)
+def get_cache_dir() -> Path:
+    if home := os.environ.get("LCT_HOME"):
+        return Path(home).expanduser()
+    if (_PROJECT_ROOT / "pyproject.toml").is_file():
+        return _PROJECT_ROOT / "tmp"
+    base = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache"))
+    return base / "lct"
 
 
 def get_models_dir() -> Path:
-    models_dir = CACHE_DIR / "models"
-    models_dir.mkdir(exist_ok=True)
-    return models_dir
+    path = get_cache_dir() / "models"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
 
 
 def get_llama_dir() -> Path:
-    llama_dir = CACHE_DIR / "llama.cpp"
-    llama_dir.mkdir(exist_ok=True)
-    return llama_dir
+    path = get_cache_dir() / "llama.cpp"
+    path.mkdir(parents=True, exist_ok=True)
+    return path

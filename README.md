@@ -1,51 +1,41 @@
 # lct
 
-Auto-optimize llama.cpp parameters for your hardware.
+A small wrapper for finding/building llama.cpp, downloading exact GGUF artifacts, and starting `llama-server`.
 
-## Quick Start
+Model selection and tuning live in reusable Agent Skills instead of Python heuristics:
+
+- [`skills/select-local-model`](skills/select-local-model/SKILL.md)
+- [`skills/tune-local-model`](skills/tune-local-model/SKILL.md)
+
+## Usage
 
 ```bash
-# Setup (detect hardware + install llama.cpp)
+# Use llama-server from PATH, or build a managed copy.
 uv run lct setup
 
-# Download a model
-uv run lct pull bartowski/Qwen2.5-0.5B-Instruct-GGUF
+# Quant names are open-ended and exact—there is no allowlist or fallback.
+uv run lct pull owner/model-GGUF --quant Q6_K
 
-# Benchmark default args
-uv run lct benchmark bartowski/Qwen2.5-0.5B-Instruct-GGUF
+# If a quant matches multiple artifacts, select the exact repository filename.
+uv run lct pull owner/model-GGUF --file model-Q6_K.gguf
 
-# Benchmark optimized args
-uv run lct benchmark bartowski/Qwen2.5-0.5B-Instruct-GGUF --args optimal
+# Serve a downloaded repository without contacting Hugging Face.
+uv run lct serve owner/model-GGUF --quant Q6_K \
+  --ctx 32768 \
+  --extra-args "-ngl all -fa on -ctk q8_0 -ctv q8_0"
 
-# Run server
-uv run lct serve bartowski/Qwen2.5-0.5B-Instruct-GGUF --ctx 4096
+# Exact local paths work too.
+uv run lct serve /models/model.gguf --extra-args "-ngl all"
+
+uv run lct models
 ```
 
-## Commands
+`serve` changes only options explicitly supplied; all others remain llama.cpp defaults. Use `--mmproj PATH` for a local vision model. Repository pulls download an unambiguous projector automatically unless `--no-mmproj` is given.
 
-| Command | Description |
-|---------|-------------|
-| `setup` | Detect hardware, install llama.cpp |
-| `pull <repo>` | Download model from HuggingFace |
-| `benchmark <repo>` | Test TPS with args (use `--args optimal`) |
-| `compare <repo>` | Compare default vs optimized TPS |
-| `args <repo>` | Show optimal arguments (dry run) |
-| `serve <repo>` | Run server with optimal args |
-| `models` | List downloaded models |
-| `status` | Show hardware status |
+A source checkout stores files in `tmp/`; an installed package uses `${XDG_CACHE_HOME:-~/.cache}/lct`. Set `LCT_HOME` to override either location.
 
-## Usage Flow
+For a custom llama.cpp build:
 
 ```bash
-# 1. Benchmark baseline
-uv run lct benchmark unsloth/Phi-4-GGUF --quant Q4_K_M
-
-# 2. See optimized args
-uv run lct args unsloth/Phi-4-GGUF --quant Q4_K_M --ctx 8192
-
-# 3. Benchmark optimized
-uv run lct benchmark unsloth/Phi-4-GGUF --quant Q4_K_M --args optimal
-
-# 4. Run server
-uv run lct serve unsloth/Phi-4-GGUF --quant Q4_K_M --port 8080
+uv run lct setup --force --cmake-arg=-DGGML_VULKAN=ON
 ```
