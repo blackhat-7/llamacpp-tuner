@@ -16,7 +16,7 @@ Collect only missing information:
 - tool/function calling, structured output, and agent-loop needs
 - accelerator/backend and dedicated or shared memory, multi-device topology, RAM, CPU, and OS
 - runtime or serving format, if fixed
-- minimum generation speed, latency, context, and concurrency
+- required context capacity, typical prompt size, first-response latency, late-context generation speed, and concurrency
 - privacy, license, language, censorship, and power constraints
 
 Separate hard requirements from preferences. “Best” means best for these constraints, not the highest headline benchmark.
@@ -39,7 +39,7 @@ Do not substitute evidence from a nearby size or family member.
 
 Use actual artifact sizes where possible. Account for weights, KV/recurrent state at the required context, runtime and batch buffers, projector, parallel requests, and memory used by the display or other processes.
 
-Reject configurations that only fit on paper or require unrequested host-memory offload. Distinguish full accelerator execution, hybrid offload, and CPU/RAM inference. Treat advertised maximum context as a capability, not a sensible default.
+Reject configurations that only fit on paper or require unrequested host-memory offload. Distinguish full accelerator execution, hybrid offload, and CPU/RAM inference. Treat advertised maximum context as a capability, not a sensible default. Verify that the active client/harness context limit and server limit agree; do not infer runtime behavior from an inactive configuration file.
 
 ## 4. Compare the relevant capabilities
 
@@ -51,7 +51,7 @@ Use exact-model evaluations closest to the workload:
 - OCR, charts, scientific figures, and vision
 - coding, math, multilingual, or domain tasks when relevant
 
-Label vendor-reported, third-party, and anecdotal evidence. Check reasoning mode, token budget, prompts, and whether scores are comparable. For altered or “uncensored” models, require provenance and capability-retention evidence; fewer refusals do not imply greater intelligence.
+Label vendor-reported, third-party, and anecdotal evidence. Check reasoning mode, token budget, prompts, and whether scores are comparable. Results for a base or full-precision model are evidence, not proof, for a quantized fine-tune. For altered or “uncensored” models, require provenance and capability-retention evidence; fewer refusals do not imply greater intelligence.
 
 Tool reliability also depends on the runtime, template, parser, and harness. A function-calling claim alone is insufficient.
 
@@ -65,6 +65,6 @@ Return no more than:
 
 State each exact model ID, evidence, deployment class, important caveat, and confidence. Include source links, fit uncertainties, and say plainly when the user's current model remains best.
 
-When published evidence cannot decide, propose the smallest representative A/B set that can. Keep tools, templates, sampling, context, and comparable quantization fixed; score task success, tool-call validity, source fidelity, hallucinations, latency, and user preference.
+When published evidence cannot decide, propose the smallest representative A/B set that can. Keep tools, templates, sampling, context, and comparable quantization fixed; score task success, tool-call validity, source fidelity, hallucinations, cold and cached latency, and user preference.
 
 Never invent memory or throughput figures. Measure them on the target system when they matter. Hand the chosen model to `tune-local-model`.
