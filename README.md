@@ -11,6 +11,7 @@ Model selection and tuning live in reusable Agent Skills instead of Python heuri
 
 ```bash
 # Use llama-server from PATH, or build a managed copy.
+# Builds CUDA when nvcc is available, otherwise Vulkan when vulkaninfo is available.
 uv run lct setup
 
 # Quant names are open-ended and exact—there is no allowlist or fallback.
@@ -33,6 +34,8 @@ uv run lct models
 `serve` changes only options explicitly supplied; all others remain llama.cpp defaults. Use `--mmproj PATH` for a local vision model. Repository pulls download an unambiguous projector automatically unless `--no-mmproj` is given.
 
 A source checkout stores files in `tmp/`; an installed package uses `${XDG_CACHE_HOME:-~/.cache}/lct`. Set `LCT_HOME` to override either location.
+
+After changing GPU vendors, rebuild the managed copy with `uv run lct setup --force`.
 
 For a custom llama.cpp build:
 

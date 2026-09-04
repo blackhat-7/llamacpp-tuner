@@ -63,6 +63,30 @@ def test_build_passes_backend_arguments(monkeypatch, tmp_path):
     assert "-DGGML_VULKAN=ON" in commands[0]
 
 
+def test_build_enables_vulkan_without_cuda(monkeypatch, tmp_path):
+    (tmp_path / ".git").mkdir()
+    binary = tmp_path / "build" / "bin" / "llama-server"
+    commands: list[list[str]] = []
+
+    def fake_run(command: list[str], check: bool):
+        commands.append(command)
+        if "--build" in command:
+            binary.parent.mkdir(parents=True)
+            binary.touch()
+
+    monkeypatch.setattr(llama, "get_llama_dir", lambda: tmp_path)
+    monkeypatch.setattr(
+        llama.shutil,
+        "which",
+        lambda name: "/usr/bin/vulkaninfo" if name == "vulkaninfo" else None,
+    )
+    monkeypatch.setattr(llama.subprocess, "run", fake_run)
+
+    assert llama.build_from_source() == binary
+    assert "-DGGML_VULKAN=ON" in commands[0]
+    assert "-DGGML_CUDA=ON" not in commands[0]
+
+
 def test_run_server_requires_binary(monkeypatch):
     monkeypatch.setattr(llama, "get_llama_binary", lambda: None)
 

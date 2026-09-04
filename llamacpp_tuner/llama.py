@@ -31,7 +31,7 @@ def get_llama_binary() -> Path | None:
 def build_from_source(
     force: bool = False, extra_cmake_args: Sequence[str] = ()
 ) -> Path:
-    """Build llama.cpp, enabling CUDA automatically when nvcc is available."""
+    """Build llama.cpp with an available CUDA or Vulkan backend."""
     source_dir = get_llama_dir()
     build_dir = source_dir / "build"
 
@@ -52,6 +52,8 @@ def build_from_source(
     nvcc = shutil.which("nvcc")
     if nvcc:
         configure.extend(["-DGGML_CUDA=ON", f"-DCMAKE_CUDA_COMPILER={nvcc}"])
+    elif shutil.which("vulkaninfo"):
+        configure.append("-DGGML_VULKAN=ON")
     configure.extend(extra_cmake_args)
     subprocess.run(configure, check=True)
 
