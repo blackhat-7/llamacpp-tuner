@@ -92,3 +92,59 @@ def test_run_server_requires_binary(monkeypatch):
 
     with pytest.raises(FileNotFoundError):
         llama.run_server([])
+
+
+def test_run_server_terminates_child_on_signal(monkeypatch):
+    handlers = {}
+    monkeypatch.setattr(
+        llama, "get_llama_binary", lambda: Path("/usr/bin/llama-server")
+    )
+    monkeypatch.setattr(
+        llama.signal, "signal", lambda sig, handler: handlers.setdefault(sig, handler)
+    )
+
+    class FakeServer:
+        def __init__(self):
+            self.terminated = False
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def terminate(self):
+            self.terminated = True
+
+        def wait(self):
+            handlers[llama.signal.SIGTERM](llama.signal.SIGTERM, None)
+            return -15
+
+    server = FakeServer()
+    monkeypatch.setattr(llama.subprocess, "Popen", lambda command: server)
+
+    llama.run_server([])
+
+    assert server.terminated
+
+
+def test_run_server_reports_server_failure(monkeypatch):
+    monkeypatch.setattr(
+        llama, "get_llama_binary", lambda: Path("/usr/bin/llama-server")
+    )
+    monkeypatch.setattr(llama.signal, "signal", lambda sig, handler: None)
+
+    class FakeServer:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def wait(self):
+            return 1
+
+    monkeypatch.setattr(llama.subprocess, "Popen", lambda command: FakeServer())
+
+    with pytest.raises(llama.subprocess.CalledProcessError):
+        llama.run_server([])

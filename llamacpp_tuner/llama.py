@@ -3,6 +3,7 @@
 import os
 import platform
 import shutil
+import signal
 import subprocess
 from collections.abc import Sequence
 from pathlib import Path
@@ -80,4 +81,18 @@ def run_server(args: list[str]) -> None:
         raise FileNotFoundError(
             "llama-server not found. Install it or run 'lct setup'."
         )
-    subprocess.run([str(binary), *args], check=True)
+    command = [str(binary), *args]
+    with subprocess.Popen(command) as server:
+        # Without this, a SIGTERM to lct kills only the wrapper and orphans
+        # llama-server, leaving the model resident in VRAM.
+        def shutdown(signum: int, frame: object) -> None:
+            server.terminate()
+
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            signal.signal(sig, shutdown)
+        code = server.wait()
+
+    # A negative code means llama-server was stopped by a signal, which is how
+    # a requested shutdown ends.
+    if code > 0:
+        raise subprocess.CalledProcessError(code, command)
