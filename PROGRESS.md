@@ -9,10 +9,10 @@ Next task: `PLAN.md`. Rules: `AGENTS.md`.
 
 - Branch `feat/tui` (from `feat/serve-aliases`). Neither is merged to `main`. Both track `origin`.
 - `lct serve <alias>` works. Local aliases in `tmp/aliases.toml`: `qwen`, `qwen-no-img`, `swift-qwen`, `swift-qwen-no-img`, all on `100.64.0.1:6868`.
-- `ukisai/Swift-Qwen3.8-27B-GGUF` Q4_K_S (16.6 GB) is downloading. It restarted from zero on 2026-09-25 with `HF_XET_FIXED_DOWNLOAD_CONCURRENCY=16`. The `swift-*` aliases fail with "Model not found" until it lands.
+- `ukisai/Swift-Qwen3.8-27B-GGUF` Q4_K_S and its projector are downloaded.
 - `textual` is a new dependency. `llama.get_llama_binary(name)` now finds `llama-bench` as well as `llama-server`.
-- `lct tui` is keyboard-driven in forseti's style: Serve (profiles list + settings; `enter` start/stop, `e`/`n`/`d`), Download (`enter` search/download, `p` projector), Benchmark (`enter` run/stop). Checked at 80 and 120 columns.
-- Checks: `pytest` 43/43, ruff clean, pyright clean.
+- `lct tui` is keyboard-driven in forseti's style. Serve edits profiles in place (autosave on enter or leaving a field; `n` copies, `d`+`y` deletes). Download searches Hugging Face as you type and shows details, files (shards grouped, smallest first) and a card summary from the base model.
+- Checks: `pytest` 47/47, ruff clean, pyright clean.
 
 ## Gotchas
 
@@ -24,3 +24,4 @@ Next task: `PLAN.md`. Rules: `AGENTS.md`.
 - **`OptionList` wraps long rows unless CSS sets `text-wrap: nowrap`;** Rich's `no_wrap` on the prompt is ignored.
 - **Textual's SVG screenshots drop a leading space in a styled span.** Put separators inside the preceding span.
 - **Never name an `App` method `run`.** It overrides Textual's `App.run` and `lct tui` breaks; the helper is `stream`.
+- **Quantizer model cards describe quantization, not the model.** `repo_details` loads the base model's card first.

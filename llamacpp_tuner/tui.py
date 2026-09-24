@@ -2,8 +2,10 @@
 
 import asyncio
 import contextlib
+import html
 import json
 import os
+import re
 import shlex
 import signal
 import sys
@@ -11,13 +13,15 @@ from collections.abc import Callable
 from pathlib import Path
 
 import click
+from huggingface_hub import ModelInfo
+from rich.console import Group
 from rich.table import Table
 from rich.text import Text
 from textual import on, work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
-from textual.containers import Horizontal, Vertical
-from textual.screen import ModalScreen
+from textual.containers import Horizontal, Vertical, VerticalScroll
+from textual.suggester import SuggestFromList
 from textual.theme import Theme
 from textual.widgets import (
     ContentSwitcher,
@@ -34,8 +38,10 @@ from textual.widgets.option_list import Option
 from llamacpp_tuner.cli import load_aliases, pick_projector, serve, write_aliases
 from llamacpp_tuner.downloader import (
     list_downloaded_models,
-    list_repo_models,
+    model_files,
+    repo_details,
     resolve_model,
+    search_repos,
 )
 from llamacpp_tuner.llama import get_llama_binary
 
@@ -59,6 +65,7 @@ THEME = Theme(
 
 CSS = """
 Screen { padding: 1 2 0 2; }
+* { scrollbar-size-vertical: 1; scrollbar-background: $background; scrollbar-color: $panel; }
 #top { height: 1; }
 #title { width: 1fr; text-style: bold; }
 #state { width: auto; }
@@ -67,31 +74,37 @@ Tabs Tab { padding: 0 3 0 0; color: $text-muted; }
 Tabs Tab.-active { color: $foreground; }
 ContentSwitcher { height: 1fr; }
 .page { height: 1fr; }
-.column { width: 1fr; height: auto; padding-right: 4; }
+.column { width: 1fr; height: 1fr; padding-right: 4; }
 .heading { color: $text-muted; margin-bottom: 1; }
 .gap { margin-top: 1; }
-OptionList { border: none; background: transparent; padding: 0; height: auto; max-height: 12; text-wrap: nowrap; text-overflow: ellipsis; }
+OptionList { border: none; background: transparent; padding: 0; height: auto; max-height: 16; text-wrap: nowrap; text-overflow: ellipsis; }
 OptionList:focus { border: none; background-tint: transparent; }
 OptionList > .option-list--option-highlighted { background: $panel; text-style: none; }
 OptionList:focus > .option-list--option-highlighted { background: $primary 25%; color: $foreground; }
 Input { border: none; height: 1; padding: 0 1; background: $panel; width: 1fr; }
 Input:focus { background: $primary 20%; }
-* { scrollbar-size-vertical: 1; scrollbar-background: $background; scrollbar-color: $panel; }
+Input.-missing { color: $warning; }
 .field { height: 1; margin-bottom: 1; }
 .field Label { width: 12; color: $text-muted; }
 #log { height: 8; background: transparent; border: none; padding: 0; }
 #hints { height: 1; margin-top: 1; }
-EditScreen { background: $background; padding: 1 2; }
-EditScreen OptionList { max-height: 6; }
 """
 
 HINTS = {
-    "serve": "enter start/stop  e edit  n new  d delete",
-    "download": "/ search  enter download  p projector",
+    "serve": "enter start/stop  tab edit  n new  d delete",
+    "download": "↓ results  enter open/download  p projector",
     "bench": "enter run/stop  tab next field",
-    "edit": "tab next field  ctrl+s save  esc cancel",
 }
-HOME_FOCUS = {"serve": "#profiles", "download": "#repo", "bench": "#bench-model"}
+HOME_FOCUS = {"serve": "#profiles", "download": "#results", "bench": "#bench-model"}
+SETTINGS = [
+    ("Name", "name"),
+    ("Model", "model"),
+    ("Projector", "mmproj"),
+    ("Context", "ctx"),
+    ("Host", "host"),
+    ("Port", "port"),
+    ("Extra args", "extra"),
+]
 
 
 async def spawn(cmd: list[str]) -> asyncio.subprocess.Process:
@@ -125,6 +138,14 @@ def tokens(count: int | None) -> str:
     )
 
 
+def compact(count: int | None) -> str:
+    count = count or 0
+    for size, suffix in ((1e9, "B"), (1e6, "M"), (1e3, "k")):
+        if count >= size:
+            return f"{count / size:.3g}{suffix}"
+    return str(count)
+
+
 def hint_line(keys: str) -> Text:
     """Render 'enter start  e edit' with keys in the accent colour."""
     text = Text()
@@ -132,6 +153,18 @@ def hint_line(keys: str) -> Text:
         key, _, label = part.partition(" ")
         text.append(f"{key} ", style=ACCENT).append(f"{label}    ", style=MUTED)
     return text
+
+
+def card_summary(card: str, limit: int = 420) -> str:
+    """First prose paragraph of a model card, without HTML or markdown clutter."""
+    text = html.unescape(re.sub(r"<[^>]+>|!\[[^\]]*\]\([^)]*\)", "", card))
+    text = re.sub(r"\[([^\]]*)\]\([^)]*\)", r"\1", text)
+    for block in re.split(r"\n\s*\n", text):
+        block = " ".join(line.strip() for line in block.splitlines()).strip()
+        if len(block) > 60 and not block.startswith(("#", "|", ">", "`", "- ", "* ")):
+            block = re.sub(r"[*_`]", "", block)
+            return block[:limit] + ("…" if len(block) > limit else "")
+    return ""
 
 
 def bench_row(result: dict) -> tuple[str, str, str, str]:
@@ -144,17 +177,32 @@ def bench_row(result: dict) -> tuple[str, str, str, str]:
 
 
 def profile(args: str) -> dict:
-    """Describe a saved profile; model and projector paths are None if missing."""
+    """Parse a saved profile into form values plus the tokens behind them."""
     ctx = serve.make_context("serve", shlex.split(args), resilient_parsing=True)
-    params = ctx.params
+    p = ctx.params
     try:
-        model = resolve_model(
-            params["model"], quant=params["quant"], filename=params["filename"]
-        )
-        mmproj = pick_projector(params["model"], params["mmproj"], params["no_mmproj"])
+        model = resolve_model(p["model"], quant=p["quant"], filename=p["filename"])
+        mmproj = pick_projector(p["model"], p["mmproj"], p["no_mmproj"])
     except (FileNotFoundError, ValueError):
         model = mmproj = None
-    return {**params, "model_path": model, "mmproj_path": mmproj}
+    selector = p["filename"] or p["quant"]
+    model_tokens = [p["model"]]
+    model_tokens += ["--file", p["filename"]] if p["filename"] else []
+    model_tokens += ["--quant", p["quant"]] if p["quant"] else []
+    mmproj_tokens = ["--mmproj", str(p["mmproj"])] if p["mmproj"] else []
+    mmproj_tokens += ["--no-mmproj"] if p["no_mmproj"] else []
+    mmproj_tokens += ["--no-mmproj-offload"] if p["no_mmproj_offload"] else []
+    return {
+        "missing": model is None,
+        "model": model.name if model else f"{p['model']} {selector or ''}".strip(),
+        "mmproj": Path(mmproj).name if mmproj else "none",
+        "ctx": str(p["ctx"] or ""),
+        "host": p["host"] or "",
+        "port": str(p["port"] or ""),
+        "extra": p["extra_args"] or "",
+        "model_tokens": model_tokens,
+        "mmproj_tokens": mmproj_tokens,
+    }
 
 
 def grid(rows: list[tuple[str, Text | str]]) -> Table:
@@ -170,78 +218,30 @@ def field(label: str, widget: Input) -> Horizontal:
     return Horizontal(Label(label), widget, classes="field")
 
 
-def model_options(projectors: bool) -> list[Option]:
-    return [
-        Option(
-            Text.assemble(path.name.ljust(52), (gib(path.stat().st_size), MUTED)),
-            str(path),
+def repo_view(info: ModelInfo, card: str) -> Group:
+    data = info.card_data.to_dict() if info.card_data else {}
+    gguf = info.gguf or {}
+    model = " · ".join(
+        part
+        for part in (
+            gguf.get("architecture"),
+            gguf.get("total") and f"{compact(gguf['total'])} params",
+            gguf.get("context_length") and f"{tokens(gguf['context_length'])} ctx",
         )
-        for path in list_downloaded_models()
-        if ("mmproj" in path.name.lower()) == projectors
+        if part
+    )
+    base = data.get("base_model")
+    rows: list[tuple[str, Text | str]] = [
+        (
+            "Popularity",
+            f"{compact(info.downloads)} downloads · {info.likes or 0} likes",
+        ),
+        ("License", str(data.get("license_name") or data.get("license") or "unknown")),
+        ("Base", ", ".join(base) if isinstance(base, list) else str(base or "—")),
+        ("Model", model or "—"),
+        ("Updated", str(info.last_modified or info.created_at or "—")[:10]),
     ]
-
-
-class EditScreen(ModalScreen[tuple[str, list[str]] | None]):
-    """Create or edit a profile. Returns (name, serve args) or None."""
-
-    BINDINGS = [
-        Binding("ctrl+s", "save", priority=True),
-        Binding("escape", "dismiss(None)"),
-    ]
-
-    def __init__(self, name: str, details: dict | None) -> None:
-        super().__init__()
-        self.profile_name, self.details = name, details or {}
-
-    def compose(self) -> ComposeResult:
-        d = self.details
-        title = f"Edit {self.profile_name}" if self.profile_name else "New profile"
-        yield Static(Text(title, style="bold"))
-        with Vertical(classes="gap"):
-            yield field("Name", Input(self.profile_name, id="name"))
-            yield Label("Model", classes="heading")
-            yield OptionList(*model_options(False), id="model")
-            yield Label("Projector", classes="heading gap")
-            yield OptionList(Option("none", ""), *model_options(True), id="mmproj")
-            with Vertical(classes="gap"):
-                yield field("Context", Input(str(d.get("ctx") or ""), id="ctx"))
-                yield field("Host", Input(d.get("host") or "", id="host"))
-                yield field("Port", Input(str(d.get("port") or ""), id="port"))
-                yield field("Extra args", Input(d.get("extra_args") or "", id="extra"))
-        yield Static(hint_line(HINTS["edit"]), id="hints")
-
-    def on_mount(self) -> None:
-        self.query_one("#ctx", Input).placeholder = "default"
-        self.query_one("#host", Input).placeholder = "127.0.0.1"
-        self.query_one("#port", Input).placeholder = "8080"
-        for selector, key in (("#model", "model_path"), ("#mmproj", "mmproj_path")):
-            options = self.query_one(selector, OptionList)
-            with contextlib.suppress(Exception):
-                options.highlighted = options.get_option_index(str(self.details[key]))
-            if options.highlighted is None and options.option_count:
-                options.highlighted = 0
-
-    def action_save(self) -> None:
-        name = self.query_one("#name", Input).value.strip()
-        model = self.query_one("#model", OptionList)
-        if not name or model.highlighted is None:
-            self.notify("A profile needs a name and a model.", severity="error")
-            return
-        args = [str(model.get_option_at_index(model.highlighted).id)]
-        mmproj = self.query_one("#mmproj", OptionList)
-        if mmproj.highlighted and (
-            path := mmproj.get_option_at_index(mmproj.highlighted).id
-        ):
-            args += ["--mmproj", path]
-        for flag, selector in (
-            ("--ctx", "#ctx"),
-            ("--host", "#host"),
-            ("--port", "#port"),
-            ("--extra-args", "#extra"),
-        ):
-            if value := self.query_one(selector, Input).value.strip():
-                args += [flag, value]
-        self.dismiss((name, args))
+    return Group(Text(info.id, style="bold"), Text(""), grid(rows))
 
 
 class LctApp(App[None]):
@@ -257,6 +257,7 @@ class LctApp(App[None]):
         Binding("y", "confirm"),
         Binding("p", "projector"),
         Binding("slash", "focus_search"),
+        Binding("down", "to_results"),
         Binding("escape", "leave"),
         Binding("q", "quit"),
         Binding("ctrl+l", "clear_log"),
@@ -266,9 +267,14 @@ class LctApp(App[None]):
         super().__init__()
         self.procs: dict[str, asyncio.subprocess.Process] = {}
         self.profiles: dict[str, dict] = {}
+        self.models: dict[str, Path] = {}
+        self.projectors: dict[str, Path] = {}
+        self.editing = ""
         self.serving = self.url = ""
         self.pending_delete = ""
         self.with_projector = True
+        self.repo = ""
+        self.repos: dict[str, tuple[ModelInfo, str]] = {}
         self.results: list[tuple[str, str, str, str]] = []
 
     def compose(self) -> ComposeResult:
@@ -287,11 +293,19 @@ class LctApp(App[None]):
                     yield OptionList(id="profiles")
                 with Vertical(classes="column"):
                     yield Label("Settings", classes="heading")
-                    yield Static(id="details")
+                    for label, key in SETTINGS:
+                        yield field(label, Input(id=f"f-{key}", classes="setting"))
             with Vertical(id="download-page", classes="page"):
-                yield field("Repository", Input(id="repo"))
-                yield Label("", id="files-heading", classes="heading")
-                yield OptionList(id="files")
+                yield field("Search", Input(id="repo"))
+                with Horizontal():
+                    with Vertical(classes="column"):
+                        yield Label("", id="results-heading", classes="heading")
+                        yield OptionList(id="results")
+                    with VerticalScroll(classes="column"):
+                        yield Static(id="repo-info")
+                        yield Label("", id="files-heading", classes="heading gap")
+                        yield OptionList(id="files")
+                        yield Static(id="repo-summary", classes="gap")
             with Horizontal(id="bench-page", classes="page"):
                 with Vertical(classes="column"):
                     yield Label("Model", classes="heading")
@@ -306,7 +320,7 @@ class LctApp(App[None]):
                         "Extra args",
                         Input("-fa on -ctk q8_0 -ctv q8_0", id="bench-extra"),
                     )
-                    yield Static(id="results", classes="gap")
+                    yield Static(id="results-table", classes="gap")
         yield Label("Output", classes="heading")
         yield RichLog(id="log", wrap=True, highlight=True, max_lines=5000)
         yield Static(id="hints")
@@ -314,9 +328,17 @@ class LctApp(App[None]):
     def on_mount(self) -> None:
         self.register_theme(THEME)
         self.theme = "lct"
-        self.query_one("#repo", Input).placeholder = "owner/model-GGUF, then enter"
-        self.refresh_profiles()
+        placeholders = {
+            "#repo": "type a model name, e.g. qwen 27b",
+            "#f-ctx": "default",
+            "#f-host": "127.0.0.1",
+            "#f-port": "8080",
+            "#f-mmproj": "none",
+        }
+        for selector, text in placeholders.items():
+            self.query_one(selector, Input).placeholder = text
         self.refresh_models()
+        self.refresh_profiles()
         self.update_state()
         self.query_one("#profiles").focus()
 
@@ -382,24 +404,34 @@ class LctApp(App[None]):
     def show_page(self, event: Tabs.TabActivated) -> None:
         page = str(event.tab.id)
         self.query_one(ContentSwitcher).current = f"{page}-page"
-        self.query_one(HOME_FOCUS[page]).focus()
+        focus = "#repo" if page == "download" else HOME_FOCUS[page]
+        self.query_one(focus).focus()
         self.update_state()
 
     def action_leave(self) -> None:
         if isinstance(self.focused, Input):
-            target = "#files" if self.page == "download" else HOME_FOCUS[self.page]
-            self.query_one(target).focus()
+            self.query_one(HOME_FOCUS[self.page]).focus()
 
     def action_clear_log(self) -> None:
         self.query_one("#log", RichLog).clear()
 
     def refresh_models(self) -> None:
+        files = list_downloaded_models()
+        self.models = {p.name: p for p in files if "mmproj" not in p.name.lower()}
+        self.projectors = {p.name: p for p in files if "mmproj" in p.name.lower()}
+        suggest = [("#f-model", self.models), ("#f-mmproj", self.projectors)]
+        for selector, names in suggest:
+            suggester = SuggestFromList(["none", *names], case_sensitive=False)
+            self.query_one(selector, Input).suggester = suggester
         options = self.query_one("#bench-model", OptionList)
-        options.clear_options().add_options(model_options(False))
+        options.clear_options()
+        for name, path in self.models.items():
+            size = (gib(path.stat().st_size), MUTED)
+            options.add_option(Option(Text.assemble(name.ljust(52), size), str(path)))
         if options.option_count:
             options.highlighted = 0
 
-    # Serve page
+    # Serve page: the profile list on the left, its settings on the right
 
     def selected_profile(self) -> str:
         options = self.query_one("#profiles", OptionList)
@@ -419,36 +451,116 @@ class LctApp(App[None]):
         options.clear_options()
         for name, details in self.profiles.items():
             dot = ("● ", GOOD) if name == self.serving else "  "
-            if details["model_path"]:
-                meta, style = f"{tokens(details['ctx'])} ctx", MUTED
-                if details["mmproj_path"]:
-                    meta += " · images"
-            else:
+            meta, style = f"{tokens(int(details['ctx'] or 0))} ctx", MUTED
+            if details["missing"]:
                 meta, style = "model missing", WARN
+            elif details["mmproj"] != "none":
+                meta += " · images"
             label = Text.assemble(dot, name.ljust(20), (meta, style))
             options.add_option(Option(label, name))
         if names := list(self.profiles):
             options.highlighted = names.index(current) if current in names else 0
-        self.show_details()
+        self.fill_form()
 
     @on(OptionList.OptionHighlighted, "#profiles")
-    def show_details(self) -> None:
-        details = self.profiles.get(self.selected_profile())
-        view = self.query_one("#details", Static)
-        if not details:
-            view.update(Text("No profiles yet. Press n to create one.", style=MUTED))
+    def fill_form(self) -> None:
+        self.editing = self.selected_profile()
+        details = self.profiles.get(self.editing, {})
+        for _, key in SETTINGS:
+            value = self.editing if key == "name" else details.get(key, "")
+            widget = self.query_one(f"#f-{key}", Input)
+            widget.value = value
+            widget.cursor_position = 0
+            widget.disabled = not details
+        self.query_one("#f-model").set_class(details.get("missing", False), "-missing")
+
+    def form_args(self, details: dict) -> list[str]:
+        """Build serve args from the form, keeping untouched model tokens as-is."""
+        value = {
+            key: self.query_one(f"#f-{key}", Input).value.strip() for _, key in SETTINGS
+        }
+        if value["model"] == details["model"]:
+            args = list(details["model_tokens"])
+        elif value["model"] in self.models:
+            args = [str(self.models[value["model"]])]
+        else:
+            raise ValueError(f"{value['model']} is not a downloaded model.")
+        if value["mmproj"] == details["mmproj"]:
+            args += details["mmproj_tokens"]
+        elif value["mmproj"] in self.projectors:
+            args += ["--mmproj", str(self.projectors[value["mmproj"]])]
+        elif value["mmproj"] in ("", "none"):
+            args += [] if args[0].endswith(".gguf") else ["--no-mmproj"]
+        else:
+            raise ValueError(f"{value['mmproj']} is not a downloaded projector.")
+        for flag, key in (("--ctx", "ctx"), ("--host", "host"), ("--port", "port")):
+            args += [flag, value[key]] if value[key] else []
+        return args + (["--extra-args", value["extra"]] if value["extra"] else [])
+
+    @on(Input.Submitted, ".setting")
+    @on(Input.Blurred, ".setting")
+    def save_form(self) -> None:
+        old = self.editing
+        if not (details := self.profiles.get(old)):
             return
-        model, mmproj = details["model_path"], details["mmproj_path"]
-        missing = Text(f"missing · {details['model']}", style=WARN)
-        address = f"{details['host'] or '127.0.0.1'}:{details['port'] or 8080}"
-        rows: list[tuple[str, Text | str]] = [
-            ("Model", model.name if model else missing),
-            ("Projector", Path(mmproj).name if mmproj else "none"),
-            ("Context", tokens(details["ctx"])),
-            ("Address", address),
-            ("Extra", Text(details["extra_args"] or "none", overflow="fold")),
-        ]
-        view.update(grid(rows))
+        name = self.query_one("#f-name", Input).value.strip()
+        aliases = load_aliases()
+        try:
+            if not name:
+                raise ValueError("A profile needs a name.")
+            if name != old and name in aliases:
+                raise ValueError(f"A profile named {name} already exists.")
+            args = shlex.join(self.form_args(details))
+        except ValueError as error:
+            self.fail(str(error))
+            return
+        if name == old and args == aliases.get(old):
+            return
+        write_aliases(
+            {
+                (name if k == old else k): (args if k == old else v)
+                for k, v in aliases.items()
+            }
+        )
+        self.refresh_profiles(select=name)
+        self.notify(f"Saved {name}", timeout=2)
+
+    def action_edit(self) -> None:
+        if self.page == "serve" and self.editing:
+            self.query_one("#f-name").focus()
+
+    def action_new(self) -> None:
+        if self.page != "serve":
+            return
+        aliases = load_aliases()
+        base = aliases.get(self.editing)
+        if base is None and not self.models:
+            self.fail("Download a model first.")
+            return
+        name = next(
+            f"profile-{i}" for i in range(1, 1000) if f"profile-{i}" not in aliases
+        )
+        write_aliases(
+            {
+                **aliases,
+                name: base or shlex.quote(str(next(iter(self.models.values())))),
+            }
+        )
+        self.refresh_profiles(select=name)
+        self.query_one("#f-name").focus()
+
+    def action_delete(self) -> None:
+        if self.page == "serve" and self.editing:
+            self.pending_delete = self.editing
+            self.update_state()
+
+    def action_confirm(self) -> None:
+        if name := self.pending_delete:
+            self.pending_delete = ""
+            write_aliases({k: v for k, v in load_aliases().items() if k != name})
+            self.refresh_profiles()
+            self.update_state()
+            self.notify(f"Deleted {name}", timeout=2)
 
     @on(OptionList.OptionSelected, "#profiles")
     def toggle_server(self) -> None:
@@ -477,81 +589,103 @@ class LctApp(App[None]):
         if code > 0:
             self.fail(f"{name} exited with code {code}. See the output log.")
 
-    def action_new(self) -> None:
-        if self.page == "serve":
-            self.push_screen(EditScreen("", None), self.save_profile)
-
-    def action_edit(self) -> None:
-        if self.page == "serve" and (name := self.selected_profile()):
-            self.push_screen(
-                EditScreen(name, self.profiles[name]),
-                lambda result: self.save_profile(result, name),
-            )
-
-    def save_profile(
-        self, result: tuple[str, list[str]] | None, old_name: str = ""
-    ) -> None:
-        if not result:
-            return
-        name, args = result
-        aliases = {k: v for k, v in load_aliases().items() if k != old_name}
-        write_aliases({**aliases, name: shlex.join(args)})
-        self.refresh_profiles(select=name)
-        self.notify(f"Saved {name}")
-
-    def action_delete(self) -> None:
-        if self.page == "serve" and (name := self.selected_profile()):
-            self.pending_delete = name
-            self.update_state()
-
-    def action_confirm(self) -> None:
-        if name := self.pending_delete:
-            self.pending_delete = ""
-            write_aliases({k: v for k, v in load_aliases().items() if k != name})
-            self.refresh_profiles()
-            self.update_state()
-            self.notify(f"Deleted {name}")
-
-    # Download page
+    # Download page: search as you type, details of the highlighted repository
 
     def action_focus_search(self) -> None:
         if self.page == "download":
             self.query_one("#repo", Input).focus()
+
+    def action_to_results(self) -> None:
+        if (
+            self.focused is self.query_one("#repo")
+            and self.query_one("#results", OptionList).option_count
+        ):
+            self.query_one("#results").focus()
 
     def action_projector(self) -> None:
         if self.page == "download":
             self.with_projector = not self.with_projector
             self.update_state()
 
-    @on(Input.Submitted, "#repo")
+    @on(Input.Changed, "#repo")
     @work(exclusive=True, group="search")
     async def search(self) -> None:
-        repo = self.query_one("#repo", Input).value.strip()
-        heading = self.query_one("#files-heading", Label)
-        files = self.query_one("#files", OptionList)
-        heading.update(f"Searching {repo}…")
+        query = self.query_one("#repo", Input).value.strip()
+        await asyncio.sleep(0.3)  # Wait for typing to pause before querying.
+        heading = self.query_one("#results-heading", Label)
+        results = self.query_one("#results", OptionList)
+        if len(query) < 2:
+            heading.update("")
+            results.clear_options()
+            return
+        heading.update(f"Searching {query}…")
         try:
-            found = await asyncio.to_thread(list_repo_models, repo)
+            found = await asyncio.to_thread(search_repos, query)
         except Exception as error:
             heading.update("")
-            self.fail(f"Cannot list {repo}: {error}")
+            self.fail(f"Search failed: {error}")
             return
-        local = {path.name for path in list_downloaded_models()}
-        files.clear_options()
-        for name, size in sorted(found):
-            mark = ("  downloaded", GOOD) if Path(name).name in local else ""
-            size_text = (gib(size).rjust(10), MUTED)
-            files.add_option(
-                Option(Text.assemble(name.ljust(44), size_text, mark), name)
-            )
+        results.clear_options()
+        for info in found:
+            popularity = (f"{compact(info.downloads)} ↓".rjust(7) + "   ", MUTED)
+            row = Text.assemble(popularity, info.id)
+            results.add_option(Option(row, info.id))
         heading.update(
-            f"{len(found)} files in {repo}"
-            if found
-            else f"No model GGUF files in {repo}"
+            f"{len(found)} GGUF repositories" if found else "No GGUF repositories"
         )
         if found:
+            results.highlighted = 0
+
+    @on(Input.Submitted, "#repo")
+    def open_first_result(self) -> None:
+        results = self.query_one("#results", OptionList)
+        if results.option_count:
+            results.focus()
+
+    @on(OptionList.OptionHighlighted, "#results")
+    @work(exclusive=True, group="details")
+    async def show_repo(self, event: OptionList.OptionHighlighted) -> None:
+        repo = str(event.option.id)
+        await asyncio.sleep(0.2)  # Skip repositories the cursor only passes over.
+        if repo not in self.repos:
+            self.query_one("#repo-info", Static).update(
+                Text(f"Loading {repo}…", style=MUTED)
+            )
+            try:
+                self.repos[repo] = await asyncio.to_thread(repo_details, repo)
+            except Exception as error:
+                self.fail(f"Cannot load {repo}: {error}")
+                return
+        self.repo = repo
+        info, card = self.repos[repo]
+        self.query_one("#repo-info", Static).update(repo_view(info, card))
+        summary = Text(card_summary(card), style="#9aa4b2")
+        self.query_one("#repo-summary", Static).update(summary)
+        self.show_files(info)
+
+    def show_files(self, info: ModelInfo) -> None:
+        files = self.query_one("#files", OptionList)
+        found = model_files(info)
+        names = [
+            Path(re.sub(r"-00001-of-0*(\d+)", r" (\1 parts)", n)).name for n, _ in found
+        ]
+        # Files share a long model-name prefix; drop it so the quant stays visible.
+        prefix = os.path.commonprefix(names) if len(names) > 1 else ""
+        prefix = prefix[: max(prefix.rfind("-"), prefix.rfind("_")) + 1]
+        heading = f"{len(found)} model files" + (f" · {prefix}…" if prefix else "")
+        self.query_one("#files-heading", Label).update(heading)
+        files.clear_options()
+        for (name, size), label in zip(found, names, strict=True):
+            mark = ("  downloaded", GOOD) if Path(name).name in self.models else ""
+            size_text = (gib(size).rjust(9) + "   ", MUTED)
+            row = Text.assemble(size_text, label.removeprefix(prefix), mark)
+            files.add_option(Option(row, name))
+        if found:
             files.highlighted = 0
-            files.focus()
+
+    @on(OptionList.OptionSelected, "#results")
+    def open_repo(self) -> None:
+        self.query_one("#files").focus()
 
     @on(OptionList.OptionSelected, "#files")
     @work(group="download")
@@ -559,8 +693,7 @@ class LctApp(App[None]):
         if "download" in self.procs:
             self.fail("A download is already running.")
             return
-        name = str(event.option.id)
-        repo = self.query_one("#repo", Input).value.strip()
+        name, repo = str(event.option.id), self.repo
         cmd = [*LCT, "pull", repo, "--file", name]
         if not self.with_projector:
             cmd.append("--no-mmproj")
@@ -571,7 +704,7 @@ class LctApp(App[None]):
         self.notify(f"Downloaded {name}")
         self.refresh_models()
         self.refresh_profiles()
-        self.search()
+        self.show_files(self.repos[repo][0])
 
     # Benchmark page
 
@@ -589,7 +722,7 @@ class LctApp(App[None]):
             table.add_column(column)
         for _, test, speed, spread in self.results:
             table.add_row(test, Text(speed, style="bold"), Text(spread, style=MUTED))
-        view = self.query_one("#results", Static)
+        view = self.query_one("#results-table", Static)
         view.update(table if self.results else Text(note, style=MUTED))
 
     @work(group="bench")

@@ -48,8 +48,8 @@ uv run lct tui
 
 It is keyboard-driven: `1`–`3` switch pages, `q` quits, and the bottom line always shows the keys for the current page.
 
-- **Serve:** profiles on the left, settings of the highlighted one on the right. `enter` starts or stops it, `e` edits, `n` creates, `d` then `y` deletes. A profile whose model is not downloaded shows `model missing`.
-- **Download:** type a repository and press `enter`, then `enter` on a file to download it. `p` toggles its projector.
+- **Serve:** profiles on the left, the highlighted profile's settings on the right. `enter` starts or stops it. `tab` moves into the settings; changes save when you press `enter` or leave the field. Model and projector autocomplete from downloaded files. `n` copies the highlighted profile, `d` then `y` deletes it. A profile whose model is not downloaded shows `model missing`.
+- **Download:** type to search Hugging Face GGUF repositories. The highlighted repository shows popularity, license, base model, architecture, context, its files with sizes, and a summary from the model card. `↓` then `enter` opens a repository, `enter` on a file downloads it, `p` toggles its projector.
 - **Benchmark:** pick a model and press `enter` to run `llama-bench`; `enter` again stops it. Prompt, generate and depth accept comma lists such as `0,32768`.
 
 Profiles are the same aliases `lct serve <name>` uses. All output streams into the log at the bottom.

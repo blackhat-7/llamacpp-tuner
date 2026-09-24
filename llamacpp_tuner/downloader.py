@@ -4,7 +4,14 @@ import re
 from pathlib import Path, PurePosixPath
 from urllib.parse import quote
 
-from huggingface_hub import HfApi, RepoFile, hf_hub_download, list_repo_files
+from huggingface_hub import (
+    HfApi,
+    ModelCard,
+    ModelInfo,
+    hf_hub_download,
+    list_repo_files,
+)
+from huggingface_hub.errors import EntryNotFoundError, HfHubHTTPError
 
 from llamacpp_tuner.cache import get_models_dir
 
@@ -130,15 +137,43 @@ def find_gguf_files(
     return _select_model(_repo_files(repo_id), quant=quant, filename=filename)
 
 
-def list_repo_models(repo_id: str) -> list[tuple[str, int]]:
-    """Return each model GGUF in a repository with its size in bytes."""
-    return [
-        (item.path, item.size)
-        for item in HfApi().list_repo_tree(repo_id, recursive=True)
-        if isinstance(item, RepoFile)
-        and item.path.lower().endswith(".gguf")
-        and "mmproj" not in PurePosixPath(item.path).name.lower()
+def search_repos(query: str, limit: int = 30) -> list[ModelInfo]:
+    """Return GGUF repositories matching a query, most downloaded first."""
+    api = HfApi()
+    return list(
+        api.list_models(search=query, filter="gguf", sort="downloads", limit=limit)
+    )
+
+
+def repo_details(repo_id: str) -> tuple[ModelInfo, str]:
+    """Return repository metadata with file sizes, and the model card that
+    describes the model: the base model's card when there is one, since
+    quantizer cards mostly describe quantization."""
+    info = HfApi().model_info(repo_id, files_metadata=True)
+    base = (info.card_data or {}).get("base_model")
+    bases = [base] if isinstance(base, str) else base or []
+    for source in [*bases[:1], repo_id]:
+        try:
+            return info, ModelCard.load(source).text
+        except (EntryNotFoundError, HfHubHTTPError):
+            continue
+    return info, ""
+
+
+def model_files(info: ModelInfo) -> list[tuple[str, int]]:
+    """Return each model GGUF artifact with its size in bytes, smallest first.
+
+    A split model appears once, under its first shard, with the total size.
+    """
+    artifacts: dict[tuple[str, ...], list[tuple[str, int]]] = {}
+    for item in info.siblings or []:
+        name = item.rfilename
+        if name.lower().endswith(".gguf") and "mmproj" not in name.lower():
+            artifacts.setdefault(_artifact_key(name), []).append((name, item.size or 0))
+    found = [
+        (min(files)[0], sum(size for _, size in files)) for files in artifacts.values()
     ]
+    return sorted(found, key=lambda item: item[1])
 
 
 def find_mmproj_file(repo_id: str, filename: str | None = None) -> str | None:

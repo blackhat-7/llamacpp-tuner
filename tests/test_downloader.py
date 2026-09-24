@@ -154,20 +154,42 @@ def test_lists_nested_downloads(monkeypatch, tmp_path):
     assert downloader.list_downloaded_models() == [model]
 
 
-def test_list_repo_models_skips_projectors_and_other_files(monkeypatch):
-    from huggingface_hub import RepoFile
+def test_model_files_groups_shards_and_skips_projectors():
+    from huggingface_hub import ModelInfo
+    from huggingface_hub.hf_api import RepoSibling
 
-    def entry(path: str, size: int) -> RepoFile:
-        return RepoFile(path=path, size=size, oid="0", lfs=None, last_commit=None)
+    info = ModelInfo(id="owner/repo")
+    info.siblings = [
+        RepoSibling(rfilename="BF16/model-BF16-00002-of-00002.gguf", size=20),
+        RepoSibling(rfilename="BF16/model-BF16-00001-of-00002.gguf", size=30),
+        RepoSibling(rfilename="model-Q4_K_M.gguf", size=10),
+        RepoSibling(rfilename="mmproj-F16.gguf", size=2),
+        RepoSibling(rfilename="README.md", size=1),
+    ]
+
+    assert downloader.model_files(info) == [
+        ("model-Q4_K_M.gguf", 10),
+        ("BF16/model-BF16-00001-of-00002.gguf", 50),
+    ]
+
+
+def test_repo_details_prefers_the_base_model_card(monkeypatch):
+    from huggingface_hub import ModelInfo
+    from huggingface_hub.errors import EntryNotFoundError
 
     class FakeApi:
-        def list_repo_tree(self, repo_id, recursive):
-            return [
-                entry("model-Q4_K_M.gguf", 10),
-                entry("mmproj-F16.gguf", 2),
-                entry("README.md", 1),
-            ]
+        def model_info(self, repo_id, files_metadata):
+            return ModelInfo(id=repo_id, card_data={"base_model": "org/base"})
+
+    def load(repo_id):
+        if repo_id == "org/base" and cards_exist:
+            return type("Card", (), {"text": "base card"})
+        raise EntryNotFoundError("no card")
 
     monkeypatch.setattr(downloader, "HfApi", FakeApi)
+    monkeypatch.setattr(downloader.ModelCard, "load", load)
 
-    assert downloader.list_repo_models("owner/repo") == [("model-Q4_K_M.gguf", 10)]
+    cards_exist = True
+    assert downloader.repo_details("q/model-GGUF")[1] == "base card"
+    cards_exist = False
+    assert downloader.repo_details("q/model-GGUF")[1] == ""

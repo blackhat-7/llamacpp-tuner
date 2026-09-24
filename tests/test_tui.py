@@ -5,11 +5,12 @@ import io
 import sys
 
 import pytest
+from huggingface_hub import ModelInfo
 from rich.console import Console
 from textual.widgets import Input, OptionList, RichLog, Static
 
 from llamacpp_tuner.cli import load_aliases, write_aliases
-from llamacpp_tuner.tui import LctApp, bench_row
+from llamacpp_tuner.tui import LctApp, bench_row, card_summary
 
 FAKE_SERVER = """
 import time
@@ -53,13 +54,13 @@ def test_renders_every_page_at_common_widths(width, workspace):
     async def run() -> None:
         app = LctApp()
         async with app.run_test(size=(width, 40)) as pilot:
-            assert "4k" in text(app, "#details")
+            assert app.query_one("#f-ctx", Input).value == "4096"
             for key in "231":
                 await pilot.press(key)
                 await pilot.pause()
             app.query_one("#profiles", OptionList).highlighted = 1
             await pilot.pause()
-            assert "missing" in text(app, "#details")
+            assert app.query_one("#f-model", Input).has_class("-missing")
 
     asyncio.run(run())
 
@@ -81,29 +82,84 @@ def test_enter_starts_and_stops_the_highlighted_profile(monkeypatch, workspace):
     asyncio.run(run())
 
 
-def test_new_profile_is_saved_and_deleted_only_after_y(workspace):
+def test_settings_save_on_enter_and_rename_on_leave(workspace):
+    write_aliases({"mine": f"{workspace} --ctx 4096"})
+
+    async def run() -> None:
+        app = LctApp()
+        async with app.run_test(size=(100, 40)) as pilot:
+            assert app.query_one("#f-model", Input).value == workspace.name
+            app.query_one("#f-ctx", Input).focus()
+            app.query_one("#f-ctx", Input).value = "8192"
+            await pilot.press("enter")
+            assert load_aliases() == {"mine": f"{workspace} --ctx 8192"}
+
+            app.query_one("#f-name", Input).focus()
+            app.query_one("#f-name", Input).value = "renamed"
+            await pilot.press("escape")
+            await pilot.pause()
+            assert list(load_aliases()) == ["renamed"]
+
+            app.query_one("#f-model", Input).focus()
+            app.query_one("#f-model", Input).value = "nope.gguf"
+            await pilot.press("enter")
+            assert load_aliases() == {"renamed": f"{workspace} --ctx 8192"}
+
+    asyncio.run(run())
+
+
+def test_new_copies_the_profile_and_delete_needs_y(workspace):
+    write_aliases({"mine": f"{workspace} --ctx 4096"})
+
     async def run() -> None:
         app = LctApp()
         async with app.run_test(size=(100, 40)) as pilot:
             await pilot.press("n")
             await pilot.pause()
-            app.screen.query_one("#name", Input).value = "fresh"
-            app.screen.query_one("#ctx", Input).value = "8192"
-            await pilot.press("ctrl+s")
-            await pilot.pause()
-            assert load_aliases() == {"fresh": f"{workspace} --ctx 8192"}
+            assert load_aliases()["profile-1"] == f"{workspace} --ctx 4096"
+            assert app.focused is app.query_one("#f-name")
 
-            await pilot.press("d", "x")
-            assert "fresh" in load_aliases()
+            await pilot.press("escape", "d", "x")
+            assert "profile-1" in load_aliases()
             await pilot.press("d", "y")
-            assert load_aliases() == {}
+            assert list(load_aliases()) == ["mine"]
 
     asyncio.run(run())
 
 
-def test_search_lists_repo_files_and_enter_downloads(monkeypatch, workspace):
-    listing = [("model-Q4_K_M.gguf", 16 * 1024**3), ("model-Q8_0.gguf", 28 * 1024**3)]
-    monkeypatch.setattr("llamacpp_tuner.tui.list_repo_models", lambda repo: listing)
+def test_missing_model_is_kept_when_other_settings_change(workspace):
+    write_aliases({"swift": "owner/repo --file m.gguf --ctx 4096"})
+
+    async def run() -> None:
+        app = LctApp()
+        async with app.run_test(size=(100, 40)) as pilot:
+            assert app.query_one("#f-model", Input).has_class("-missing")
+            app.query_one("#f-ctx", Input).focus()
+            app.query_one("#f-ctx", Input).value = "8192"
+            await pilot.press("enter")
+            assert load_aliases() == {"swift": "owner/repo --file m.gguf --ctx 8192"}
+
+    asyncio.run(run())
+
+
+def test_search_as_you_type_shows_repo_details_and_downloads(monkeypatch, workspace):
+    info = ModelInfo(
+        id="owner/repo-GGUF",
+        downloads=176256,
+        likes=12,
+        gguf={
+            "architecture": "qwen35",
+            "total": 27_000_000_000,
+            "context_length": 262144,
+        },
+        siblings=[
+            {"rfilename": "m-Q4_K_M.gguf", "size": 16 * 1024**3},
+            {"rfilename": "mmproj-F16.gguf", "size": 1},
+        ],
+    )
+    card = "# Title\n\nThis model is a small and fast fine-tune that answers questions well."
+    monkeypatch.setattr("llamacpp_tuner.tui.search_repos", lambda query: [info])
+    monkeypatch.setattr("llamacpp_tuner.tui.repo_details", lambda repo: (info, card))
     monkeypatch.setattr(
         "llamacpp_tuner.tui.LCT",
         [sys.executable, "-c", "import sys; print('pulled', *sys.argv[1:])"],
@@ -111,22 +167,29 @@ def test_search_lists_repo_files_and_enter_downloads(monkeypatch, workspace):
 
     async def run() -> None:
         app = LctApp()
-        async with app.run_test(size=(100, 40)) as pilot:
-            await pilot.press("2")
-            await pilot.pause()
-            app.query_one("#repo", Input).value = "owner/repo"
-            await pilot.press("enter")
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.press("2", *"qwen")
             files = app.query_one("#files", OptionList)
-            await until(pilot, lambda: files.option_count == 2)
-            assert "downloaded" in str(files.get_option_at_index(0).prompt)
+            await until(pilot, lambda: files.option_count == 1)
+            details = text(app, "#repo-info") + text(app, "#repo-summary")
+            assert "176k downloads" in details and "qwen35 · 27B params" in details
+            assert "small and fast fine-tune" in details
 
-            await pilot.press("p", "down", "enter")
+            await pilot.press("down", "enter", "p", "enter")
             log = app.query_one("#log", RichLog)
             await until(pilot, lambda: any("pulled" in ln.text for ln in log.lines))
             output = "\n".join(line.text for line in log.lines)
-            assert "pull owner/repo --file model-Q8_0.gguf --no-mmproj" in output
+            assert "pull owner/repo-GGUF --file m-Q4_K_M.gguf --no-mmproj" in output
 
     asyncio.run(run())
+
+
+def test_card_summary_skips_html_headings_and_images():
+    card = '<div align="center"><img src="x.png"/></div>\n\n# Name\n\n![b](c.png)\n\n'
+    card += "**Name** is a [derivative](https://x) that uses fewer thinking tokens than its base."
+    assert card_summary(card) == (
+        "Name is a derivative that uses fewer thinking tokens than its base."
+    )
 
 
 def test_bench_row_names_prompt_generation_and_depth():
