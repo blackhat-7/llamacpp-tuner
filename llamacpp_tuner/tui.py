@@ -29,7 +29,11 @@ from textual.widgets import (
 )
 
 from llamacpp_tuner.cli import load_aliases, pick_projector, save_alias, serve
-from llamacpp_tuner.downloader import list_downloaded_models, resolve_model
+from llamacpp_tuner.downloader import (
+    list_downloaded_models,
+    list_repo_models,
+    resolve_model,
+)
 
 LCT = [sys.executable, "-m", "llamacpp_tuner.cli"]
 
@@ -332,3 +336,59 @@ class LctApp(App[None]):
             self.set_status(f"✕ Exited with code {code}", "error")
         else:
             self.set_status("○ Stopped")
+
+    # Download tab
+
+    @on(Input.Submitted, "#repo")
+    @on(Button.Pressed, "#search")
+    @work(exclusive=True, group="search")
+    async def search(self) -> None:
+        repo = self.query_one("#repo", Input).value.strip()
+        if not repo:
+            self.fail("Enter a repository such as owner/model-GGUF.")
+            return
+        table = self.query_one("#files", DataTable)
+        table.loading = True
+        try:
+            files = await asyncio.to_thread(list_repo_models, repo)
+        except Exception as error:
+            self.fail(f"Cannot list {repo}: {error}")
+            return
+        finally:
+            table.loading = False
+        local = {path.name for path in list_downloaded_models()}
+        table.clear()
+        for name, size in sorted(files):
+            mark = (
+                Text("✓ downloaded", style="green")
+                if name.split("/")[-1] in local
+                else ""
+            )
+            table.add_row(name, gib(size), mark, key=name)
+        if not files:
+            self.notify(f"No model GGUF files in {repo}.", severity="warning")
+        table.focus()
+
+    @on(Button.Pressed, "#download")
+    @work(group="download")
+    async def download(self) -> None:
+        table = self.query_one("#files", DataTable)
+        if not table.row_count:
+            self.fail("Search a repository and pick a file first.")
+            return
+        name = table.coordinate_to_cell_key(table.cursor_coordinate).row_key.value
+        repo = self.query_one("#repo", Input).value.strip()
+        cmd = [*LCT, "pull", repo, "--file", str(name)]
+        if not self.query_one("#with-mmproj", Switch).value:
+            cmd.append("--no-mmproj")
+        button = self.query_one("#download", Button)
+        button.disabled, button.label = True, "⬇ Downloading…"
+        self.notify(f"Downloading {name}. Large files take a while.")
+        code = await self.stream("download", cmd)
+        button.disabled, button.label = False, "⬇ Download"
+        if code:
+            self.fail(f"Download of {name} failed. See the output log.")
+            return
+        self.notify(f"Downloaded {name}")
+        self.refresh_choices()
+        self.search()

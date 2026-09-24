@@ -4,7 +4,7 @@ import re
 from pathlib import Path, PurePosixPath
 from urllib.parse import quote
 
-from huggingface_hub import hf_hub_download, list_repo_files
+from huggingface_hub import HfApi, RepoFile, hf_hub_download, list_repo_files
 
 from llamacpp_tuner.cache import get_models_dir
 
@@ -128,6 +128,17 @@ def find_gguf_files(
 ) -> list[str]:
     """Return one exact artifact or its complete shard set."""
     return _select_model(_repo_files(repo_id), quant=quant, filename=filename)
+
+
+def list_repo_models(repo_id: str) -> list[tuple[str, int]]:
+    """Return each model GGUF in a repository with its size in bytes."""
+    return [
+        (item.path, item.size)
+        for item in HfApi().list_repo_tree(repo_id, recursive=True)
+        if isinstance(item, RepoFile)
+        and item.path.lower().endswith(".gguf")
+        and "mmproj" not in PurePosixPath(item.path).name.lower()
+    ]
 
 
 def find_mmproj_file(repo_id: str, filename: str | None = None) -> str | None:

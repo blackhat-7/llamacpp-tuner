@@ -152,3 +152,22 @@ def test_lists_nested_downloads(monkeypatch, tmp_path):
     model.touch()
 
     assert downloader.list_downloaded_models() == [model]
+
+
+def test_list_repo_models_skips_projectors_and_other_files(monkeypatch):
+    from huggingface_hub import RepoFile
+
+    def entry(path: str, size: int) -> RepoFile:
+        return RepoFile(path=path, size=size, oid="0", lfs=None, last_commit=None)
+
+    class FakeApi:
+        def list_repo_tree(self, repo_id, recursive):
+            return [
+                entry("model-Q4_K_M.gguf", 10),
+                entry("mmproj-F16.gguf", 2),
+                entry("README.md", 1),
+            ]
+
+    monkeypatch.setattr(downloader, "HfApi", FakeApi)
+
+    assert downloader.list_repo_models("owner/repo") == [("model-Q4_K_M.gguf", 10)]
