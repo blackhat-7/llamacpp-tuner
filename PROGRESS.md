@@ -20,6 +20,6 @@ Next task: `PLAN.md`. Rules: `AGENTS.md`.
 - **MTP draft KV cache defaults to f16** unless `-ctkd q8_0 -ctvd q8_0` is passed.
 - **A plain SIGTERM to `llama-server` did not stop it within 120 s; SIGINT did.**
 - **The projector loads lazily.** It adds up to ~1.16 GB when the first image arrives, not at startup.
-- `hf_xet` downloads do not grow the `.incomplete` file steadily; check `~/.cache/huggingface/xet/logs/` to see progress.
+- **Slow Hugging Face downloads are the ISP route, not xet.** Measured 2026-09-25: xet at concurrency 1 and forced to 16 both gave ~1.4 MB/s; OVH also ~1 MB/s. Watch progress via the `.incomplete` file size under the repo's `.cache/huggingface/download/`.
 - **Textual `Label` has built-in `success` / `warning` / `error` classes** that paint a badge background. The status pill uses them on purpose.
 - **Never name an `App` method `run`.** It overrides Textual's `App.run` and `lct tui` breaks; the helper is `stream`.
