@@ -40,6 +40,18 @@ qwen = """owner/model-GGUF --quant Q6_K --ctx 32768 \
 
 `uv run lct serve qwen` then expands to those arguments. Options typed after the alias replace the alias's value for that option; `--extra-args` is replaced as a whole.
 
+### Terminal UI
+
+```bash
+uv run lct tui
+```
+
+- **Serve:** load a saved profile, adjust model, projector, context, host, port and extra args, then start or stop with `ctrl+s`. **Save** stores the form as a profile.
+- **Download:** search a repository, pick a GGUF from the size list, download it with or without its projector.
+- **Benchmark:** run `llama-bench` on a downloaded model. Prompt, generate and depth accept comma lists such as `0,32768`.
+
+All output streams into the log at the bottom. `ctrl+p` opens the command palette, including theme switching.
+
 `serve` changes only options explicitly supplied; all others remain llama.cpp defaults. Use `--mmproj PATH` for a local vision model. Repository pulls download an unambiguous projector automatically unless `--no-mmproj` is given.
 
 A source checkout stores files in `tmp/`; an installed package uses `${XDG_CACHE_HOME:-~/.cache}/lct`. Set `LCT_HOME` to override either location.

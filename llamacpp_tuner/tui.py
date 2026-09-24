@@ -2,6 +2,7 @@
 
 import asyncio
 import contextlib
+import json
 import os
 import shlex
 import signal
@@ -34,6 +35,7 @@ from llamacpp_tuner.downloader import (
     list_repo_models,
     resolve_model,
 )
+from llamacpp_tuner.llama import get_llama_binary
 
 LCT = [sys.executable, "-m", "llamacpp_tuner.cli"]
 
@@ -42,15 +44,15 @@ TabbedContent { height: 1fr; }
 .form { height: auto; padding: 1 2 0 2; }
 .row { height: auto; }
 .row > Label { width: 12; padding: 1 1 0 0; color: $text-muted; text-style: bold; }
-.row > .inline { width: auto; padding: 1 1 0 2; background: transparent; }
+.row > .inline { width: auto; padding: 1 1 0 2; }
 .row Input, .row Select { width: 1fr; }
-.row .narrow { width: 20; }
+.row .narrow { width: 12; }
 .actions { height: auto; padding: 1 0 0 12; }
 .actions Button { margin-right: 1; }
-.actions Label { padding: 1 1 0 1; }
-#status.ready { color: $success; }
-#status.busy { color: $warning; }
-#status.error { color: $error; }
+.actions Label { margin: 1 1 0 1; }
+.actions .spacer { width: 1fr; margin: 0; }
+.actions Input { width: 1fr; max-width: 24; min-width: 12; }
+#status { padding: 0 1; }
 DataTable { height: 1fr; margin: 1 2 0 2; background: $surface; }
 #log { height: 12; margin: 0 1; border: round $panel; background: $background; }
 """
@@ -81,6 +83,15 @@ def gib(num_bytes: int) -> str:
     return f"{num_bytes / 1024**3:.1f} GiB"
 
 
+def bench_row(result: dict) -> tuple[str, str, str, str]:
+    """Turn one llama-bench jsonl result into a table row."""
+    test = f"pp{result['n_prompt']}" if result["n_prompt"] else f"tg{result['n_gen']}"
+    if result["n_depth"]:
+        test += f" @ d{result['n_depth']}"
+    name = os.path.basename(result["model_filename"])
+    return name, test, f"{result['avg_ts']:.1f}", f"{result['stddev_ts']:.1f}"
+
+
 def row(label: str, *widgets: Widget) -> Horizontal:
     return Horizontal(Label(label), *widgets, classes="row")
 
@@ -107,12 +118,7 @@ class LctApp(App[None]):
         with TabbedContent():
             with TabPane("Serve", id="serve-tab"), Vertical(classes="form"):
                 yield row(
-                    "Profile",
-                    Select([], prompt="Load a saved profile", id="profile"),
-                    Input(
-                        placeholder="profile name", id="alias-name", classes="narrow"
-                    ),
-                    Button("Save", id="save"),
+                    "Profile", Select([], prompt="Load a saved profile", id="profile")
                 )
                 yield row("Model", Select([], prompt="Choose a model", id="model"))
                 yield row(
@@ -120,7 +126,12 @@ class LctApp(App[None]):
                 )
                 yield row(
                     "Context",
-                    Input(placeholder="default", type="integer", id="ctx"),
+                    Input(
+                        placeholder="default",
+                        type="integer",
+                        id="ctx",
+                        classes="narrow",
+                    ),
                     inline("Host"),
                     Input(placeholder="127.0.0.1", id="host"),
                     inline("Port"),
@@ -137,6 +148,9 @@ class LctApp(App[None]):
                 yield Horizontal(
                     Button("▶ Start", variant="success", id="serve"),
                     Label("○ Stopped", id="status"),
+                    Label(classes="spacer"),
+                    Input(placeholder="profile name", id="alias-name"),
+                    Button("Save", id="save"),
                     classes="actions",
                 )
             with TabPane("Download", id="download-tab"):
@@ -238,11 +252,12 @@ class LctApp(App[None]):
 
     # Serve tab
 
-    def set_status(self, text: str, state: str = "") -> None:
+    def set_status(self, text: str, state: str = "", url: str = "") -> None:
+        """State is a Label badge class: success, warning, error or none."""
         status = self.query_one("#status", Label)
         status.update(text)
         status.set_classes(state)
-        self.sub_title = text
+        self.sub_title = f"{text}  {url}".strip()
 
     def form_args(self) -> list[str]:
         model = self.query_one("#model", Select).value
@@ -307,7 +322,7 @@ class LctApp(App[None]):
     @on(Button.Pressed, "#serve")
     def action_toggle_server(self) -> None:
         if server := self.procs.get("server"):
-            self.set_status("◌ Stopping…", "busy")
+            self.set_status("◌ Stopping…", "warning")
             interrupt(server)
         else:
             self.start_server()
@@ -321,13 +336,12 @@ class LctApp(App[None]):
             return
         button = self.query_one("#serve", Button)
         button.label, button.variant = "■ Stop", "error"
-        self.set_status("◌ Loading model…", "busy")
+        self.set_status("◌ Loading model…", "warning")
 
         def watch(line: str) -> bool:
             if "listening on" in line:
-                self.set_status(
-                    f"● Ready  {line.split('listening on')[-1].strip()}", "ready"
-                )
+                url = line.split("listening on")[-1].strip()
+                self.set_status("● Ready", "success", url)
             return False
 
         code = await self.stream("server", [*LCT, "serve", *args], watch)
@@ -392,3 +406,55 @@ class LctApp(App[None]):
         self.notify(f"Downloaded {name}")
         self.refresh_choices()
         self.search()
+
+    # Benchmark tab
+
+    @on(Button.Pressed, "#bench")
+    def toggle_bench(self) -> None:
+        if bench := self.procs.get("bench"):
+            interrupt(bench)
+        else:
+            self.run_bench()
+
+    @work(group="bench")
+    async def run_bench(self) -> None:
+        model = self.query_one("#bench-model", Select).value
+        binary = get_llama_binary("llama-bench")
+        if not isinstance(model, str):
+            self.fail("Choose a model first.")
+            return
+        if not binary:
+            self.fail("llama-bench not found. Run 'lct setup'.")
+            return
+        cmd = [str(binary), "-m", model, "-o", "jsonl"]
+        for flag, selector in (
+            ("-p", "#pp"),
+            ("-n", "#tg"),
+            ("-d", "#depth"),
+            ("-r", "#reps"),
+        ):
+            if value := self.query_one(selector, Input).value.strip():
+                cmd += [flag, value]
+        try:
+            cmd += shlex.split(self.query_one("#bench-extra", Input).value)
+        except ValueError as error:
+            self.fail(f"Extra args: {error}")
+            return
+
+        table = self.query_one("#results", DataTable)
+
+        def collect(line: str) -> bool:
+            if not line.startswith("{"):
+                return False
+            try:
+                table.add_row(*bench_row(json.loads(line)))
+            except (json.JSONDecodeError, KeyError):
+                return False
+            return True
+
+        button = self.query_one("#bench", Button)
+        button.label, button.variant = "■ Stop", "error"
+        code = await self.stream("bench", cmd, collect)
+        button.label, button.variant = "▶ Run", "primary"
+        if code > 0:
+            self.fail(f"llama-bench exited with code {code}. See the output log.")

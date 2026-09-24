@@ -10,6 +10,6 @@ Each line carries its own done-check. A task too big for one session gets split 
 - [x] **TUI shell.** `lct tui` opens a Textual app with Serve / Download / Benchmark tabs, a shared output log and footer shortcuts. Done when a `run_test` smoke test renders at widths 40, 80 and 120.
 - [x] **Serve tab.** Load a profile (alias) into a form, edit model / projector / ctx / host / port / extra args, start and stop the server, save the form as a profile. Done when a test starts a fake server through the form and stops it.
 - [x] **Download tab.** Search a repository, list its GGUF files with sizes and a downloaded mark, download the selected one with an optional projector. Done when a test fills the table from a mocked listing.
-- [ ] **Benchmark tab.** Run `llama-bench -o jsonl` on a downloaded model with prompt / gen / depth / repeats / extra args; show results in a table; stop mid-run. Done when a test parses jsonl lines into rows.
+- [x] **Benchmark tab.** Run `llama-bench -o jsonl` on a downloaded model with prompt / gen / depth / repeats / extra args; show results in a table; stop mid-run. Done when a test parses jsonl lines into rows.
 - [ ] **Validate Swift aliases.** After `ukisai/Swift-Qwen3.8-27B-GGUF` Q4_K_S finishes downloading, load `swift-qwen-no-img` at 160k and read llama.cpp's projected device memory. Done when the number is in `PROGRESS.md`.
 - [ ] **Merge to main.** Branches `feat/serve-aliases` and `feat/tui` are pushed but not merged. Done when the user says how (fast-forward or PR).

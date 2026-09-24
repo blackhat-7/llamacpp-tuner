@@ -15,7 +15,7 @@ from textual.widgets import (
     TabbedContent,
 )
 
-from llamacpp_tuner.tui import LctApp
+from llamacpp_tuner.tui import LctApp, bench_row
 
 
 @pytest.fixture
@@ -71,7 +71,7 @@ def test_serve_starts_and_stops_from_the_form(monkeypatch, workspace):
             status = app.query_one("#status", Label)
             await pilot.press("ctrl+s")
             await until(pilot, lambda: "Ready" in str(status.content))
-            assert "http://127.0.0.1:9" in str(status.content)
+            assert "http://127.0.0.1:9" in app.sub_title
             await pilot.press("ctrl+s")
             await until(pilot, lambda: "Stopped" in str(status.content))
             assert "server" not in app.procs
@@ -132,5 +132,54 @@ def test_search_lists_repo_files_and_downloads_the_selected_one(monkeypatch, wor
             )
             text = "\n".join(line.text for line in log.lines)
             assert "pull owner/repo --file model-Q8_0.gguf --no-mmproj" in text
+
+    asyncio.run(run())
+
+
+def test_bench_row_names_prompt_generation_and_depth():
+    result = {
+        "model_filename": "/m/a.gguf",
+        "n_depth": 0,
+        "avg_ts": 911.04,
+        "stddev_ts": 2.3,
+    }
+
+    assert bench_row({**result, "n_prompt": 512, "n_gen": 0}) == (
+        "a.gguf",
+        "pp512",
+        "911.0",
+        "2.3",
+    )
+    assert (
+        bench_row({**result, "n_prompt": 0, "n_gen": 128, "n_depth": 4096})[1]
+        == "tg128 @ d4096"
+    )
+
+
+def test_benchmark_streams_llama_bench_results_into_the_table(
+    monkeypatch, workspace, tmp_path
+):
+    fake = tmp_path / "llama-bench"
+    fake.write_text(
+        f"#!{sys.executable}\n"
+        "import json\n"
+        "print('loading model', flush=True)\n"
+        "print(json.dumps({'model_filename': 'm.gguf', 'n_prompt': 512, 'n_gen': 0,"
+        " 'n_depth': 0, 'avg_ts': 900.0, 'stddev_ts': 1.0}))\n"
+    )
+    fake.chmod(0o755)
+    monkeypatch.setattr("llamacpp_tuner.tui.get_llama_binary", lambda name: fake)
+
+    async def run() -> None:
+        app = LctApp()
+        async with app.run_test(size=(100, 40)) as pilot:
+            app.query_one(TabbedContent).active = "bench-tab"
+            await pilot.pause()
+            app.query_one("#bench-model", Select).value = str(workspace)
+            await pilot.click("#bench")
+            table = app.query_one("#results", DataTable)
+            await until(pilot, lambda: table.row_count == 1)
+            assert table.get_row_at(0) == ["m.gguf", "pp512", "900.0", "1.0"]
+            await until(pilot, lambda: "bench" not in app.procs)
 
     asyncio.run(run())

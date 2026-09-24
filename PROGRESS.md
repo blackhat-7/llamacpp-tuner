@@ -11,8 +11,8 @@ Next task: `PLAN.md`. Rules: `AGENTS.md`.
 - `lct serve <alias>` works. Local aliases in `tmp/aliases.toml`: `qwen`, `qwen-no-img`, `swift-qwen`, `swift-qwen-no-img`, all on `100.64.0.1:6868`.
 - `ukisai/Swift-Qwen3.8-27B-GGUF` Q4_K_S (16.6 GB) was downloading at ~3 MB/s. The `swift-*` aliases fail with "Model not found" until it lands.
 - `textual` is a new dependency. `llama.get_llama_binary(name)` now finds `llama-bench` as well as `llama-server`.
-- `lct tui` exists: tabs, output log, Serve tab (profiles, start/stop with ctrl+s, save), Download tab (search with sizes, download). Benchmark tab is layout only.
-- Checks: `pytest` 41/41, ruff clean, pyright clean.
+- `lct tui` is complete: Serve (profiles, start/stop with `ctrl+s`, save), Download (search with sizes, download), Benchmark (`llama-bench -o jsonl` into a table, stop mid-run). Screenshot-checked at 70 and 120 columns.
+- Checks: `pytest` 43/43, ruff clean, pyright clean.
 
 ## Gotchas
 
@@ -21,3 +21,5 @@ Next task: `PLAN.md`. Rules: `AGENTS.md`.
 - **A plain SIGTERM to `llama-server` did not stop it within 120 s; SIGINT did.**
 - **The projector loads lazily.** It adds up to ~1.16 GB when the first image arrives, not at startup.
 - `hf_xet` downloads do not grow the `.incomplete` file steadily; check `~/.cache/huggingface/xet/logs/` to see progress.
+- **Textual `Label` has built-in `success` / `warning` / `error` classes** that paint a badge background. The status pill uses them on purpose.
+- **Never name an `App` method `run`.** It overrides Textual's `App.run` and `lct tui` breaks; the helper is `stream`.
