@@ -11,7 +11,8 @@ Next task: `PLAN.md`. Rules: `AGENTS.md`.
 - `lct serve <alias>` works. Local aliases in `tmp/aliases.toml`: `qwen`, `qwen-no-img`, `swift-qwen`, `swift-qwen-no-img`, all on `100.64.0.1:6868`.
 - `ukisai/Swift-Qwen3.8-27B-GGUF` Q4_K_S (16.6 GB) was downloading at ~3 MB/s. The `swift-*` aliases fail with "Model not found" until it lands.
 - `textual` is a new dependency. `llama.get_llama_binary(name)` now finds `llama-bench` as well as `llama-server`.
-- Checks: `pytest` 34/34, ruff clean, pyright clean.
+- `lct tui` exists: tabs, output log, Serve tab (profiles, start/stop with ctrl+s, save). Download and Benchmark tabs are layout only.
+- Checks: `pytest` 39/39, ruff clean, pyright clean.
 
 ## Gotchas
 

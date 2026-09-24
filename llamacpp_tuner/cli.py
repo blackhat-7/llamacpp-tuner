@@ -1,5 +1,6 @@
 """Command-line interface for lct."""
 
+import json
 import shlex
 import subprocess
 import tomllib
@@ -34,6 +35,24 @@ def load_aliases() -> dict[str, str]:
                 f"Alias '{name}' in {path} must be a string of serve arguments."
             )
     return aliases
+
+
+def save_alias(name: str, args: list[str]) -> None:
+    """Add or replace an alias. Rewriting the file drops its comments."""
+    aliases = {**load_aliases(), name: shlex.join(args)}
+    get_aliases_path().write_text(
+        "".join(
+            f"{json.dumps(key)} = {json.dumps(value)}\n"
+            for key, value in aliases.items()
+        )
+    )
+
+
+def pick_projector(model: str, mmproj: Path | None, no_mmproj: bool) -> Path | None:
+    """Use an explicit projector, else a repository's downloaded one."""
+    if mmproj or no_mmproj or model.lower().endswith(".gguf"):
+        return mmproj
+    return get_mmproj_path(model)
 
 
 class _AliasGroup(click.Group):
@@ -153,13 +172,7 @@ def serve(
     try:
         model_path = resolve_model(model, quant=quant, filename=filename)
 
-        selected_mmproj = mmproj
-        if (
-            not selected_mmproj
-            and not no_mmproj
-            and not model.lower().endswith(".gguf")
-        ):
-            selected_mmproj = get_mmproj_path(model)
+        selected_mmproj = pick_projector(model, mmproj, no_mmproj)
         if no_mmproj_offload and not selected_mmproj:
             raise click.UsageError(
                 "--no-mmproj-offload requires --mmproj or a downloaded repository projector."
@@ -198,6 +211,15 @@ def list_models() -> None:
         size_gib = model.stat().st_size / (1024**3)
         tag = " [projector]" if "mmproj" in model.name.lower() else ""
         click.echo(f"{model.relative_to(root)} ({size_gib:.2f} GiB){tag}")
+
+
+@main.command()
+def tui() -> None:
+    """Open the terminal UI."""
+    # Imported here so plain CLI commands do not pay for loading Textual.
+    from llamacpp_tuner.tui import LctApp
+
+    LctApp().run()
 
 
 if __name__ == "__main__":
