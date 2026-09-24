@@ -96,6 +96,25 @@ def test_tab_moves_between_panes_and_pages_switch_after_search(workspace):
     asyncio.run(run())
 
 
+def test_a_click_only_highlights_and_a_double_click_starts(monkeypatch, workspace):
+    write_aliases({"a": str(workspace), "b": str(workspace)})
+    monkeypatch.setattr("llamacpp_tuner.tui.LCT", [sys.executable, "-c", FAKE_SERVER])
+
+    async def run() -> None:
+        app = LctApp()
+        async with app.run_test(size=(100, 40)) as pilot:
+            await pilot.click("#profiles", offset=(4, 1))
+            await pilot.pause(0.3)
+            assert app.selected_profile() == "b"
+            assert "server" not in app.procs
+            await pilot.click("#profiles", offset=(4, 1), times=2)
+            await until(pilot, lambda: app.serving == "b")
+            await pilot.press("enter")
+            await until(pilot, lambda: "server" not in app.procs)
+
+    asyncio.run(run())
+
+
 def test_enter_starts_and_stops_the_highlighted_profile(monkeypatch, workspace):
     write_aliases({"mine": str(workspace)})
     monkeypatch.setattr("llamacpp_tuner.tui.LCT", [sys.executable, "-c", FAKE_SERVER])
@@ -225,6 +244,9 @@ def test_search_shows_repo_details_and_downloads(monkeypatch, workspace):
             assert "small and fast fine-tune" in details
 
             await pilot.press("enter", "enter", "p", "enter")
+            assert "press y to download m-Q4_K_M.gguf (16.0 GiB)" in text(app, "#hints")
+            assert "download" not in app.procs
+            await pilot.press("y")
             log = app.query_one("#log", RichLog)
             await until(pilot, lambda: any("pulled" in ln.text for ln in log.lines))
             output = "\n".join(line.text for line in log.lines)

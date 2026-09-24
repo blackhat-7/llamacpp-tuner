@@ -17,7 +17,7 @@ from huggingface_hub import ModelInfo
 from rich.console import Group
 from rich.table import Table
 from rich.text import Text
-from textual import on, work
+from textual import events, on, work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
@@ -97,6 +97,7 @@ HINTS = {
     "serve": "enter start/stop  tab settings  n new  d delete",
     "serve-settings": "enter edit  tab profiles",
     "download": "/ search  tab files  enter download  p projector",
+    "downloading": "c cancel-download  / search  p projector",
     "bench": "enter run/stop  tab settings",
     "bench-settings": "enter edit  tab models",
     "editor": "enter save  esc cancel",
@@ -277,6 +278,19 @@ def repo_view(info: ModelInfo) -> Group:
     return Group(Text(info.id, style="bold"), Text(""), grid(rows))
 
 
+class PickList(OptionList):
+    """An OptionList where a click only highlights; enter or a double-click acts."""
+
+    async def _on_click(self, event: events.Click) -> None:
+        event.prevent_default()  # Textual would also run OptionList's click-selects.
+        index = event.style.meta.get("option")
+        if index is None or self.get_option_at_index(index).disabled:
+            return
+        self.highlighted = index
+        if event.chain > 1:
+            self.action_select()
+
+
 class LctApp(App[None]):
     TITLE = "lct"
     CSS = CSS
@@ -291,6 +305,7 @@ class LctApp(App[None]):
         Binding("n", "new"),
         Binding("d", "delete"),
         Binding("y", "confirm"),
+        Binding("c", "cancel_download"),
         Binding("p", "projector"),
         Binding("slash", "search"),
         Binding("escape", "leave"),
@@ -307,7 +322,8 @@ class LctApp(App[None]):
         self.editing = ""
         self.edit_target: tuple[str, str] | None = None
         self.serving = self.url = ""
-        self.pending_delete = ""
+        # A question awaiting y, and what y does.
+        self.pending: tuple[str, Callable[[], object]] | None = None
         self.with_projector = True
         self.repo = ""
         self.repos: dict[str, tuple[ModelInfo, str]] = {}
@@ -327,10 +343,10 @@ class LctApp(App[None]):
             with Horizontal(id="serve-page", classes="page"):
                 with Vertical(classes="column"):
                     yield Label("Profiles", classes="heading")
-                    yield OptionList(id="profiles")
+                    yield PickList(id="profiles")
                 with Vertical(classes="column"):
                     yield Label("Settings", classes="heading")
-                    yield OptionList(id="settings")
+                    yield PickList(id="settings")
             with Vertical(id="download-page", classes="page"):
                 with Horizontal(id="search-row"):
                     yield Label("Search")
@@ -338,19 +354,19 @@ class LctApp(App[None]):
                 with Horizontal():
                     with Vertical(classes="column"):
                         yield Label("", id="results-heading", classes="heading")
-                        yield OptionList(id="results")
+                        yield PickList(id="results")
                     with VerticalScroll(classes="column"):
                         yield Static(id="repo-info")
                         yield Label("", id="files-heading", classes="heading gap")
-                        yield OptionList(id="files")
+                        yield PickList(id="files")
                         yield Static(id="repo-summary", classes="gap")
             with Horizontal(id="bench-page", classes="page"):
                 with Vertical(classes="column"):
                     yield Label("Model", classes="heading")
-                    yield OptionList(id="bench-model")
+                    yield PickList(id="bench-model")
                 with Vertical(classes="column"):
                     yield Label("Settings", classes="heading")
-                    yield OptionList(id="bench-settings")
+                    yield PickList(id="bench-settings")
                     yield Static(id="results-table", classes="gap")
         with Horizontal(id="editor"):
             yield Label("", id="editor-label")
@@ -404,28 +420,38 @@ class LctApp(App[None]):
             context = "search"
         elif focused is not None and focused.id in ("settings", "bench-settings"):
             context = f"{self.page}-settings"
+        if context == "download" and "download" in self.procs:
+            context = "downloading"
         keys = HINTS[context]
-        if context == "download":
+        if context in ("download", "downloading"):
             state = "on" if self.with_projector else "off"
             keys = keys.replace("p projector", f"p projector-{state}")
         hints = hint_line(keys)
         if context not in ("editor", "search"):
             hints.append_text(hint_line("1-3 pages  q quit"))
-        if self.pending_delete:
-            hints = Text(
-                f"press y to delete {self.pending_delete}, any other key keeps it",
-                style=WARN,
-            )
+        if self.pending:
+            hints = Text(self.pending[0], style=WARN)
         self.query_one("#hints", Static).update(hints)
 
     def on_descendant_focus(self) -> None:
         self.update_hints()
 
     def on_key(self, event) -> None:
-        # Only y confirms a pending delete; any other key abandons it.
-        if self.pending_delete and event.key != "y":
-            self.pending_delete = ""
+        # Only y confirms a pending question; any other key abandons it.
+        if self.pending and event.key != "y":
+            self.pending = None
             self.update_hints()
+
+    def ask(self, question: str, action: Callable[[], object]) -> None:
+        self.pending = (question, action)
+        self.update_hints()
+
+    def action_confirm(self) -> None:
+        if self.pending:
+            action = self.pending[1]
+            self.pending = None
+            self.update_hints()
+            action()
 
     def action_page(self, page: str) -> None:
         self.query_one(Tabs).active = page
@@ -651,17 +677,14 @@ class LctApp(App[None]):
         self.open_editor(("serve", "name"), SETTINGS["name"], name)
 
     def action_delete(self) -> None:
-        if self.page == "serve" and self.editing and not self.edit_target:
-            self.pending_delete = self.editing
-            self.update_hints()
+        if self.page == "serve" and (name := self.editing) and not self.edit_target:
+            question = f"press y to delete {name}, any other key keeps it"
+            self.ask(question, lambda: self.delete_profile(name))
 
-    def action_confirm(self) -> None:
-        if name := self.pending_delete:
-            self.pending_delete = ""
-            write_aliases({k: v for k, v in load_aliases().items() if k != name})
-            self.refresh_profiles()
-            self.update_hints()
-            self.notify(f"Deleted {name}", timeout=2)
+    def delete_profile(self, name: str) -> None:
+        write_aliases({k: v for k, v in load_aliases().items() if k != name})
+        self.refresh_profiles()
+        self.notify(f"Deleted {name}", timeout=2)
 
     @on(OptionList.OptionSelected, "#profiles")
     def toggle_server(self) -> None:
@@ -777,18 +800,32 @@ class LctApp(App[None]):
         self.query_one("#files").focus()
 
     @on(OptionList.OptionSelected, "#files")
-    @work(group="download")
-    async def download(self, event: OptionList.OptionSelected) -> None:
+    def confirm_download(self, event: OptionList.OptionSelected) -> None:
         if "download" in self.procs:
-            self.fail("A download is already running.")
+            self.fail("A download is already running. Press c to cancel it.")
             return
         name, repo = str(event.option.id), self.repo
+        size = dict(model_files(self.repos[repo][0])).get(name, 0)
+        extra = " plus its projector" if self.with_projector else ""
+        question = f"press y to download {Path(name).name} ({gib(size)}){extra}, any other key cancels"
+        self.ask(question, lambda: self.download(repo, name))
+
+    def action_cancel_download(self) -> None:
+        if download := self.procs.get("download"):
+            interrupt(download)
+            self.notify("Cancelling download", timeout=2)
+
+    @work(group="download")
+    async def download(self, repo: str, name: str) -> None:
         cmd = [*LCT, "pull", repo, "--file", name]
         if not self.with_projector:
             cmd.append("--no-mmproj")
         self.notify(f"Downloading {name}")
-        if await self.stream("download", cmd):
-            self.fail(f"Download of {name} failed. See the output log.")
+        self.update_hints()
+        code = await self.stream("download", cmd)
+        self.update_hints()
+        if code:
+            self.fail(f"Download of {name} stopped. See the output log.")
             return
         self.notify(f"Downloaded {name}")
         self.refresh_models()

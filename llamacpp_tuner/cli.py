@@ -2,6 +2,7 @@
 
 import json
 import shlex
+import signal
 import subprocess
 import tomllib
 from pathlib import Path
@@ -219,6 +220,9 @@ def tui() -> None:
     from llamacpp_tuner.tui import LctApp
 
     app = LctApp()
+    # A closed terminal (SIGHUP) or kill (SIGTERM) must still stop child servers.
+    for sig in (signal.SIGHUP, signal.SIGTERM):
+        signal.signal(sig, lambda *_: app.exit())
     try:
         app.run()
     finally:
