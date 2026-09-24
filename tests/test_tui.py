@@ -37,6 +37,21 @@ def text(app: LctApp, selector: str) -> str:
     return console.export_text()
 
 
+def row(app: LctApp, selector: str, option_id: str) -> str:
+    return str(app.query_one(selector, OptionList).get_option(option_id).prompt)
+
+
+async def edit(pilot, app: LctApp, key: str, value: str) -> None:
+    """Open a setting with enter, type a new value and press enter."""
+    settings = app.query_one("#settings", OptionList)
+    settings.focus()
+    settings.highlighted = settings.get_option_index(key)
+    await pilot.press("enter")
+    app.query_one("#editor-input", Input).value = value
+    await pilot.press("enter")
+    await pilot.pause()
+
+
 @pytest.fixture
 def workspace(monkeypatch, tmp_path):
     model = tmp_path / "model-Q4_K_M.gguf"
@@ -55,13 +70,28 @@ def test_renders_every_page_at_common_widths(width, workspace):
     async def run() -> None:
         app = LctApp()
         async with app.run_test(size=(width, 40)) as pilot:
-            assert app.query_one("#f-ctx", Input).value == "4096"
+            assert "4096" in row(app, "#settings", "ctx")
             for key in "231":
                 await pilot.press(key)
                 await pilot.pause()
-            app.query_one("#profiles", OptionList).highlighted = 1
-            await pilot.pause()
-            assert app.query_one("#f-model", Input).has_class("-missing")
+            assert "model missing" in row(app, "#profiles", "gone")
+
+    asyncio.run(run())
+
+
+def test_tab_moves_between_panes_and_pages_switch_after_search(workspace):
+    async def run() -> None:
+        app = LctApp()
+        async with app.run_test(size=(100, 40)) as pilot:
+            await pilot.press("tab")
+            assert app.focused is app.query_one("#settings")
+            await pilot.press("tab")
+            assert app.focused is app.query_one("#profiles")
+
+            await pilot.press("2", "slash", "3")
+            assert app.query_one("#repo", Input).value == "3"
+            await pilot.press("escape", "3")
+            assert app.page == "bench"
 
     asyncio.run(run())
 
@@ -99,10 +129,8 @@ def test_quitting_stops_the_server(monkeypatch, workspace, tmp_path):
             await pilot.press("q")
         pid = int(pid_file.read_text())
         for _ in range(100):
-            if (
-                not Path(f"/proc/{pid}").exists()
-                or " Z " in Path(f"/proc/{pid}/stat").read_text()
-            ):
+            stat = Path(f"/proc/{pid}/stat")
+            if not stat.exists() or " Z " in stat.read_text():
                 return
             await asyncio.sleep(0.05)
         raise AssertionError("server survived quitting the UI")
@@ -110,28 +138,24 @@ def test_quitting_stops_the_server(monkeypatch, workspace, tmp_path):
     asyncio.run(run())
 
 
-def test_settings_save_on_enter_and_rename_on_leave(workspace):
+def test_settings_edit_in_place_and_reject_unknown_models(workspace):
     write_aliases({"mine": f"{workspace} --ctx 4096"})
 
     async def run() -> None:
         app = LctApp()
         async with app.run_test(size=(100, 40)) as pilot:
-            assert app.query_one("#f-model", Input).value == workspace.name
-            app.query_one("#f-ctx", Input).focus()
-            app.query_one("#f-ctx", Input).value = "8192"
-            await pilot.press("enter")
+            await edit(pilot, app, "ctx", "8192")
             assert load_aliases() == {"mine": f"{workspace} --ctx 8192"}
 
-            app.query_one("#f-name", Input).focus()
-            app.query_one("#f-name", Input).value = "renamed"
-            await pilot.press("escape")
-            await pilot.pause()
+            await edit(pilot, app, "name", "renamed")
             assert list(load_aliases()) == ["renamed"]
 
-            app.query_one("#f-model", Input).focus()
-            app.query_one("#f-model", Input).value = "nope.gguf"
-            await pilot.press("enter")
+            await edit(pilot, app, "model", "nope.gguf")
             assert load_aliases() == {"renamed": f"{workspace} --ctx 8192"}
+            assert app.edit_target is not None
+            await pilot.press("escape")
+            assert app.edit_target is None
+            assert app.focused is app.query_one("#settings")
 
     asyncio.run(run())
 
@@ -145,9 +169,9 @@ def test_new_copies_the_profile_and_delete_needs_y(workspace):
             await pilot.press("n")
             await pilot.pause()
             assert load_aliases()["profile-1"] == f"{workspace} --ctx 4096"
-            assert app.focused is app.query_one("#f-name")
+            assert app.focused is app.query_one("#editor-input")
 
-            await pilot.press("escape", "d", "x")
+            await pilot.press("escape", "shift+tab", "d", "x")
             assert "profile-1" in load_aliases()
             await pilot.press("d", "y")
             assert list(load_aliases()) == ["mine"]
@@ -161,16 +185,13 @@ def test_missing_model_is_kept_when_other_settings_change(workspace):
     async def run() -> None:
         app = LctApp()
         async with app.run_test(size=(100, 40)) as pilot:
-            assert app.query_one("#f-model", Input).has_class("-missing")
-            app.query_one("#f-ctx", Input).focus()
-            app.query_one("#f-ctx", Input).value = "8192"
-            await pilot.press("enter")
+            await edit(pilot, app, "ctx", "8192")
             assert load_aliases() == {"swift": "owner/repo --file m.gguf --ctx 8192"}
 
     asyncio.run(run())
 
 
-def test_search_as_you_type_shows_repo_details_and_downloads(monkeypatch, workspace):
+def test_search_shows_repo_details_and_downloads(monkeypatch, workspace):
     info = ModelInfo(
         id="owner/repo-GGUF",
         downloads=176256,
@@ -196,14 +217,14 @@ def test_search_as_you_type_shows_repo_details_and_downloads(monkeypatch, worksp
     async def run() -> None:
         app = LctApp()
         async with app.run_test(size=(120, 40)) as pilot:
-            await pilot.press("2", *"qwen")
+            await pilot.press("2", "slash", *"qwen")
             files = app.query_one("#files", OptionList)
             await until(pilot, lambda: files.option_count == 1)
             details = text(app, "#repo-info") + text(app, "#repo-summary")
             assert "176k downloads" in details and "qwen35 · 27B params" in details
             assert "small and fast fine-tune" in details
 
-            await pilot.press("down", "enter", "p", "enter")
+            await pilot.press("enter", "enter", "p", "enter")
             log = app.query_one("#log", RichLog)
             await until(pilot, lambda: any("pulled" in ln.text for ln in log.lines))
             output = "\n".join(line.text for line in log.lines)
@@ -234,13 +255,13 @@ def test_bench_row_names_prompt_generation_and_depth():
     assert bench_row(depth)[1] == "tg128 @ d4096"
 
 
-def test_benchmark_streams_llama_bench_results(monkeypatch, workspace, tmp_path):
+def test_benchmark_settings_edit_and_results_stream(monkeypatch, workspace, tmp_path):
     fake = tmp_path / "llama-bench"
     fake.write_text(
         f"#!{sys.executable}\n"
-        "import json\n"
-        "print('loading model', flush=True)\n"
-        "print(json.dumps({'model_filename': 'm.gguf', 'n_prompt': 512, 'n_gen': 0,"
+        "import json, sys\n"
+        "print('args', *sys.argv[1:], flush=True)\n"
+        "print(json.dumps({'model_filename': 'm.gguf', 'n_prompt': 1024, 'n_gen': 0,"
         " 'n_depth': 0, 'avg_ts': 900.0, 'stddev_ts': 1.0}))\n"
     )
     fake.chmod(0o755)
@@ -249,10 +270,12 @@ def test_benchmark_streams_llama_bench_results(monkeypatch, workspace, tmp_path)
     async def run() -> None:
         app = LctApp()
         async with app.run_test(size=(100, 40)) as pilot:
-            await pilot.press("3")
-            await pilot.pause()
-            await pilot.press("enter")
+            await pilot.press("3", "tab", "enter")
+            app.query_one("#editor-input", Input).value = "1024"
+            await pilot.press("enter", "shift+tab", "enter")
             await until(pilot, lambda: app.results and "bench" not in app.procs)
-            assert app.results == [("m.gguf", "pp512", "900.0", "± 1.0")]
+            assert app.results == [("m.gguf", "pp1024", "900.0", "± 1.0")]
+            log = "\n".join(line.text for line in app.query_one("#log", RichLog).lines)
+            assert "-p 1024" in log
 
     asyncio.run(run())

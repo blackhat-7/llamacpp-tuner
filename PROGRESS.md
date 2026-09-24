@@ -11,8 +11,8 @@ Next task: `PLAN.md`. Rules: `AGENTS.md`.
 - `lct serve <alias>` works. Local aliases in `tmp/aliases.toml`: `qwen`, `qwen-no-img`, `swift-qwen`, `swift-qwen-no-img`, all on `100.64.0.1:6868`.
 - `ukisai/Swift-Qwen3.8-27B-GGUF` Q4_K_S and its projector are downloaded. `swift-qwen` at 128k projects 21408 MiB before the projector's ~1158 MiB; fits.
 - `textual` is a new dependency. `llama.get_llama_binary(name)` now finds `llama-bench` as well as `llama-server`.
-- `lct tui` is keyboard-driven in forseti's style. Serve edits profiles in place (autosave on enter or leaving a field; `n` copies, `d`+`y` deletes). Download searches Hugging Face as you type and shows details, files (shards grouped, smallest first) and a card summary from the base model.
-- Checks: `pytest` 48/48, ruff clean, pyright clean.
+- `lct tui`: settings are plain label/value rows; `enter` opens a one-line editor. `tab`/`←→` move between two panes only; `/` search; `esc` always backs out, so `1`–`3` always work outside a text box. Quitting stops child processes.
+- Checks: `pytest` 49/49, ruff clean, pyright clean.
 
 ## Gotchas
 

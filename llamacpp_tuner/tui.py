@@ -72,40 +72,58 @@ Screen { padding: 1 2 0 2; }
 #state { width: auto; }
 Tabs { height: 2; margin-bottom: 1; }
 Tabs Tab { padding: 0 3 0 0; color: $text-muted; }
+Tabs Tab.-active { color: $accent; text-style: bold; }
 ContentSwitcher { height: 1fr; }
 .page { height: 1fr; }
 .column { width: 1fr; height: 1fr; padding-right: 4; }
 .heading { color: $accent; text-style: bold; margin-bottom: 1; }
-Tabs Tab.-active { color: $accent; text-style: bold; }
 .gap { margin-top: 1; }
 OptionList { border: none; background: transparent; padding: 0; height: auto; max-height: 16; text-wrap: nowrap; text-overflow: ellipsis; }
 OptionList:focus { border: none; background-tint: transparent; }
-OptionList > .option-list--option-highlighted { background: $panel; text-style: none; }
+OptionList > .option-list--option-highlighted { background: transparent; text-style: none; }
 OptionList:focus > .option-list--option-highlighted { background: $primary 25%; color: $foreground; }
 Input { border: none; height: 1; padding: 0 1; background: $panel; width: 1fr; }
 Input:focus { background: $primary 20%; }
-Input.-missing { color: $warning; }
-.field { height: 1; margin-bottom: 1; }
-.field Label { width: 12; color: $text-muted; }
+#search-row { height: 1; margin-bottom: 1; }
+#search-row Label { width: 12; color: $text-muted; }
+#editor { height: 1; margin-top: 1; display: none; }
+#editor.-open { display: block; }
+#editor Label { width: auto; color: $accent; text-style: bold; padding-right: 2; }
 #log { height: 8; background: transparent; border: none; padding: 0; }
 #hints { height: 1; margin-top: 1; }
 """
 
 HINTS = {
-    "serve": "enter start/stop  tab edit  n new  d delete",
-    "download": "↓ results  enter open/download  p projector",
-    "bench": "enter run/stop  tab next field",
+    "serve": "enter start/stop  tab settings  n new  d delete",
+    "serve-settings": "enter edit  tab profiles",
+    "download": "/ search  tab files  enter download  p projector",
+    "bench": "enter run/stop  tab settings",
+    "bench-settings": "enter edit  tab models",
+    "editor": "enter save  esc cancel",
+    "search": "enter results  esc done",
 }
-HOME_FOCUS = {"serve": "#profiles", "download": "#results", "bench": "#bench-model"}
-SETTINGS = [
-    ("Name", "name"),
-    ("Model", "model"),
-    ("Projector", "mmproj"),
-    ("Context", "ctx"),
-    ("Host", "host"),
-    ("Port", "port"),
-    ("Extra args", "extra"),
-]
+PANES = {
+    "serve": ["#profiles", "#settings"],
+    "download": ["#results", "#files"],
+    "bench": ["#bench-model", "#bench-settings"],
+}
+SETTINGS = {
+    "name": "Name",
+    "model": "Model",
+    "mmproj": "Projector",
+    "ctx": "Context",
+    "host": "Host",
+    "port": "Port",
+    "extra": "Extra args",
+}
+BENCH_SETTINGS = {
+    "pp": ("Prompt", "-p", "512"),
+    "tg": ("Generate", "-n", "128"),
+    "depth": ("Depth", "-d", "0"),
+    "reps": ("Repeats", "-r", "3"),
+    "extra": ("Extra args", "", "-fa on -ctk q8_0 -ctv q8_0"),
+}
+DEFAULTS = {"ctx": "model default", "host": "127.0.0.1", "port": "8080"}
 
 
 async def spawn(cmd: list[str]) -> asyncio.subprocess.Process:
@@ -156,6 +174,16 @@ def hint_line(keys: str) -> Text:
     return text
 
 
+def setting_row(label: str, value: Text | str) -> Text:
+    return Text.assemble((label.ljust(12), MUTED), value)
+
+
+def sized_row(size: int, name: str, mark: str = "") -> Text:
+    """A file row with its size first, so long names never run into it."""
+    row = Text.assemble((gib(size).rjust(9) + "   ", NUMBER), name)
+    return row.append(f"  {mark}", style=GOOD) if mark else row
+
+
 def card_summary(card: str, limit: int = 420) -> str:
     """First prose paragraph of a model card, without HTML or markdown clutter."""
     text = html.unescape(re.sub(r"<[^>]+>|!\[[^\]]*\]\([^)]*\)", "", card))
@@ -178,7 +206,7 @@ def bench_row(result: dict) -> tuple[str, str, str, str]:
 
 
 def profile(args: str) -> dict:
-    """Parse a saved profile into form values plus the tokens behind them."""
+    """Parse a saved profile into setting values plus the tokens behind them."""
     ctx = serve.make_context("serve", shlex.split(args), resilient_parsing=True)
     p = ctx.params
     try:
@@ -215,11 +243,7 @@ def grid(rows: list[tuple[str, Text | str]]) -> Table:
     return table
 
 
-def field(label: str, widget: Input) -> Horizontal:
-    return Horizontal(Label(label), widget, classes="field")
-
-
-def repo_view(info: ModelInfo, card: str) -> Group:
+def repo_view(info: ModelInfo) -> Group:
     data = info.card_data.to_dict() if info.card_data else {}
     gguf = info.gguf or {}
     model = " · ".join(
@@ -242,15 +266,13 @@ def repo_view(info: ModelInfo, card: str) -> Group:
         (f"{info.likes or 0} ", MEDIA),
         "likes",
     )
+    updated = str(info.last_modified or info.created_at or "—")[:10]
     rows: list[tuple[str, Text | str]] = [
         ("Popularity", popularity),
         ("License", Text(license, style=GOOD if open_license else WARN)),
         ("Base", ", ".join(base) if isinstance(base, list) else str(base or "—")),
         ("Model", Text(model or "—", style=NUMBER)),
-        (
-            "Updated",
-            Text(str(info.last_modified or info.created_at or "—")[:10], style=SOFT),
-        ),
+        ("Updated", Text(updated, style=SOFT)),
     ]
     return Group(Text(info.id, style="bold"), Text(""), grid(rows))
 
@@ -262,13 +284,15 @@ class LctApp(App[None]):
         Binding("1", "page('serve')"),
         Binding("2", "page('download')"),
         Binding("3", "page('bench')"),
-        Binding("e", "edit"),
+        Binding("tab", "pane(1)", priority=True),
+        Binding("shift+tab", "pane(-1)", priority=True),
+        Binding("right", "pane(1)"),
+        Binding("left", "pane(-1)"),
         Binding("n", "new"),
         Binding("d", "delete"),
         Binding("y", "confirm"),
         Binding("p", "projector"),
-        Binding("slash", "focus_search"),
-        Binding("down", "to_results"),
+        Binding("slash", "search"),
         Binding("escape", "leave"),
         Binding("q", "quit"),
         Binding("ctrl+l", "clear_log"),
@@ -281,11 +305,13 @@ class LctApp(App[None]):
         self.models: dict[str, Path] = {}
         self.projectors: dict[str, Path] = {}
         self.editing = ""
+        self.edit_target: tuple[str, str] | None = None
         self.serving = self.url = ""
         self.pending_delete = ""
         self.with_projector = True
         self.repo = ""
         self.repos: dict[str, tuple[ModelInfo, str]] = {}
+        self.bench = {key: default for key, (_, _, default) in BENCH_SETTINGS.items()}
         self.results: list[tuple[str, str, str, str]] = []
 
     def compose(self) -> ComposeResult:
@@ -304,10 +330,11 @@ class LctApp(App[None]):
                     yield OptionList(id="profiles")
                 with Vertical(classes="column"):
                     yield Label("Settings", classes="heading")
-                    for label, key in SETTINGS:
-                        yield field(label, Input(id=f"f-{key}", classes="setting"))
+                    yield OptionList(id="settings")
             with Vertical(id="download-page", classes="page"):
-                yield field("Search", Input(id="repo"))
+                with Horizontal(id="search-row"):
+                    yield Label("Search")
+                    yield Input(id="repo")
                 with Horizontal():
                     with Vertical(classes="column"):
                         yield Label("", id="results-heading", classes="heading")
@@ -323,15 +350,11 @@ class LctApp(App[None]):
                     yield OptionList(id="bench-model")
                 with Vertical(classes="column"):
                     yield Label("Settings", classes="heading")
-                    yield field("Prompt", Input("512", id="pp"))
-                    yield field("Generate", Input("128", id="tg"))
-                    yield field("Depth", Input("0", id="depth"))
-                    yield field("Repeats", Input("3", id="reps"))
-                    yield field(
-                        "Extra args",
-                        Input("-fa on -ctk q8_0 -ctv q8_0", id="bench-extra"),
-                    )
+                    yield OptionList(id="bench-settings")
                     yield Static(id="results-table", classes="gap")
+        with Horizontal(id="editor"):
+            yield Label("", id="editor-label")
+            yield Input(id="editor-input")
         yield Label("Output", classes="heading gap")
         yield RichLog(id="log", wrap=True, highlight=True, max_lines=5000)
         yield Static(id="hints")
@@ -339,18 +362,10 @@ class LctApp(App[None]):
     def on_mount(self) -> None:
         self.register_theme(THEME)
         self.theme = "lct"
-        placeholders = {
-            "#repo": "type a model name, e.g. qwen 27b",
-            "#f-ctx": "default",
-            "#f-host": "127.0.0.1",
-            "#f-port": "8080",
-            "#f-mmproj": "none",
-        }
-        for selector, text in placeholders.items():
-            self.query_one(selector, Input).placeholder = text
+        self.query_one("#repo", Input).placeholder = "press / and type a model name"
         self.refresh_models()
         self.refresh_profiles()
-        self.update_state()
+        self.show_bench_settings()
         self.query_one("#profiles").focus()
 
     def stop_children(self) -> None:
@@ -362,7 +377,7 @@ class LctApp(App[None]):
         self.stop_children()
         self.exit()
 
-    # Shared plumbing
+    # Shared plumbing: pages, panes, the edit line, status and hints
 
     @property
     def page(self) -> str:
@@ -378,17 +393,102 @@ class LctApp(App[None]):
             if self.serving:
                 text, style = f"● serving {self.serving} · {self.url}", GOOD
         self.query_one("#state", Static).update(Text(text, style=style))
-        keys = HINTS[self.page]
-        if self.page == "download":
+        self.update_hints()
+
+    def update_hints(self) -> None:
+        focused = self.focused
+        context = self.page
+        if self.edit_target:
+            context = "editor"
+        elif focused is self.query_one("#repo"):
+            context = "search"
+        elif focused is not None and focused.id in ("settings", "bench-settings"):
+            context = f"{self.page}-settings"
+        keys = HINTS[context]
+        if context == "download":
             state = "on" if self.with_projector else "off"
             keys = keys.replace("p projector", f"p projector-{state}")
-        hints = Text.assemble(hint_line(keys), hint_line("1-3 pages  q quit"))
+        hints = hint_line(keys)
+        if context not in ("editor", "search"):
+            hints.append_text(hint_line("1-3 pages  q quit"))
         if self.pending_delete:
             hints = Text(
                 f"press y to delete {self.pending_delete}, any other key keeps it",
                 style=WARN,
             )
         self.query_one("#hints", Static).update(hints)
+
+    def on_descendant_focus(self) -> None:
+        self.update_hints()
+
+    def on_key(self, event) -> None:
+        # Only y confirms a pending delete; any other key abandons it.
+        if self.pending_delete and event.key != "y":
+            self.pending_delete = ""
+            self.update_hints()
+
+    def action_page(self, page: str) -> None:
+        self.query_one(Tabs).active = page
+
+    @on(Tabs.TabActivated)
+    def show_page(self, event: Tabs.TabActivated) -> None:
+        page = str(event.tab.id)
+        self.close_editor()
+        self.query_one(ContentSwitcher).current = f"{page}-page"
+        self.query_one(PANES[page][0]).focus()
+        self.update_state()
+
+    def action_pane(self, step: int) -> None:
+        """Move between the two panes of a page, never through every widget."""
+        if self.edit_target:
+            return
+        panes = PANES[self.page]
+        current = self.focused.id if self.focused else None
+        index = next((i for i, p in enumerate(panes) if p == f"#{current}"), -1)
+        self.query_one(panes[(index + step) % len(panes)]).focus()
+
+    def action_leave(self) -> None:
+        if self.edit_target:
+            self.close_editor()
+        elif self.focused is self.query_one("#repo"):
+            self.query_one("#results").focus()
+
+    def open_editor(self, target: tuple[str, str], label: str, value: str) -> None:
+        self.edit_target = target
+        self.query_one("#editor-label", Label).update(label)
+        editor = self.query_one("#editor-input", Input)
+        choices = {"model": self.models, "mmproj": self.projectors}.get(target[1])
+        suggestions = ["none", *choices] if choices is not None else []
+        editor.suggester = SuggestFromList(suggestions, case_sensitive=False)
+        editor.value = value
+        self.query_one("#editor").add_class("-open")
+        editor.focus()
+
+    def close_editor(self) -> None:
+        if not self.edit_target:
+            return
+        page = self.edit_target[0]
+        self.edit_target = None
+        self.query_one("#editor").remove_class("-open")
+        if page == self.page:
+            self.query_one(PANES[page][1]).focus()
+        self.update_hints()
+
+    @on(Input.Submitted, "#editor-input")
+    def apply_edit(self, event: Input.Submitted) -> None:
+        if not self.edit_target:
+            return
+        page, key = self.edit_target
+        value = event.value.strip()
+        if page == "bench":
+            self.bench[key] = value
+            self.show_bench_settings()
+        elif not self.save_setting(key, value):
+            return
+        self.close_editor()
+
+    def action_clear_log(self) -> None:
+        self.query_one("#log", RichLog).clear()
 
     async def stream(
         self, name: str, cmd: list[str], on_line: Callable[[str], bool] | None = None
@@ -407,47 +507,18 @@ class LctApp(App[None]):
         finally:
             del self.procs[name]
 
-    def on_key(self, event) -> None:
-        # Only y confirms a pending delete; any other key abandons it.
-        if self.pending_delete and event.key != "y":
-            self.pending_delete = ""
-            self.update_state()
-
-    def action_page(self, page: str) -> None:
-        self.query_one(Tabs).active = page
-
-    @on(Tabs.TabActivated)
-    def show_page(self, event: Tabs.TabActivated) -> None:
-        page = str(event.tab.id)
-        self.query_one(ContentSwitcher).current = f"{page}-page"
-        focus = "#repo" if page == "download" else HOME_FOCUS[page]
-        self.query_one(focus).focus()
-        self.update_state()
-
-    def action_leave(self) -> None:
-        if isinstance(self.focused, Input):
-            self.query_one(HOME_FOCUS[self.page]).focus()
-
-    def action_clear_log(self) -> None:
-        self.query_one("#log", RichLog).clear()
-
     def refresh_models(self) -> None:
         files = list_downloaded_models()
         self.models = {p.name: p for p in files if "mmproj" not in p.name.lower()}
         self.projectors = {p.name: p for p in files if "mmproj" in p.name.lower()}
-        suggest = [("#f-model", self.models), ("#f-mmproj", self.projectors)]
-        for selector, names in suggest:
-            suggester = SuggestFromList(["none", *names], case_sensitive=False)
-            self.query_one(selector, Input).suggester = suggester
         options = self.query_one("#bench-model", OptionList)
         options.clear_options()
         for name, path in self.models.items():
-            size = (gib(path.stat().st_size), NUMBER)
-            options.add_option(Option(Text.assemble(name.ljust(52), size), str(path)))
+            options.add_option(Option(sized_row(path.stat().st_size, name), str(path)))
         if options.option_count:
             options.highlighted = 0
 
-    # Serve page: the profile list on the left, its settings on the right
+    # Serve page: profiles on the left, the highlighted profile's settings on the right
 
     def selected_profile(self) -> str:
         options = self.query_one("#profiles", OptionList)
@@ -469,7 +540,7 @@ class LctApp(App[None]):
             running = name == self.serving
             label = Text.assemble(
                 ("● " if running else "  ", GOOD),
-                (name.ljust(20), GOOD if running else ""),
+                (name[:21].ljust(22), GOOD if running else ""),
             )
             if details["missing"]:
                 label.append("model missing", style=WARN)
@@ -480,62 +551,79 @@ class LctApp(App[None]):
             options.add_option(Option(label, name))
         if names := list(self.profiles):
             options.highlighted = names.index(current) if current in names else 0
-        self.fill_form()
+        self.show_settings()
 
     @on(OptionList.OptionHighlighted, "#profiles")
-    def fill_form(self) -> None:
+    def show_settings(self) -> None:
         self.editing = self.selected_profile()
-        details = self.profiles.get(self.editing, {})
-        for _, key in SETTINGS:
-            value = self.editing if key == "name" else details.get(key, "")
-            widget = self.query_one(f"#f-{key}", Input)
-            widget.value = value
-            widget.cursor_position = 0
-            widget.disabled = not details
-        self.query_one("#f-model").set_class(details.get("missing", False), "-missing")
+        details = self.profiles.get(self.editing)
+        options = self.query_one("#settings", OptionList)
+        highlighted = options.highlighted
+        options.clear_options()
+        if not details:
+            empty = Text("No profiles yet. Press n to create one.", style=MUTED)
+            options.add_option(Option(empty, disabled=True))
+            return
+        for key, label in SETTINGS.items():
+            value = self.editing if key == "name" else details[key]
+            if not value:
+                shown = Text(DEFAULTS.get(key, "none"), style=MUTED)
+            elif key == "model":
+                shown = Text(value, style=WARN if details["missing"] else "bold")
+            elif key == "mmproj":
+                shown = Text(value, style=MUTED if value == "none" else MEDIA)
+            elif key in ("ctx", "port"):
+                shown = Text(value, style=NUMBER)
+            else:
+                shown = Text(value, style=SOFT if key == "extra" else "")
+            options.add_option(Option(setting_row(label, shown), key))
+        options.highlighted = highlighted or 0
 
-    def form_args(self, details: dict) -> list[str]:
-        """Build serve args from the form, keeping untouched model tokens as-is."""
-        value = {
-            key: self.query_one(f"#f-{key}", Input).value.strip() for _, key in SETTINGS
-        }
-        if value["model"] == details["model"]:
+    @on(OptionList.OptionSelected, "#settings")
+    def edit_setting(self, event: OptionList.OptionSelected) -> None:
+        key = str(event.option.id)
+        details = self.profiles[self.editing]
+        value = self.editing if key == "name" else details[key]
+        self.open_editor(("serve", key), SETTINGS[key], value)
+
+    def profile_args(self, details: dict, values: dict[str, str]) -> list[str]:
+        """Build serve args, keeping an unchanged model or projector's tokens."""
+        if values["model"] == details["model"]:
             args = list(details["model_tokens"])
-        elif value["model"] in self.models:
-            args = [str(self.models[value["model"]])]
+        elif values["model"] in self.models:
+            args = [str(self.models[values["model"]])]
         else:
-            raise ValueError(f"{value['model']} is not a downloaded model.")
-        if value["mmproj"] == details["mmproj"]:
+            raise ValueError(f"{values['model']} is not a downloaded model.")
+        if values["mmproj"] == details["mmproj"]:
             args += details["mmproj_tokens"]
-        elif value["mmproj"] in self.projectors:
-            args += ["--mmproj", str(self.projectors[value["mmproj"]])]
-        elif value["mmproj"] in ("", "none"):
+        elif values["mmproj"] in self.projectors:
+            args += ["--mmproj", str(self.projectors[values["mmproj"]])]
+        elif values["mmproj"] in ("", "none"):
             args += [] if args[0].endswith(".gguf") else ["--no-mmproj"]
         else:
-            raise ValueError(f"{value['mmproj']} is not a downloaded projector.")
+            raise ValueError(f"{values['mmproj']} is not a downloaded projector.")
         for flag, key in (("--ctx", "ctx"), ("--host", "host"), ("--port", "port")):
-            args += [flag, value[key]] if value[key] else []
-        return args + (["--extra-args", value["extra"]] if value["extra"] else [])
+            args += [flag, values[key]] if values[key] else []
+        return args + (["--extra-args", values["extra"]] if values["extra"] else [])
 
-    @on(Input.Submitted, ".setting")
-    @on(Input.Blurred, ".setting")
-    def save_form(self) -> None:
+    def save_setting(self, key: str, value: str) -> bool:
         old = self.editing
-        if not (details := self.profiles.get(old)):
-            return
-        name = self.query_one("#f-name", Input).value.strip()
+        details = self.profiles[old]
+        values = {k: (old if k == "name" else details[k]) for k in SETTINGS}
+        values[key] = value
+        name = values["name"]
         aliases = load_aliases()
         try:
             if not name:
                 raise ValueError("A profile needs a name.")
             if name != old and name in aliases:
                 raise ValueError(f"A profile named {name} already exists.")
-            args = shlex.join(self.form_args(details))
+            if key in ("ctx", "port") and value and not value.isdigit():
+                raise ValueError(f"{SETTINGS[key]} must be a number.")
+            args = shlex.join(self.profile_args(details, values))
         except ValueError as error:
             self.fail(str(error))
-            return
-        if name == old and args == aliases.get(old):
-            return
+            return False
         write_aliases(
             {
                 (name if k == old else k): (args if k == old else v)
@@ -544,13 +632,10 @@ class LctApp(App[None]):
         )
         self.refresh_profiles(select=name)
         self.notify(f"Saved {name}", timeout=2)
-
-    def action_edit(self) -> None:
-        if self.page == "serve" and self.editing:
-            self.query_one("#f-name").focus()
+        return True
 
     def action_new(self) -> None:
-        if self.page != "serve":
+        if self.page != "serve" or self.edit_target:
             return
         aliases = load_aliases()
         base = aliases.get(self.editing)
@@ -560,26 +645,22 @@ class LctApp(App[None]):
         name = next(
             f"profile-{i}" for i in range(1, 1000) if f"profile-{i}" not in aliases
         )
-        write_aliases(
-            {
-                **aliases,
-                name: base or shlex.quote(str(next(iter(self.models.values())))),
-            }
-        )
+        first_model = shlex.quote(str(next(iter(self.models.values()), "")))
+        write_aliases({**aliases, name: base or first_model})
         self.refresh_profiles(select=name)
-        self.query_one("#f-name").focus()
+        self.open_editor(("serve", "name"), SETTINGS["name"], name)
 
     def action_delete(self) -> None:
-        if self.page == "serve" and self.editing:
+        if self.page == "serve" and self.editing and not self.edit_target:
             self.pending_delete = self.editing
-            self.update_state()
+            self.update_hints()
 
     def action_confirm(self) -> None:
         if name := self.pending_delete:
             self.pending_delete = ""
             write_aliases({k: v for k, v in load_aliases().items() if k != name})
             self.refresh_profiles()
-            self.update_state()
+            self.update_hints()
             self.notify(f"Deleted {name}", timeout=2)
 
     @on(OptionList.OptionSelected, "#profiles")
@@ -611,21 +692,14 @@ class LctApp(App[None]):
 
     # Download page: search as you type, details of the highlighted repository
 
-    def action_focus_search(self) -> None:
-        if self.page == "download":
+    def action_search(self) -> None:
+        if self.page == "download" and not self.edit_target:
             self.query_one("#repo", Input).focus()
-
-    def action_to_results(self) -> None:
-        if (
-            self.focused is self.query_one("#repo")
-            and self.query_one("#results", OptionList).option_count
-        ):
-            self.query_one("#results").focus()
 
     def action_projector(self) -> None:
         if self.page == "download":
             self.with_projector = not self.with_projector
-            self.update_state()
+            self.update_hints()
 
     @on(Input.Changed, "#repo")
     @work(exclusive=True, group="search")
@@ -648,19 +722,15 @@ class LctApp(App[None]):
         results.clear_options()
         for info in found:
             popularity = (f"{compact(info.downloads)} ↓".rjust(7) + "   ", NUMBER)
-            row = Text.assemble(popularity, info.id)
-            results.add_option(Option(row, info.id))
-        heading.update(
-            f"{len(found)} GGUF repositories" if found else "No GGUF repositories"
-        )
+            results.add_option(Option(Text.assemble(popularity, info.id), info.id))
+        count = f"{len(found)} GGUF repositories" if found else "No GGUF repositories"
+        heading.update(count)
         if found:
             results.highlighted = 0
 
     @on(Input.Submitted, "#repo")
-    def open_first_result(self) -> None:
-        results = self.query_one("#results", OptionList)
-        if results.option_count:
-            results.focus()
+    def open_results(self) -> None:
+        self.query_one("#results").focus()
 
     @on(OptionList.OptionHighlighted, "#results")
     @work(exclusive=True, group="details")
@@ -668,9 +738,8 @@ class LctApp(App[None]):
         repo = str(event.option.id)
         await asyncio.sleep(0.2)  # Skip repositories the cursor only passes over.
         if repo not in self.repos:
-            self.query_one("#repo-info", Static).update(
-                Text(f"Loading {repo}…", style=MUTED)
-            )
+            loading = Text(f"Loading {repo}…", style=MUTED)
+            self.query_one("#repo-info", Static).update(loading)
             try:
                 self.repos[repo] = await asyncio.to_thread(repo_details, repo)
             except Exception as error:
@@ -678,7 +747,7 @@ class LctApp(App[None]):
                 return
         self.repo = repo
         info, card = self.repos[repo]
-        self.query_one("#repo-info", Static).update(repo_view(info, card))
+        self.query_one("#repo-info", Static).update(repo_view(info))
         summary = Text(card_summary(card), style=SOFT)
         self.query_one("#repo-summary", Static).update(summary)
         self.show_files(info)
@@ -696,10 +765,10 @@ class LctApp(App[None]):
         self.query_one("#files-heading", Label).update(heading)
         files.clear_options()
         for (name, size), label in zip(found, names, strict=True):
-            mark = ("  downloaded", GOOD) if Path(name).name in self.models else ""
-            size_text = (gib(size).rjust(9) + "   ", NUMBER)
-            row = Text.assemble(size_text, label.removeprefix(prefix), mark)
-            files.add_option(Option(row, name))
+            mark = "downloaded" if Path(name).name in self.models else ""
+            files.add_option(
+                Option(sized_row(size, label.removeprefix(prefix), mark), name)
+            )
         if found:
             files.highlighted = 0
 
@@ -728,8 +797,23 @@ class LctApp(App[None]):
 
     # Benchmark page
 
+    def show_bench_settings(self) -> None:
+        options = self.query_one("#bench-settings", OptionList)
+        highlighted = options.highlighted
+        options.clear_options()
+        for key, (label, _, _) in BENCH_SETTINGS.items():
+            value = self.bench[key]
+            style = SOFT if key == "extra" else NUMBER
+            shown = Text(value or "none", style=style if value else MUTED)
+            options.add_option(Option(setting_row(label, shown), key))
+        options.highlighted = highlighted or 0
+
+    @on(OptionList.OptionSelected, "#bench-settings")
+    def edit_bench_setting(self, event: OptionList.OptionSelected) -> None:
+        key = str(event.option.id)
+        self.open_editor(("bench", key), BENCH_SETTINGS[key][0], self.bench[key])
+
     @on(OptionList.OptionSelected, "#bench-model")
-    @on(Input.Submitted, "#bench-page Input")
     def toggle_bench(self) -> None:
         if bench := self.procs.get("bench"):
             interrupt(bench)
@@ -761,16 +845,11 @@ class LctApp(App[None]):
             return
         model = str(options.get_option_at_index(options.highlighted).id)
         cmd = [str(binary), "-m", model, "-o", "jsonl"]
-        for flag, selector in (
-            ("-p", "#pp"),
-            ("-n", "#tg"),
-            ("-d", "#depth"),
-            ("-r", "#reps"),
-        ):
-            if value := self.query_one(selector, Input).value.strip():
-                cmd += [flag, value]
+        for key, (_, flag, _) in BENCH_SETTINGS.items():
+            if flag and self.bench[key]:
+                cmd += [flag, self.bench[key]]
         try:
-            cmd += shlex.split(self.query_one("#bench-extra", Input).value)
+            cmd += shlex.split(self.bench["extra"])
         except ValueError as error:
             self.fail(f"Extra args: {error}")
             return

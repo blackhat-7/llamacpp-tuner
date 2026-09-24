@@ -46,11 +46,11 @@ qwen = """owner/model-GGUF --quant Q6_K --ctx 32768 \
 uv run lct tui
 ```
 
-It is keyboard-driven: `1`–`3` switch pages, `q` quits, and the bottom line always shows the keys for the current page.
+It is keyboard-driven and never traps you in a text box: `1`–`3` switch pages, `tab` or `←`/`→` move between the two panes of a page, `esc` backs out, `q` quits. The bottom line always shows the keys for where you are.
 
-- **Serve:** profiles on the left, the highlighted profile's settings on the right. `enter` starts or stops it. `tab` moves into the settings; changes save when you press `enter` or leave the field. Model and projector autocomplete from downloaded files. `n` copies the highlighted profile, `d` then `y` deletes it. A profile whose model is not downloaded shows `model missing`.
-- **Download:** type to search Hugging Face GGUF repositories. The highlighted repository shows popularity, license, base model, architecture, context, its files with sizes, and a summary from the model card. `↓` then `enter` opens a repository, `enter` on a file downloads it, `p` toggles its projector.
-- **Benchmark:** pick a model and press `enter` to run `llama-bench`; `enter` again stops it. Prompt, generate and depth accept comma lists such as `0,32768`.
+- **Serve:** profiles on the left, the highlighted profile's settings on the right. `enter` on a profile starts or stops it. `enter` on a setting opens a one-line editor (`enter` saves, `esc` cancels); model and projector autocomplete from downloaded files. `n` copies the highlighted profile, `d` then `y` deletes it.
+- **Download:** `/` to search Hugging Face GGUF repositories as you type. The highlighted repository shows popularity, license, base model, architecture, context, its files with sizes and a model-card summary. `enter` opens a repository, `enter` on a file downloads it, `p` toggles its projector.
+- **Benchmark:** `enter` on a model runs `llama-bench` (again to stop). Settings edit like profile settings; prompt, generate and depth accept comma lists such as `0,32768`.
 
 Profiles are the same aliases `lct serve <name>` uses. All output streams into the log at the bottom.
 
