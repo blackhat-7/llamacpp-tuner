@@ -9,9 +9,9 @@ Next task: `PLAN.md`. Rules: `AGENTS.md`.
 
 - Branch `feat/tui` (from `feat/serve-aliases`). Neither is merged to `main`. Both track `origin`.
 - `lct serve <alias>` works. Local aliases in `tmp/aliases.toml`: `qwen`, `qwen-no-img`, `swift-qwen`, `swift-qwen-no-img`, all on `100.64.0.1:6868`.
-- `ukisai/Swift-Qwen3.8-27B-GGUF` Q4_K_S (16.6 GB) was downloading at ~3 MB/s. The `swift-*` aliases fail with "Model not found" until it lands.
+- `ukisai/Swift-Qwen3.8-27B-GGUF` Q4_K_S (16.6 GB) is downloading. It restarted from zero on 2026-09-25 with `HF_XET_FIXED_DOWNLOAD_CONCURRENCY=16`. The `swift-*` aliases fail with "Model not found" until it lands.
 - `textual` is a new dependency. `llama.get_llama_binary(name)` now finds `llama-bench` as well as `llama-server`.
-- `lct tui` is complete: Serve (profiles, start/stop with `ctrl+s`, save), Download (search with sizes, download), Benchmark (`llama-bench -o jsonl` into a table, stop mid-run). Screenshot-checked at 70 and 120 columns.
+- `lct tui` is keyboard-driven in forseti's style: Serve (profiles list + settings; `enter` start/stop, `e`/`n`/`d`), Download (`enter` search/download, `p` projector), Benchmark (`enter` run/stop). Checked at 80 and 120 columns.
 - Checks: `pytest` 43/43, ruff clean, pyright clean.
 
 ## Gotchas
@@ -20,6 +20,7 @@ Next task: `PLAN.md`. Rules: `AGENTS.md`.
 - **MTP draft KV cache defaults to f16** unless `-ctkd q8_0 -ctvd q8_0` is passed.
 - **A plain SIGTERM to `llama-server` did not stop it within 120 s; SIGINT did.**
 - **The projector loads lazily.** It adds up to ~1.16 GB when the first image arrives, not at startup.
-- **Slow Hugging Face downloads are the ISP route, not xet.** Measured 2026-09-25: xet at concurrency 1 and forced to 16 both gave ~1.4 MB/s; OVH also ~1 MB/s. Watch progress via the `.incomplete` file size under the repo's `.cache/huggingface/download/`.
-- **Textual `Label` has built-in `success` / `warning` / `error` classes** that paint a badge background. The status pill uses them on purpose.
+- **Slow downloads: first check for a VPN.** With one on, everything ran at ~1.5 MB/s. Without it, xet's adaptive concurrency still stalls at 1–5 connections on this Wi-Fi; `HF_XET_FIXED_DOWNLOAD_CONCURRENCY=16` measured 13 MB/s. Restarting a pull does not resume a partial xet file.
+- **`OptionList` wraps long rows unless CSS sets `text-wrap: nowrap`;** Rich's `no_wrap` on the prompt is ignored.
+- **Textual's SVG screenshots drop a leading space in a styled span.** Put separators inside the preceding span.
 - **Never name an `App` method `run`.** It overrides Textual's `App.run` and `lct tui` breaks; the helper is `stream`.

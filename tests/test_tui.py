@@ -1,47 +1,15 @@
 """Tests for the terminal UI."""
 
 import asyncio
+import io
 import sys
 
 import pytest
-from textual.widgets import (
-    Button,
-    DataTable,
-    Input,
-    Label,
-    RichLog,
-    Select,
-    Switch,
-    TabbedContent,
-)
+from rich.console import Console
+from textual.widgets import Input, OptionList, RichLog, Static
 
+from llamacpp_tuner.cli import load_aliases, write_aliases
 from llamacpp_tuner.tui import LctApp, bench_row
-
-
-@pytest.fixture
-def workspace(monkeypatch, tmp_path):
-    model = tmp_path / "model-Q4_K_M.gguf"
-    model.write_bytes(b"x")
-    monkeypatch.setattr("llamacpp_tuner.tui.list_downloaded_models", lambda: [model])
-    monkeypatch.setattr(
-        "llamacpp_tuner.cli.get_aliases_path", lambda: tmp_path / "aliases.toml"
-    )
-    return model
-
-
-@pytest.mark.parametrize("width", [40, 80, 120])
-def test_renders_all_tabs_at_common_widths(width, workspace):
-    async def run() -> None:
-        app = LctApp()
-        async with app.run_test(size=(width, 40)) as pilot:
-            tabs = app.query_one(TabbedContent)
-            for tab in ("serve-tab", "download-tab", "bench-tab"):
-                tabs.active = tab
-                await pilot.pause()
-                assert app.screen.find_widget(app.query_one(f"#{tab}"))
-
-    asyncio.run(run())
-
 
 FAKE_SERVER = """
 import time
@@ -61,48 +29,79 @@ async def until(pilot, condition) -> None:
     raise AssertionError("condition never became true")
 
 
-def test_serve_starts_and_stops_from_the_form(monkeypatch, workspace):
+def text(app: LctApp, selector: str) -> str:
+    console = Console(width=200, record=True, file=io.StringIO())
+    console.print(app.query_one(selector, Static).content)
+    return console.export_text()
+
+
+@pytest.fixture
+def workspace(monkeypatch, tmp_path):
+    model = tmp_path / "model-Q4_K_M.gguf"
+    model.write_bytes(b"x")
+    monkeypatch.setattr("llamacpp_tuner.tui.list_downloaded_models", lambda: [model])
+    monkeypatch.setattr(
+        "llamacpp_tuner.cli.get_aliases_path", lambda: tmp_path / "aliases.toml"
+    )
+    return model
+
+
+@pytest.mark.parametrize("width", [40, 80, 120])
+def test_renders_every_page_at_common_widths(width, workspace):
+    write_aliases({"mine": f"{workspace} --ctx 4096", "gone": "owner/repo --quant Q4"})
+
+    async def run() -> None:
+        app = LctApp()
+        async with app.run_test(size=(width, 40)) as pilot:
+            assert "4k" in text(app, "#details")
+            for key in "231":
+                await pilot.press(key)
+                await pilot.pause()
+            app.query_one("#profiles", OptionList).highlighted = 1
+            await pilot.pause()
+            assert "missing" in text(app, "#details")
+
+    asyncio.run(run())
+
+
+def test_enter_starts_and_stops_the_highlighted_profile(monkeypatch, workspace):
+    write_aliases({"mine": str(workspace)})
     monkeypatch.setattr("llamacpp_tuner.tui.LCT", [sys.executable, "-c", FAKE_SERVER])
 
     async def run() -> None:
         app = LctApp()
         async with app.run_test(size=(100, 40)) as pilot:
-            app.query_one("#model", Select).value = str(workspace)
-            status = app.query_one("#status", Label)
-            await pilot.press("ctrl+s")
-            await until(pilot, lambda: "Ready" in str(status.content))
-            assert "http://127.0.0.1:9" in app.sub_title
-            await pilot.press("ctrl+s")
-            await until(pilot, lambda: "Stopped" in str(status.content))
+            await pilot.press("enter")
+            await until(pilot, lambda: app.serving == "mine")
+            assert "http://127.0.0.1:9" in text(app, "#state")
+            await pilot.press("enter")
+            await until(pilot, lambda: "idle" in text(app, "#state"))
             assert "server" not in app.procs
 
     asyncio.run(run())
 
 
-def test_profile_round_trips_through_aliases(workspace, tmp_path):
+def test_new_profile_is_saved_and_deleted_only_after_y(workspace):
     async def run() -> None:
         app = LctApp()
         async with app.run_test(size=(100, 40)) as pilot:
-            app.query_one("#model", Select).value = str(workspace)
-            app.query_one("#ctx", Input).value = "4096"
-            app.query_one("#extra", Input).value = "-fa on"
-            app.query_one("#alias-name", Input).value = "mine"
-            app.query_one("#save", Button).press()
+            await pilot.press("n")
             await pilot.pause()
-            assert "mine" in (tmp_path / "aliases.toml").read_text()
+            app.screen.query_one("#name", Input).value = "fresh"
+            app.screen.query_one("#ctx", Input).value = "8192"
+            await pilot.press("ctrl+s")
+            await pilot.pause()
+            assert load_aliases() == {"fresh": f"{workspace} --ctx 8192"}
 
-            app.query_one("#ctx", Input).value = ""
-            app.query_one("#profile", Select).clear()
-            await pilot.pause()
-            app.query_one("#profile", Select).value = "mine"
-            await pilot.pause()
-            assert app.query_one("#ctx", Input).value == "4096"
-            assert app.query_one("#extra", Input).value == "-fa on"
+            await pilot.press("d", "x")
+            assert "fresh" in load_aliases()
+            await pilot.press("d", "y")
+            assert load_aliases() == {}
 
     asyncio.run(run())
 
 
-def test_search_lists_repo_files_and_downloads_the_selected_one(monkeypatch, workspace):
+def test_search_lists_repo_files_and_enter_downloads(monkeypatch, workspace):
     listing = [("model-Q4_K_M.gguf", 16 * 1024**3), ("model-Q8_0.gguf", 28 * 1024**3)]
     monkeypatch.setattr("llamacpp_tuner.tui.list_repo_models", lambda repo: listing)
     monkeypatch.setattr(
@@ -113,52 +112,38 @@ def test_search_lists_repo_files_and_downloads_the_selected_one(monkeypatch, wor
     async def run() -> None:
         app = LctApp()
         async with app.run_test(size=(100, 40)) as pilot:
-            app.query_one(TabbedContent).active = "download-tab"
+            await pilot.press("2")
             await pilot.pause()
             app.query_one("#repo", Input).value = "owner/repo"
-            await pilot.click("#search")
-            table = app.query_one("#files", DataTable)
-            await until(pilot, lambda: table.row_count == 2)
-            assert "downloaded" in str(table.get_row_at(0)[2])
-            assert table.get_row_at(1)[1] == "28.0 GiB"
+            await pilot.press("enter")
+            files = app.query_one("#files", OptionList)
+            await until(pilot, lambda: files.option_count == 2)
+            assert "downloaded" in str(files.get_option_at_index(0).prompt)
 
-            table.move_cursor(row=1)
-            app.query_one("#with-mmproj", Switch).value = False
-            await pilot.click("#download")
+            await pilot.press("p", "down", "enter")
             log = app.query_one("#log", RichLog)
-            await until(
-                pilot,
-                lambda: any("pulled" in line.text for line in log.lines),
-            )
-            text = "\n".join(line.text for line in log.lines)
-            assert "pull owner/repo --file model-Q8_0.gguf --no-mmproj" in text
+            await until(pilot, lambda: any("pulled" in ln.text for ln in log.lines))
+            output = "\n".join(line.text for line in log.lines)
+            assert "pull owner/repo --file model-Q8_0.gguf --no-mmproj" in output
 
     asyncio.run(run())
 
 
 def test_bench_row_names_prompt_generation_and_depth():
-    result = {
-        "model_filename": "/m/a.gguf",
-        "n_depth": 0,
-        "avg_ts": 911.04,
-        "stddev_ts": 2.3,
-    }
+    result = {"model_filename": "/m/a.gguf", "n_depth": 0, "avg_ts": 911.04}
+    result["stddev_ts"] = 2.3
 
     assert bench_row({**result, "n_prompt": 512, "n_gen": 0}) == (
         "a.gguf",
         "pp512",
         "911.0",
-        "2.3",
+        "± 2.3",
     )
-    assert (
-        bench_row({**result, "n_prompt": 0, "n_gen": 128, "n_depth": 4096})[1]
-        == "tg128 @ d4096"
-    )
+    depth = {**result, "n_prompt": 0, "n_gen": 128, "n_depth": 4096}
+    assert bench_row(depth)[1] == "tg128 @ d4096"
 
 
-def test_benchmark_streams_llama_bench_results_into_the_table(
-    monkeypatch, workspace, tmp_path
-):
+def test_benchmark_streams_llama_bench_results(monkeypatch, workspace, tmp_path):
     fake = tmp_path / "llama-bench"
     fake.write_text(
         f"#!{sys.executable}\n"
@@ -173,13 +158,10 @@ def test_benchmark_streams_llama_bench_results_into_the_table(
     async def run() -> None:
         app = LctApp()
         async with app.run_test(size=(100, 40)) as pilot:
-            app.query_one(TabbedContent).active = "bench-tab"
+            await pilot.press("3")
             await pilot.pause()
-            app.query_one("#bench-model", Select).value = str(workspace)
-            await pilot.click("#bench")
-            table = app.query_one("#results", DataTable)
-            await until(pilot, lambda: table.row_count == 1)
-            assert table.get_row_at(0) == ["m.gguf", "pp512", "900.0", "1.0"]
-            await until(pilot, lambda: "bench" not in app.procs)
+            await pilot.press("enter")
+            await until(pilot, lambda: app.results and "bench" not in app.procs)
+            assert app.results == [("m.gguf", "pp512", "900.0", "± 1.0")]
 
     asyncio.run(run())

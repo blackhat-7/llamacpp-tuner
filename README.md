@@ -46,11 +46,13 @@ qwen = """owner/model-GGUF --quant Q6_K --ctx 32768 \
 uv run lct tui
 ```
 
-- **Serve:** load a saved profile, adjust model, projector, context, host, port and extra args, then start or stop with `ctrl+s`. **Save** stores the form as a profile.
-- **Download:** search a repository, pick a GGUF from the size list, download it with or without its projector.
-- **Benchmark:** run `llama-bench` on a downloaded model. Prompt, generate and depth accept comma lists such as `0,32768`.
+It is keyboard-driven: `1`–`3` switch pages, `q` quits, and the bottom line always shows the keys for the current page.
 
-All output streams into the log at the bottom. `ctrl+p` opens the command palette, including theme switching.
+- **Serve:** profiles on the left, settings of the highlighted one on the right. `enter` starts or stops it, `e` edits, `n` creates, `d` then `y` deletes. A profile whose model is not downloaded shows `model missing`.
+- **Download:** type a repository and press `enter`, then `enter` on a file to download it. `p` toggles its projector.
+- **Benchmark:** pick a model and press `enter` to run `llama-bench`; `enter` again stops it. Prompt, generate and depth accept comma lists such as `0,32768`.
+
+Profiles are the same aliases `lct serve <name>` uses. All output streams into the log at the bottom.
 
 `serve` changes only options explicitly supplied; all others remain llama.cpp defaults. Use `--mmproj PATH` for a local vision model. Repository pulls download an unambiguous projector automatically unless `--no-mmproj` is given.
 

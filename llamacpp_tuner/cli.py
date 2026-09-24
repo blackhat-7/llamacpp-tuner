@@ -37,9 +37,8 @@ def load_aliases() -> dict[str, str]:
     return aliases
 
 
-def save_alias(name: str, args: list[str]) -> None:
-    """Add or replace an alias. Rewriting the file drops its comments."""
-    aliases = {**load_aliases(), name: shlex.join(args)}
+def write_aliases(aliases: dict[str, str]) -> None:
+    """Replace every alias. Rewriting the file drops its comments."""
     get_aliases_path().write_text(
         "".join(
             f"{json.dumps(key)} = {json.dumps(value)}\n"
