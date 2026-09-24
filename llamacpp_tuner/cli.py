@@ -1,13 +1,16 @@
 """Command-line interface for lct."""
 
+import json
 import shlex
+import signal
 import subprocess
+import tomllib
 from pathlib import Path
 
 import click
 
 from llamacpp_tuner import __version__
-from llamacpp_tuner.cache import get_models_dir
+from llamacpp_tuner.cache import get_aliases_path, get_models_dir
 from llamacpp_tuner.downloader import (
     download_mmproj,
     download_model,
@@ -18,7 +21,53 @@ from llamacpp_tuner.downloader import (
 from llamacpp_tuner.llama import install_llama, run_server
 
 
-@click.group()
+def load_aliases() -> dict[str, str]:
+    """Read serve aliases, each mapping a name to 'serve' arguments."""
+    path = get_aliases_path()
+    if not path.is_file():
+        return {}
+    try:
+        aliases = tomllib.loads(path.read_text())
+    except tomllib.TOMLDecodeError as error:
+        raise click.ClickException(f"Invalid {path}: {error}") from error
+    for name, value in aliases.items():
+        if not isinstance(value, str):
+            raise click.ClickException(
+                f"Alias '{name}' in {path} must be a string of serve arguments."
+            )
+    return aliases
+
+
+def write_aliases(aliases: dict[str, str]) -> None:
+    """Replace every alias. Rewriting the file drops its comments."""
+    get_aliases_path().write_text(
+        "".join(
+            f"{json.dumps(key)} = {json.dumps(value)}\n"
+            for key, value in aliases.items()
+        )
+    )
+
+
+def pick_projector(model: str, mmproj: Path | None, no_mmproj: bool) -> Path | None:
+    """Use an explicit projector, else a repository's downloaded one."""
+    if mmproj or no_mmproj or model.lower().endswith(".gguf"):
+        return mmproj
+    return get_mmproj_path(model)
+
+
+class _AliasGroup(click.Group):
+    def parse_args(self, ctx: click.Context, args: list[str]) -> list[str]:
+        # Expand before parsing so options typed after an alias override its own.
+        if (
+            len(args) > 1
+            and args[0] == "serve"
+            and (alias := load_aliases().get(args[1])) is not None
+        ):
+            args = ["serve", *shlex.split(alias), *args[2:]]
+        return super().parse_args(ctx, args)
+
+
+@click.group(cls=_AliasGroup)
 @click.version_option(version=__version__)
 def main() -> None:
     """Download and serve GGUF models with llama.cpp."""
@@ -111,7 +160,10 @@ def serve(
     no_mmproj_offload: bool,
     extra_args: str,
 ) -> None:
-    """Run llama-server, overriding only explicitly supplied settings."""
+    """Run llama-server, overriding only explicitly supplied settings.
+
+    MODEL is a GGUF path, a downloaded repository, or an alias from aliases.toml.
+    """
     if quant and filename:
         raise click.UsageError("--quant and --file cannot be combined.")
     if mmproj and no_mmproj:
@@ -120,13 +172,7 @@ def serve(
     try:
         model_path = resolve_model(model, quant=quant, filename=filename)
 
-        selected_mmproj = mmproj
-        if (
-            not selected_mmproj
-            and not no_mmproj
-            and not model.lower().endswith(".gguf")
-        ):
-            selected_mmproj = get_mmproj_path(model)
+        selected_mmproj = pick_projector(model, mmproj, no_mmproj)
         if no_mmproj_offload and not selected_mmproj:
             raise click.UsageError(
                 "--no-mmproj-offload requires --mmproj or a downloaded repository projector."
@@ -165,6 +211,22 @@ def list_models() -> None:
         size_gib = model.stat().st_size / (1024**3)
         tag = " [projector]" if "mmproj" in model.name.lower() else ""
         click.echo(f"{model.relative_to(root)} ({size_gib:.2f} GiB){tag}")
+
+
+@main.command()
+def tui() -> None:
+    """Open the terminal UI."""
+    # Imported here so plain CLI commands do not pay for loading Textual.
+    from llamacpp_tuner.tui import LctApp
+
+    app = LctApp()
+    # A closed terminal (SIGHUP) or kill (SIGTERM) must still stop child servers.
+    for sig in (signal.SIGHUP, signal.SIGTERM):
+        signal.signal(sig, lambda *_: app.exit())
+    try:
+        app.run()
+    finally:
+        app.stop_children()
 
 
 if __name__ == "__main__":

@@ -13,20 +13,19 @@ from llamacpp_tuner.cache import get_llama_dir
 LLAMA_REPO_URL = "https://github.com/ggml-org/llama.cpp.git"
 
 
-def _binary_name() -> str:
-    return "llama-server.exe" if platform.system() == "Windows" else "llama-server"
-
-
-def _managed_binary(source_dir: Path) -> Path | None:
+def _managed_binary(source_dir: Path, name: str = "llama-server") -> Path | None:
+    if platform.system() == "Windows":
+        name += ".exe"
     bin_dir = source_dir / "build" / "bin"
-    candidates = [bin_dir / _binary_name(), bin_dir / "Release" / _binary_name()]
+    candidates = [bin_dir / name, bin_dir / "Release" / name]
     return next((path for path in candidates if path.is_file()), None)
 
 
-def get_llama_binary() -> Path | None:
-    if system_binary := shutil.which("llama-server"):
+def get_llama_binary(name: str = "llama-server") -> Path | None:
+    """Find a llama.cpp tool such as llama-server or llama-bench."""
+    if system_binary := shutil.which(name):
         return Path(system_binary)
-    return _managed_binary(get_llama_dir())
+    return _managed_binary(get_llama_dir(), name)
 
 
 def build_from_source(

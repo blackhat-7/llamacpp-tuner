@@ -152,3 +152,44 @@ def test_lists_nested_downloads(monkeypatch, tmp_path):
     model.touch()
 
     assert downloader.list_downloaded_models() == [model]
+
+
+def test_model_files_groups_shards_and_skips_projectors():
+    from huggingface_hub import ModelInfo
+    from huggingface_hub.hf_api import RepoSibling
+
+    info = ModelInfo(id="owner/repo")
+    info.siblings = [
+        RepoSibling(rfilename="BF16/model-BF16-00002-of-00002.gguf", size=20),
+        RepoSibling(rfilename="BF16/model-BF16-00001-of-00002.gguf", size=30),
+        RepoSibling(rfilename="model-Q4_K_M.gguf", size=10),
+        RepoSibling(rfilename="mmproj-F16.gguf", size=2),
+        RepoSibling(rfilename="README.md", size=1),
+    ]
+
+    assert downloader.model_files(info) == [
+        ("model-Q4_K_M.gguf", 10),
+        ("BF16/model-BF16-00001-of-00002.gguf", 50),
+    ]
+
+
+def test_repo_details_prefers_the_base_model_card(monkeypatch):
+    from huggingface_hub import ModelInfo
+    from huggingface_hub.errors import EntryNotFoundError
+
+    class FakeApi:
+        def model_info(self, repo_id, files_metadata):
+            return ModelInfo(id=repo_id, card_data={"base_model": "org/base"})
+
+    def load(repo_id):
+        if repo_id == "org/base" and cards_exist:
+            return type("Card", (), {"text": "base card"})
+        raise EntryNotFoundError("no card")
+
+    monkeypatch.setattr(downloader, "HfApi", FakeApi)
+    monkeypatch.setattr(downloader.ModelCard, "load", load)
+
+    cards_exist = True
+    assert downloader.repo_details("q/model-GGUF")[1] == "base card"
+    cards_exist = False
+    assert downloader.repo_details("q/model-GGUF")[1] == ""
