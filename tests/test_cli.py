@@ -133,6 +133,48 @@ def test_serve_supports_explicit_projector(tmp_path):
     assert "--no-mmproj-offload" in args
 
 
+def test_serve_expands_alias_and_later_options_override(monkeypatch, tmp_path):
+    aliases = tmp_path / "aliases.toml"
+    aliases.write_text(
+        "qwen = \"owner/repo --file model.gguf --ctx 4096 --extra-args '-ngl all -fa on'\"\n"
+    )
+    monkeypatch.setattr("llamacpp_tuner.cli.get_aliases_path", lambda: aliases)
+
+    with (
+        patch(
+            "llamacpp_tuner.cli.resolve_model",
+            return_value=Path("models/model.gguf"),
+        ) as resolve,
+        patch("llamacpp_tuner.cli.get_mmproj_path", return_value=None),
+        patch("llamacpp_tuner.cli.run_server") as run_server,
+    ):
+        result = CliRunner().invoke(main, ["serve", "qwen", "--ctx", "8192"])
+
+    assert result.exit_code == 0
+    resolve.assert_called_once_with("owner/repo", quant=None, filename="model.gguf")
+    assert run_server.call_args.args[0] == [
+        "-m",
+        "models/model.gguf",
+        "-c",
+        "8192",
+        "-ngl",
+        "all",
+        "-fa",
+        "on",
+    ]
+
+
+def test_invalid_alias_file_is_a_user_error(monkeypatch, tmp_path):
+    aliases = tmp_path / "aliases.toml"
+    aliases.write_text("qwen = [\n")
+    monkeypatch.setattr("llamacpp_tuner.cli.get_aliases_path", lambda: aliases)
+
+    result = CliRunner().invoke(main, ["serve", "qwen"])
+
+    assert result.exit_code != 0
+    assert "Invalid" in result.output
+
+
 def test_models_lists_namespaced_path(monkeypatch, tmp_path):
     root = tmp_path / "models"
     model = root / "owner" / "repo" / "model.gguf"

@@ -2,12 +2,13 @@
 
 import shlex
 import subprocess
+import tomllib
 from pathlib import Path
 
 import click
 
 from llamacpp_tuner import __version__
-from llamacpp_tuner.cache import get_models_dir
+from llamacpp_tuner.cache import get_aliases_path, get_models_dir
 from llamacpp_tuner.downloader import (
     download_mmproj,
     download_model,
@@ -18,7 +19,36 @@ from llamacpp_tuner.downloader import (
 from llamacpp_tuner.llama import install_llama, run_server
 
 
-@click.group()
+def load_aliases() -> dict[str, str]:
+    """Read serve aliases, each mapping a name to 'serve' arguments."""
+    path = get_aliases_path()
+    if not path.is_file():
+        return {}
+    try:
+        aliases = tomllib.loads(path.read_text())
+    except tomllib.TOMLDecodeError as error:
+        raise click.ClickException(f"Invalid {path}: {error}") from error
+    for name, value in aliases.items():
+        if not isinstance(value, str):
+            raise click.ClickException(
+                f"Alias '{name}' in {path} must be a string of serve arguments."
+            )
+    return aliases
+
+
+class _AliasGroup(click.Group):
+    def parse_args(self, ctx: click.Context, args: list[str]) -> list[str]:
+        # Expand before parsing so options typed after an alias override its own.
+        if (
+            len(args) > 1
+            and args[0] == "serve"
+            and (alias := load_aliases().get(args[1])) is not None
+        ):
+            args = ["serve", *shlex.split(alias), *args[2:]]
+        return super().parse_args(ctx, args)
+
+
+@click.group(cls=_AliasGroup)
 @click.version_option(version=__version__)
 def main() -> None:
     """Download and serve GGUF models with llama.cpp."""
@@ -111,7 +141,10 @@ def serve(
     no_mmproj_offload: bool,
     extra_args: str,
 ) -> None:
-    """Run llama-server, overriding only explicitly supplied settings."""
+    """Run llama-server, overriding only explicitly supplied settings.
+
+    MODEL is a GGUF path, a downloaded repository, or an alias from aliases.toml.
+    """
     if quant and filename:
         raise click.UsageError("--quant and --file cannot be combined.")
     if mmproj and no_mmproj:

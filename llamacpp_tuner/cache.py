@@ -15,6 +15,10 @@ def get_cache_dir() -> Path:
     return base / "lct"
 
 
+def get_aliases_path() -> Path:
+    return get_cache_dir() / "aliases.toml"
+
+
 def get_models_dir() -> Path:
     path = get_cache_dir() / "models"
     path.mkdir(parents=True, exist_ok=True)
