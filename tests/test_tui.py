@@ -157,6 +157,39 @@ def test_quitting_stops_the_server(monkeypatch, workspace, tmp_path):
     asyncio.run(run())
 
 
+def test_switching_pages_from_settings_does_not_crash(workspace):
+    write_aliases({"mine": str(workspace)})
+
+    async def run() -> None:
+        app = LctApp()
+        async with app.run_test(size=(100, 40)) as pilot:
+            await pilot.press("tab", "2", "1", "tab", "3", "tab", "2")
+            assert app.page == "download"
+
+    asyncio.run(run())
+
+
+def test_cancelled_worker_stops_its_server(monkeypatch, workspace, tmp_path):
+    write_aliases({"mine": str(workspace)})
+    pid_file = tmp_path / "pid"
+    server = f"import os; open({str(pid_file)!r}, 'w').write(str(os.getpid()))\n"
+    monkeypatch.setattr(
+        "llamacpp_tuner.tui.LCT", [sys.executable, "-c", server + FAKE_SERVER]
+    )
+
+    async def run() -> None:
+        app = LctApp()
+        async with app.run_test(size=(100, 40)) as pilot:
+            await pilot.press("enter")
+            await until(pilot, lambda: app.serving == "mine")
+            app.workers.cancel_all()
+            pid = int(pid_file.read_text())
+            stat = Path(f"/proc/{pid}/stat")
+            await until(pilot, lambda: not stat.exists() or " Z " in stat.read_text())
+
+    asyncio.run(run())
+
+
 def test_settings_edit_in_place_and_reject_unknown_models(workspace):
     write_aliases({"mine": f"{workspace} --ctx 4096"})
 

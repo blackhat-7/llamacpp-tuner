@@ -12,7 +12,7 @@ Next task: `PLAN.md`. Rules: `AGENTS.md`.
 - `ukisai/Swift-Qwen3.8-27B-GGUF` Q4_K_S and its projector are downloaded. `swift-qwen` at 128k projects 21408 MiB before the projector's ~1158 MiB; fits.
 - `textual` is a new dependency. `llama.get_llama_binary(name)` now finds `llama-bench` as well as `llama-server`.
 - `lct tui`: settings are plain label/value rows; `enter` opens a one-line editor. `tab`/`←→` move between two panes only; `/` search; `esc` always backs out, so `1`–`3` always work outside a text box. Quitting stops child processes.
-- Checks: `pytest` 50/50, ruff clean, pyright clean.
+- Checks: `pytest` 52/52, ruff clean, pyright clean.
 
 ## Gotchas
 
@@ -28,3 +28,4 @@ Next task: `PLAN.md`. Rules: `AGENTS.md`.
 - **Check `ss -ltnp` and VRAM before any GPU fit test.** The user often has a server on `100.64.0.1:6868`; a second model then sees ~50 MiB free.
 - **Textual's `App.on_unmount` did not run on quit**, so servers outlived the UI. `action_quit` and `lct tui`'s `finally` now call `stop_children()`; a test pins it.
 - **Textual runs `_on_click` for every class in the MRO.** A subclass override must call `event.prevent_default()` or the base OptionList still selects.
+- **Textual cancels workers on exit or crash before `finally` in `lct tui` runs**, emptying `procs`. `stream()` stops its own child on `CancelledError`.

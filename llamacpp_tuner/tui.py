@@ -418,7 +418,11 @@ class LctApp(App[None]):
             context = "editor"
         elif focused is self.query_one("#repo"):
             context = "search"
-        elif focused is not None and focused.id in ("settings", "bench-settings"):
+        elif (
+            self.page != "download"
+            and focused is not None
+            and f"#{focused.id}" == PANES[self.page][1]
+        ):
             context = f"{self.page}-settings"
         if context == "download" and "download" in self.procs:
             context = "downloading"
@@ -530,6 +534,11 @@ class LctApp(App[None]):
                 if not (on_line and on_line(line)):
                     log.write(line)
             return await proc.wait()
+        except asyncio.CancelledError:
+            # Textual cancels workers when the app exits or crashes; the child
+            # must not outlive it.
+            interrupt(proc)
+            raise
         finally:
             del self.procs[name]
 
