@@ -12,7 +12,7 @@ Next task: `PLAN.md`. Rules: `AGENTS.md`.
 - `ukisai/Swift-Qwen3.8-27B-GGUF` Q4_K_S and its projector are downloaded. `swift-qwen` at 128k projects 21408 MiB before the projector's ~1158 MiB; fits.
 - `textual` is a new dependency. `llama.get_llama_binary(name)` now finds `llama-bench` as well as `llama-server`.
 - `lct tui` is keyboard-driven in forseti's style. Serve edits profiles in place (autosave on enter or leaving a field; `n` copies, `d`+`y` deletes). Download searches Hugging Face as you type and shows details, files (shards grouped, smallest first) and a card summary from the base model.
-- Checks: `pytest` 47/47, ruff clean, pyright clean.
+- Checks: `pytest` 48/48, ruff clean, pyright clean.
 
 ## Gotchas
 
@@ -26,3 +26,4 @@ Next task: `PLAN.md`. Rules: `AGENTS.md`.
 - **Never name an `App` method `run`.** It overrides Textual's `App.run` and `lct tui` breaks; the helper is `stream`.
 - **Quantizer model cards describe quantization, not the model.** `repo_details` loads the base model's card first.
 - **Check `ss -ltnp` and VRAM before any GPU fit test.** The user often has a server on `100.64.0.1:6868`; a second model then sees ~50 MiB free.
+- **Textual's `App.on_unmount` did not run on quit**, so servers outlived the UI. `action_quit` and `lct tui`'s `finally` now call `stop_children()`; a test pins it.

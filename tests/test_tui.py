@@ -3,6 +3,7 @@
 import asyncio
 import io
 import sys
+from pathlib import Path
 
 import pytest
 from huggingface_hub import ModelInfo
@@ -78,6 +79,33 @@ def test_enter_starts_and_stops_the_highlighted_profile(monkeypatch, workspace):
             await pilot.press("enter")
             await until(pilot, lambda: "idle" in text(app, "#state"))
             assert "server" not in app.procs
+
+    asyncio.run(run())
+
+
+def test_quitting_stops_the_server(monkeypatch, workspace, tmp_path):
+    write_aliases({"mine": str(workspace)})
+    pid_file = tmp_path / "pid"
+    server = f"import os; open({str(pid_file)!r}, 'w').write(str(os.getpid()))\n"
+    monkeypatch.setattr(
+        "llamacpp_tuner.tui.LCT", [sys.executable, "-c", server + FAKE_SERVER]
+    )
+
+    async def run() -> None:
+        app = LctApp()
+        async with app.run_test(size=(100, 40)) as pilot:
+            await pilot.press("enter")
+            await until(pilot, lambda: app.serving == "mine")
+            await pilot.press("q")
+        pid = int(pid_file.read_text())
+        for _ in range(100):
+            if (
+                not Path(f"/proc/{pid}").exists()
+                or " Z " in Path(f"/proc/{pid}/stat").read_text()
+            ):
+                return
+            await asyncio.sleep(0.05)
+        raise AssertionError("server survived quitting the UI")
 
     asyncio.run(run())
 

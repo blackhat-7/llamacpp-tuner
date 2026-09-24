@@ -48,6 +48,7 @@ from llamacpp_tuner.llama import get_llama_binary
 LCT = [sys.executable, "-m", "llamacpp_tuner.cli"]
 
 ACCENT, MUTED, GOOD, WARN = "#818cf8", "#6b7280", "#7ee2a0", "#f2c572"
+NUMBER, MEDIA, SOFT = "#67e8f9", "#f0abfc", "#9aa4b2"
 
 THEME = Theme(
     name="lct",
@@ -71,11 +72,11 @@ Screen { padding: 1 2 0 2; }
 #state { width: auto; }
 Tabs { height: 2; margin-bottom: 1; }
 Tabs Tab { padding: 0 3 0 0; color: $text-muted; }
-Tabs Tab.-active { color: $foreground; }
 ContentSwitcher { height: 1fr; }
 .page { height: 1fr; }
 .column { width: 1fr; height: 1fr; padding-right: 4; }
-.heading { color: $text-muted; margin-bottom: 1; }
+.heading { color: $accent; text-style: bold; margin-bottom: 1; }
+Tabs Tab.-active { color: $accent; text-style: bold; }
 .gap { margin-top: 1; }
 OptionList { border: none; background: transparent; padding: 0; height: auto; max-height: 16; text-wrap: nowrap; text-overflow: ellipsis; }
 OptionList:focus { border: none; background-tint: transparent; }
@@ -231,15 +232,25 @@ def repo_view(info: ModelInfo, card: str) -> Group:
         if part
     )
     base = data.get("base_model")
+    license = str(data.get("license_name") or data.get("license") or "unknown")
+    open_license = license in ("apache-2.0", "mit") or license.startswith(
+        ("llama", "gemma")
+    )
+    popularity = Text.assemble(
+        (f"{compact(info.downloads)} ", NUMBER),
+        "downloads · ",
+        (f"{info.likes or 0} ", MEDIA),
+        "likes",
+    )
     rows: list[tuple[str, Text | str]] = [
-        (
-            "Popularity",
-            f"{compact(info.downloads)} downloads · {info.likes or 0} likes",
-        ),
-        ("License", str(data.get("license_name") or data.get("license") or "unknown")),
+        ("Popularity", popularity),
+        ("License", Text(license, style=GOOD if open_license else WARN)),
         ("Base", ", ".join(base) if isinstance(base, list) else str(base or "—")),
-        ("Model", model or "—"),
-        ("Updated", str(info.last_modified or info.created_at or "—")[:10]),
+        ("Model", Text(model or "—", style=NUMBER)),
+        (
+            "Updated",
+            Text(str(info.last_modified or info.created_at or "—")[:10], style=SOFT),
+        ),
     ]
     return Group(Text(info.id, style="bold"), Text(""), grid(rows))
 
@@ -321,7 +332,7 @@ class LctApp(App[None]):
                         Input("-fa on -ctk q8_0 -ctv q8_0", id="bench-extra"),
                     )
                     yield Static(id="results-table", classes="gap")
-        yield Label("Output", classes="heading")
+        yield Label("Output", classes="heading gap")
         yield RichLog(id="log", wrap=True, highlight=True, max_lines=5000)
         yield Static(id="hints")
 
@@ -342,9 +353,14 @@ class LctApp(App[None]):
         self.update_state()
         self.query_one("#profiles").focus()
 
-    def on_unmount(self) -> None:
+    def stop_children(self) -> None:
+        """Stop servers, downloads and benchmarks so none outlive the UI."""
         for proc in self.procs.values():
             interrupt(proc)
+
+    async def action_quit(self) -> None:
+        self.stop_children()
+        self.exit()
 
     # Shared plumbing
 
@@ -426,7 +442,7 @@ class LctApp(App[None]):
         options = self.query_one("#bench-model", OptionList)
         options.clear_options()
         for name, path in self.models.items():
-            size = (gib(path.stat().st_size), MUTED)
+            size = (gib(path.stat().st_size), NUMBER)
             options.add_option(Option(Text.assemble(name.ljust(52), size), str(path)))
         if options.option_count:
             options.highlighted = 0
@@ -450,13 +466,17 @@ class LctApp(App[None]):
         current = select or self.selected_profile()
         options.clear_options()
         for name, details in self.profiles.items():
-            dot = ("● ", GOOD) if name == self.serving else "  "
-            meta, style = f"{tokens(int(details['ctx'] or 0))} ctx", MUTED
+            running = name == self.serving
+            label = Text.assemble(
+                ("● " if running else "  ", GOOD),
+                (name.ljust(20), GOOD if running else ""),
+            )
             if details["missing"]:
-                meta, style = "model missing", WARN
-            elif details["mmproj"] != "none":
-                meta += " · images"
-            label = Text.assemble(dot, name.ljust(20), (meta, style))
+                label.append("model missing", style=WARN)
+            else:
+                label.append(f"{tokens(int(details['ctx'] or 0))} ctx  ", style=NUMBER)
+                if details["mmproj"] != "none":
+                    label.append("images", style=MEDIA)
             options.add_option(Option(label, name))
         if names := list(self.profiles):
             options.highlighted = names.index(current) if current in names else 0
@@ -627,7 +647,7 @@ class LctApp(App[None]):
             return
         results.clear_options()
         for info in found:
-            popularity = (f"{compact(info.downloads)} ↓".rjust(7) + "   ", MUTED)
+            popularity = (f"{compact(info.downloads)} ↓".rjust(7) + "   ", NUMBER)
             row = Text.assemble(popularity, info.id)
             results.add_option(Option(row, info.id))
         heading.update(
@@ -659,7 +679,7 @@ class LctApp(App[None]):
         self.repo = repo
         info, card = self.repos[repo]
         self.query_one("#repo-info", Static).update(repo_view(info, card))
-        summary = Text(card_summary(card), style="#9aa4b2")
+        summary = Text(card_summary(card), style=SOFT)
         self.query_one("#repo-summary", Static).update(summary)
         self.show_files(info)
 
@@ -677,7 +697,7 @@ class LctApp(App[None]):
         files.clear_options()
         for (name, size), label in zip(found, names, strict=True):
             mark = ("  downloaded", GOOD) if Path(name).name in self.models else ""
-            size_text = (gib(size).rjust(9) + "   ", MUTED)
+            size_text = (gib(size).rjust(9) + "   ", NUMBER)
             row = Text.assemble(size_text, label.removeprefix(prefix), mark)
             files.add_option(Option(row, name))
         if found:
@@ -721,7 +741,11 @@ class LctApp(App[None]):
         for column in ("Test", "t/s", ""):
             table.add_column(column)
         for _, test, speed, spread in self.results:
-            table.add_row(test, Text(speed, style="bold"), Text(spread, style=MUTED))
+            table.add_row(
+                Text(test, style=NUMBER),
+                Text(speed, style=f"bold {GOOD}"),
+                Text(spread, style=MUTED),
+            )
         view = self.query_one("#results-table", Static)
         view.update(table if self.results else Text(note, style=MUTED))
 

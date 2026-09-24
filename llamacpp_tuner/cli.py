@@ -218,7 +218,11 @@ def tui() -> None:
     # Imported here so plain CLI commands do not pay for loading Textual.
     from llamacpp_tuner.tui import LctApp
 
-    LctApp().run()
+    app = LctApp()
+    try:
+        app.run()
+    finally:
+        app.stop_children()
 
 
 if __name__ == "__main__":
