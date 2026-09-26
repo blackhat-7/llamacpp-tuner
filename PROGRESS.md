@@ -3,11 +3,11 @@
 Handoff note. Rewritten at the end of every session, never appended to. Cap 40 lines.
 Next task: `PLAN.md`. Rules: `AGENTS.md`.
 
-**Last session:** 2026-09-24
+**Last session:** 2026-09-26
 
 ## State
 
-- Branch `feat/tui` (from `feat/serve-aliases`). Neither is merged to `main`. Both track `origin`.
+- `feat/serve-aliases` and `feat/tui` are merged to `main` (PR #1). The TUI now uses the Kanagawa Dragon palette.
 - `lct serve <alias>` works. Local aliases in `tmp/aliases.toml`: `qwen`, `qwen-no-img`, `swift-qwen`, `swift-qwen-no-img`, all on `100.64.0.1:6868`.
 - `ukisai/Swift-Qwen3.8-27B-GGUF` Q4_K_S and its projector are downloaded. `swift-qwen` at 128k projects 21408 MiB before the projector's ~1158 MiB; fits.
 - `textual` is a new dependency. `llama.get_llama_binary(name)` now finds `llama-bench` as well as `llama-server`.

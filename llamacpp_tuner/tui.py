@@ -47,20 +47,21 @@ from llamacpp_tuner.llama import get_llama_binary
 
 LCT = [sys.executable, "-m", "llamacpp_tuner.cli"]
 
-ACCENT, MUTED, GOOD, WARN = "#818cf8", "#6b7280", "#7ee2a0", "#f2c572"
-NUMBER, MEDIA, SOFT = "#67e8f9", "#f0abfc", "#9aa4b2"
+# Kanagawa Dragon (rebelot/kanagawa.nvim), to match the user's editor and terminal.
+ACCENT, MUTED, GOOD, WARN = "#8ba4b0", "#737c73", "#87a987", "#e6c384"
+NUMBER, MEDIA, SOFT = "#b6927b", "#a292a3", "#9e9b93"
 
 THEME = Theme(
     name="lct",
     primary=ACCENT,
     accent=ACCENT,
-    foreground="#c9d1d9",
-    background="#0b0e14",
-    surface="#0b0e14",
-    panel="#161b26",
+    foreground="#c5c9c5",
+    background="#181616",
+    surface="#181616",
+    panel="#282727",
     success=GOOD,
     warning=WARN,
-    error="#f38ba8",
+    error="#c4746e",
     dark=True,
 )
 
@@ -81,9 +82,9 @@ ContentSwitcher { height: 1fr; }
 OptionList { border: none; background: transparent; padding: 0; height: auto; max-height: 16; text-wrap: nowrap; text-overflow: ellipsis; }
 OptionList:focus { border: none; background-tint: transparent; }
 OptionList > .option-list--option-highlighted { background: transparent; text-style: none; }
-OptionList:focus > .option-list--option-highlighted { background: $primary 25%; color: $foreground; }
+OptionList:focus > .option-list--option-highlighted { background: $selection; color: $foreground; }
 Input { border: none; height: 1; padding: 0 1; background: $panel; width: 1fr; }
-Input:focus { background: $primary 20%; }
+Input:focus { background: $selection; }
 #search-row { height: 1; margin-bottom: 1; }
 #search-row Label { width: 12; color: $text-muted; }
 #editor { height: 1; margin-top: 1; display: none; }
@@ -374,6 +375,10 @@ class LctApp(App[None]):
         yield Label("Output", classes="heading gap")
         yield RichLog(id="log", wrap=True, highlight=True, max_lines=5000)
         yield Static(id="hints")
+
+    def get_theme_variable_defaults(self) -> dict[str, str]:
+        # Kanagawa's own selection colour; a tint of the accent reads as grey.
+        return {"selection": "#2d4f67"}
 
     def on_mount(self) -> None:
         self.register_theme(THEME)

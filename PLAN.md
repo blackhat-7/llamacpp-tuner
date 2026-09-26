@@ -14,4 +14,5 @@ Each line carries its own done-check. A task too big for one session gets split 
 - [x] **Redesign the TUI in forseti's style.** Keyboard-driven, no boxes or buttons, near-black theme with one indigo accent, profiles as the unit on Serve. Done: screenshots at 80/120, 8 TUI tests.
 - [x] **Inline profile editing and live Hugging Face search.** Settings edit in place and autosave; Download searches as you type and shows repository details. Done: 47 tests, screenshots at 90/120.
 - [~] **Validate Swift aliases.** `swift-qwen` (128k + projector) projects 21408 MiB, fits. Still needed: `swift-qwen-no-img` at 160k, run only while no other server holds the GPU. Done when the number is in `PROGRESS.md`.
-- [ ] **Merge to main.** Branches `feat/serve-aliases` and `feat/tui` are pushed but not merged. Done when the user says how (fast-forward or PR).
+- [x] **Merge to main.** Merged as PR #1.
+- [x] **Kanagawa Dragon theme.** TUI colours match the user's nvim and alacritty. Done: screenshots at 120, 52 tests.
