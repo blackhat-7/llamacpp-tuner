@@ -8,6 +8,7 @@ import os
 import re
 import shlex
 import signal
+import subprocess
 import sys
 from collections.abc import Callable
 from pathlib import Path
@@ -35,6 +36,7 @@ from textual.widgets import (
 )
 from textual.widgets.option_list import Option
 
+from llamacpp_tuner.cache import get_server_log_path, get_server_state_path
 from llamacpp_tuner.cli import load_aliases, pick_projector, serve, write_aliases
 from llamacpp_tuner.downloader import (
     list_downloaded_models,
@@ -47,20 +49,21 @@ from llamacpp_tuner.llama import get_llama_binary
 
 LCT = [sys.executable, "-m", "llamacpp_tuner.cli"]
 
-ACCENT, MUTED, GOOD, WARN = "#818cf8", "#6b7280", "#7ee2a0", "#f2c572"
-NUMBER, MEDIA, SOFT = "#67e8f9", "#f0abfc", "#9aa4b2"
+# Kanagawa Dragon (rebelot/kanagawa.nvim), to match the user's editor and terminal.
+ACCENT, MUTED, GOOD, WARN = "#8ba4b0", "#737c73", "#87a987", "#e6c384"
+NUMBER, MEDIA, SOFT = "#b6927b", "#a292a3", "#9e9b93"
 
 THEME = Theme(
     name="lct",
     primary=ACCENT,
     accent=ACCENT,
-    foreground="#c9d1d9",
-    background="#0b0e14",
-    surface="#0b0e14",
-    panel="#161b26",
+    foreground="#c5c9c5",
+    background="#181616",
+    surface="#181616",
+    panel="#282727",
     success=GOOD,
     warning=WARN,
-    error="#f38ba8",
+    error="#c4746e",
     dark=True,
 )
 
@@ -81,9 +84,9 @@ ContentSwitcher { height: 1fr; }
 OptionList { border: none; background: transparent; padding: 0; height: auto; max-height: 16; text-wrap: nowrap; text-overflow: ellipsis; }
 OptionList:focus { border: none; background-tint: transparent; }
 OptionList > .option-list--option-highlighted { background: transparent; text-style: none; }
-OptionList:focus > .option-list--option-highlighted { background: $primary 25%; color: $foreground; }
+OptionList:focus > .option-list--option-highlighted { background: $selection; color: $foreground; }
 Input { border: none; height: 1; padding: 0 1; background: $panel; width: 1fr; }
-Input:focus { background: $primary 20%; }
+Input:focus { background: $selection; }
 #search-row { height: 1; margin-bottom: 1; }
 #search-row Label { width: 12; color: $text-muted; }
 #editor { height: 1; margin-top: 1; display: none; }
@@ -127,25 +130,36 @@ BENCH_SETTINGS = {
 DEFAULTS = {"ctx": "model default", "host": "127.0.0.1", "port": "8080"}
 
 
+def child_env() -> dict[str, str]:
+    return {**os.environ, "PYTHONUNBUFFERED": "1", "HF_HUB_DISABLE_PROGRESS_BARS": "1"}
+
+
 async def spawn(cmd: list[str]) -> asyncio.subprocess.Process:
     # A new session lets one SIGINT reach lct and llama-server, like Ctrl-C does.
     return await asyncio.create_subprocess_exec(
         *cmd,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.STDOUT,
-        env={
-            **os.environ,
-            "PYTHONUNBUFFERED": "1",
-            "HF_HUB_DISABLE_PROGRESS_BARS": "1",
-        },
+        env=child_env(),
         start_new_session=True,
         limit=2**20,
     )
 
 
-def interrupt(proc: asyncio.subprocess.Process) -> None:
+def interrupt(pid: int) -> None:
     with contextlib.suppress(ProcessLookupError):
-        os.killpg(proc.pid, signal.SIGINT)
+        os.killpg(pid, signal.SIGINT)
+
+
+def alive(pid: int) -> bool:
+    # Reap the server if this UI started it, or a finished one lingers as a zombie.
+    with contextlib.suppress(ChildProcessError):
+        os.waitpid(pid, os.WNOHANG)
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    return True
 
 
 def gib(num_bytes: int) -> str:
@@ -322,6 +336,8 @@ class LctApp(App[None]):
         self.editing = ""
         self.edit_target: tuple[str, str] | None = None
         self.serving = self.url = ""
+        self.server_pid = 0
+        self.stopping = False
         # A question awaiting y, and what y does.
         self.pending: tuple[str, Callable[[], object]] | None = None
         self.with_projector = True
@@ -375,6 +391,10 @@ class LctApp(App[None]):
         yield RichLog(id="log", wrap=True, highlight=True, max_lines=5000)
         yield Static(id="hints")
 
+    def get_theme_variable_defaults(self) -> dict[str, str]:
+        # Kanagawa's own selection colour; a tint of the accent reads as grey.
+        return {"selection": "#2d4f67"}
+
     def on_mount(self) -> None:
         self.register_theme(THEME)
         self.theme = "lct"
@@ -383,11 +403,14 @@ class LctApp(App[None]):
         self.refresh_profiles()
         self.show_bench_settings()
         self.query_one("#profiles").focus()
+        with contextlib.suppress(FileNotFoundError):
+            state = json.loads(get_server_state_path().read_text())
+            self.follow_server(state["name"], state["pid"])
 
     def stop_children(self) -> None:
-        """Stop servers, downloads and benchmarks so none outlive the UI."""
+        """Stop downloads and benchmarks; the server is left running on purpose."""
         for proc in self.procs.values():
-            interrupt(proc)
+            interrupt(proc.pid)
 
     async def action_quit(self) -> None:
         self.stop_children()
@@ -537,7 +560,7 @@ class LctApp(App[None]):
         except asyncio.CancelledError:
             # Textual cancels workers when the app exits or crashes; the child
             # must not outlive it.
-            interrupt(proc)
+            interrupt(proc.pid)
             raise
         finally:
             del self.procs[name]
@@ -697,30 +720,68 @@ class LctApp(App[None]):
 
     @on(OptionList.OptionSelected, "#profiles")
     def toggle_server(self) -> None:
-        if server := self.procs.get("server"):
+        if self.server_pid:
+            self.stopping = True
             self.update_state("◌ stopping", WARN)
-            interrupt(server)
+            interrupt(self.server_pid)
         elif name := self.selected_profile():
             self.start_server(name)
 
+    def start_server(self, name: str) -> None:
+        # The server writes to a file, not a pipe, so it outlives the UI; a later
+        # UI finds it through the state file and can stop it.
+        cmd = [*LCT, "serve", name]
+        log_path = get_server_log_path()
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        with log_path.open("w") as log:
+            log.write(f"$ {shlex.join(cmd)}\n")
+            log.flush()
+            proc = subprocess.Popen(
+                cmd,
+                stdin=subprocess.DEVNULL,
+                stdout=log,
+                stderr=subprocess.STDOUT,
+                env=child_env(),
+                start_new_session=True,
+            )
+        state = {"name": name, "pid": proc.pid}
+        get_server_state_path().write_text(json.dumps(state))
+        self.follow_server(name, proc.pid)
+
     @work(group="server")
-    async def start_server(self, name: str) -> None:
+    async def follow_server(self, name: str, pid: int) -> None:
+        """Show the server's log until it exits."""
+        self.server_pid = pid
         self.update_state(f"◌ loading {name}", WARN)
-
-        def watch(line: str) -> bool:
-            if "listening on" in line:
-                self.serving = name
-                self.url = line.split("listening on")[-1].strip()
-                self.update_state()
-                self.refresh_profiles()
-            return False
-
-        code = await self.stream("server", [*LCT, "serve", name], watch)
-        self.serving = ""
+        log = self.query_one("#log", RichLog)
+        with get_server_log_path().open(errors="replace") as file:
+            partial = ""
+            while True:
+                # Check before reading, so lines written just before exit still show.
+                running = alive(pid)
+                if chunk := file.readline():
+                    partial += chunk
+                    if not partial.endswith("\n"):
+                        continue
+                    line, partial = partial.rstrip(), ""
+                    if "listening on" in line:
+                        self.serving = name
+                        self.url = line.split("listening on")[-1].strip()
+                        self.update_state()
+                        self.refresh_profiles()
+                    log.write(
+                        Text(line, style=ACCENT) if line.startswith("$ ") else line
+                    )
+                elif running:
+                    await asyncio.sleep(0.2)
+                else:
+                    break
+        get_server_state_path().unlink(missing_ok=True)
+        if not self.stopping:
+            self.fail(f"{name} stopped. See the output log.")
+        self.server_pid, self.serving, self.stopping = 0, "", False
         self.refresh_profiles()
         self.update_state()
-        if code > 0:
-            self.fail(f"{name} exited with code {code}. See the output log.")
 
     # Download page: search as you type, details of the highlighted repository
 
@@ -821,7 +882,7 @@ class LctApp(App[None]):
 
     def action_cancel_download(self) -> None:
         if download := self.procs.get("download"):
-            interrupt(download)
+            interrupt(download.pid)
             self.notify("Cancelling download", timeout=2)
 
     @work(group="download")
@@ -862,7 +923,7 @@ class LctApp(App[None]):
     @on(OptionList.OptionSelected, "#bench-model")
     def toggle_bench(self) -> None:
         if bench := self.procs.get("bench"):
-            interrupt(bench)
+            interrupt(bench.pid)
         else:
             self.run_bench()
 

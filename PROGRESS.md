@@ -3,16 +3,16 @@
 Handoff note. Rewritten at the end of every session, never appended to. Cap 40 lines.
 Next task: `PLAN.md`. Rules: `AGENTS.md`.
 
-**Last session:** 2026-09-24
+**Last session:** 2026-09-26
 
 ## State
 
-- Branch `feat/tui` (from `feat/serve-aliases`). Neither is merged to `main`. Both track `origin`.
+- `feat/serve-aliases` and `feat/tui` are merged to `main` (PR #1). The TUI now uses the Kanagawa Dragon palette.
 - `lct serve <alias>` works. Local aliases in `tmp/aliases.toml`: `qwen`, `qwen-no-img`, `swift-qwen`, `swift-qwen-no-img`, all on `100.64.0.1:6868`.
 - `ukisai/Swift-Qwen3.8-27B-GGUF` Q4_K_S and its projector are downloaded. `swift-qwen` at 128k projects 21408 MiB before the projector's ~1158 MiB; fits.
 - `textual` is a new dependency. `llama.get_llama_binary(name)` now finds `llama-bench` as well as `llama-server`.
-- `lct tui`: settings are plain label/value rows; `enter` opens a one-line editor. `tab`/`←→` move between two panes only; `/` search; `esc` always backs out, so `1`–`3` always work outside a text box. Quitting stops child processes.
-- Checks: `pytest` 52/52, ruff clean, pyright clean.
+- `lct tui`: settings are plain label/value rows; `enter` opens a one-line editor. `tab`/`←→` move between two panes only; `/` search; `esc` always backs out, so `1`–`3` always work outside a text box. Quitting stops downloads and benchmarks but leaves the server running; the next `lct tui` reattaches via `server.json` and `server.log` in the cache dir.
+- Checks: `pytest` 51/51, ruff clean, pyright clean.
 
 ## Gotchas
 
@@ -26,6 +26,6 @@ Next task: `PLAN.md`. Rules: `AGENTS.md`.
 - **Never name an `App` method `run`.** It overrides Textual's `App.run` and `lct tui` breaks; the helper is `stream`.
 - **Quantizer model cards describe quantization, not the model.** `repo_details` loads the base model's card first.
 - **Check `ss -ltnp` and VRAM before any GPU fit test.** The user often has a server on `100.64.0.1:6868`; a second model then sees ~50 MiB free.
-- **Textual's `App.on_unmount` did not run on quit**, so servers outlived the UI. `action_quit` and `lct tui`'s `finally` now call `stop_children()`; a test pins it.
+- **Textual's `App.on_unmount` did not run on quit**, so children outlived the UI. `action_quit` and `lct tui`'s `finally` now call `stop_children()`; a test pins it.
 - **Textual runs `_on_click` for every class in the MRO.** A subclass override must call `event.prevent_default()` or the base OptionList still selects.
 - **Textual cancels workers on exit or crash before `finally` in `lct tui` runs**, emptying `procs`. `stream()` stops its own child on `CancelledError`.
