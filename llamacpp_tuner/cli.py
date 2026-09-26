@@ -220,7 +220,8 @@ def tui() -> None:
     from llamacpp_tuner.tui import LctApp
 
     app = LctApp()
-    # A closed terminal (SIGHUP) or kill (SIGTERM) must still stop child servers.
+    # A closed terminal (SIGHUP) or kill (SIGTERM) must still stop downloads and
+    # benchmarks.
     for sig in (signal.SIGHUP, signal.SIGTERM):
         signal.signal(sig, lambda *_: app.exit())
     try:

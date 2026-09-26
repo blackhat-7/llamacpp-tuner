@@ -29,3 +29,11 @@ def get_llama_dir() -> Path:
     path = get_cache_dir() / "llama.cpp"
     path.mkdir(parents=True, exist_ok=True)
     return path
+
+
+def get_server_log_path() -> Path:
+    return get_cache_dir() / "server.log"
+
+
+def get_server_state_path() -> Path:
+    return get_cache_dir() / "server.json"

@@ -1,9 +1,12 @@
 """Tests for the terminal UI."""
 
 import asyncio
+import contextlib
 import io
+import json
+import os
+import signal
 import sys
-from pathlib import Path
 
 import pytest
 from huggingface_hub import ModelInfo
@@ -56,11 +59,17 @@ async def edit(pilot, app: LctApp, key: str, value: str) -> None:
 def workspace(monkeypatch, tmp_path):
     model = tmp_path / "model-Q4_K_M.gguf"
     model.write_bytes(b"x")
+    monkeypatch.setenv("LCT_HOME", str(tmp_path))
     monkeypatch.setattr("llamacpp_tuner.tui.list_downloaded_models", lambda: [model])
     monkeypatch.setattr(
         "llamacpp_tuner.cli.get_aliases_path", lambda: tmp_path / "aliases.toml"
     )
-    return model
+    yield model
+    # Servers outlive the UI by design; do not let a failed test leak one.
+    state = tmp_path / "server.json"
+    if state.exists():
+        with contextlib.suppress(ProcessLookupError):
+            os.killpg(json.loads(state.read_text())["pid"], signal.SIGKILL)
 
 
 @pytest.mark.parametrize("width", [40, 80, 120])
@@ -106,11 +115,11 @@ def test_a_click_only_highlights_and_a_double_click_starts(monkeypatch, workspac
             await pilot.click("#profiles", offset=(4, 1))
             await pilot.pause(0.3)
             assert app.selected_profile() == "b"
-            assert "server" not in app.procs
+            assert not app.server_pid
             await pilot.click("#profiles", offset=(4, 1), times=2)
             await until(pilot, lambda: app.serving == "b")
             await pilot.press("enter")
-            await until(pilot, lambda: "server" not in app.procs)
+            await until(pilot, lambda: not app.server_pid)
 
     asyncio.run(run())
 
@@ -127,32 +136,32 @@ def test_enter_starts_and_stops_the_highlighted_profile(monkeypatch, workspace):
             assert "http://127.0.0.1:9" in text(app, "#state")
             await pilot.press("enter")
             await until(pilot, lambda: "idle" in text(app, "#state"))
-            assert "server" not in app.procs
+            assert not app.server_pid
 
     asyncio.run(run())
 
 
-def test_quitting_stops_the_server(monkeypatch, workspace, tmp_path):
+def test_quitting_leaves_the_server_and_a_new_ui_stops_it(monkeypatch, workspace):
     write_aliases({"mine": str(workspace)})
-    pid_file = tmp_path / "pid"
-    server = f"import os; open({str(pid_file)!r}, 'w').write(str(os.getpid()))\n"
-    monkeypatch.setattr(
-        "llamacpp_tuner.tui.LCT", [sys.executable, "-c", server + FAKE_SERVER]
-    )
+    monkeypatch.setattr("llamacpp_tuner.tui.LCT", [sys.executable, "-c", FAKE_SERVER])
 
     async def run() -> None:
         app = LctApp()
         async with app.run_test(size=(100, 40)) as pilot:
             await pilot.press("enter")
             await until(pilot, lambda: app.serving == "mine")
+            pid = app.server_pid
             await pilot.press("q")
-        pid = int(pid_file.read_text())
-        for _ in range(100):
-            stat = Path(f"/proc/{pid}/stat")
-            if not stat.exists() or " Z " in stat.read_text():
-                return
-            await asyncio.sleep(0.05)
-        raise AssertionError("server survived quitting the UI")
+        os.kill(pid, 0)  # still running
+
+        app = LctApp()
+        async with app.run_test(size=(100, 40)) as pilot:
+            await until(pilot, lambda: app.serving == "mine")
+            assert "http://127.0.0.1:9" in text(app, "#state")
+            await pilot.press("enter")
+            await until(pilot, lambda: not app.server_pid)
+        with pytest.raises(ProcessLookupError):
+            os.kill(pid, 0)
 
     asyncio.run(run())
 
@@ -165,27 +174,6 @@ def test_switching_pages_from_settings_does_not_crash(workspace):
         async with app.run_test(size=(100, 40)) as pilot:
             await pilot.press("tab", "2", "1", "tab", "3", "tab", "2")
             assert app.page == "download"
-
-    asyncio.run(run())
-
-
-def test_cancelled_worker_stops_its_server(monkeypatch, workspace, tmp_path):
-    write_aliases({"mine": str(workspace)})
-    pid_file = tmp_path / "pid"
-    server = f"import os; open({str(pid_file)!r}, 'w').write(str(os.getpid()))\n"
-    monkeypatch.setattr(
-        "llamacpp_tuner.tui.LCT", [sys.executable, "-c", server + FAKE_SERVER]
-    )
-
-    async def run() -> None:
-        app = LctApp()
-        async with app.run_test(size=(100, 40)) as pilot:
-            await pilot.press("enter")
-            await until(pilot, lambda: app.serving == "mine")
-            app.workers.cancel_all()
-            pid = int(pid_file.read_text())
-            stat = Path(f"/proc/{pid}/stat")
-            await until(pilot, lambda: not stat.exists() or " Z " in stat.read_text())
 
     asyncio.run(run())
 
