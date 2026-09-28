@@ -1,105 +1,65 @@
 ---
 name: tune-local-model
-description: Given a specific local LLM or VLM, choose its best quantized artifact and runtime arguments, then prove them with staged benchmarks. Use for GGUF/quant selection, context sizing, offload, KV cache, batching, multimodal placement, tokens-per-second tuning, or OOM diagnosis. If the model itself is not chosen, use select-local-model first.
+description: Given a specific local LLM or VLM, choose its best quantized artifact and runtime arguments, then prove them with staged benchmarks. Use for GGUF/quant selection, context sizing, offload, KV cache, batching, speculative decoding, multimodal placement, prompt caching, tokens-per-second tuning, or OOM/crash diagnosis. If the model itself is not chosen, use select-local-model first.
 ---
 
 # Tune a Local Model
 
-Optimize for required quality, speed, context, and concurrency—not maximum allocation or one short benchmark.
+Optimize for required quality, speed at realistic depth, context and concurrency — not maximum allocation or one short benchmark. For this user's host, measured baselines, working commands and past failures are in `references/host-7900xtx.md`; read it before measuring anything.
+
+## Safety first
+
+- **No long GPU runs without asking.** This host crashed under sustained load (PSU). Short loads and sub-minute tests are fine; ask before multi-minute prefills or sweeps. Estimate a run's length from a short prefill first.
+- Before any fit test: `lct ps`, `ss -ltnp`, and VRAM. A resident server leaves a second model ~50 MiB.
+- Keep 10+ GB RAM free when launching from an agent session; an OOM kill can take the session with it.
+- Stop llama-server with SIGINT (`lct down`); SIGTERM was ignored for 120 s+.
 
 ## 1. Fix the target
 
-Collect the exact model, artifact family, accelerator/backend and dedicated or shared memory, topology, RAM, CPU, runtime/build, modalities, concurrency, and whether host-memory offload is acceptable. Define context capacity, typical initial prompt size, acceptable cold-prefill latency, and minimum decode speed at a realistic filled depth separately.
+Record exact model, artifact, backend and build (commit), VRAM, RAM, CPU, modalities, slots needed, context floor, typical cold prompt (agent harness system prompts: 10–27k tokens), acceptable cold latency, and decode floor at realistic depth. Read the current server command and the client's context/output limits; the client must compact below the server context. Check the build's `--help` — flags get renamed (`-mmp 0` → `-lm none`) and defaults change.
 
-Inspect current memory use. Verify the active client/harness context and output limits, then align the server; do not infer runtime behavior from an inactive configuration file. Confirm that a pinned runtime build supports the exact architecture, quant format, template, reasoning/tool parser, and projector. Do not upgrade blindly; inspect that build's help because flags and defaults change.
+## 2. Choose the artifact
 
-## 2. Choose candidate artifacts
+Inspect real files; never invent filenames or fall back to another quant. Ladder: Q4_K_M (usual winner on 24 GB) → one higher quant only if context and KV survive → one smaller only if forced. A bigger quant that forces lower-precision KV cancels its gain. Importance-matrix and unsloth "UD" quants: compare by KLD, not name. Confirm a speculative head (MTP) is trained and supported by the build.
 
-Inspect repository metadata and actual files. Never invent a model ID, filename, quant, projector, or download command. Verify provenance, license, quantizer, split files, and checksums when supplied.
+## 3. Budget memory before loading
 
-Test a small ladder:
+Weights + KV (attention layers × KV heads × head dim × 2 × bytes, per token) + recurrent state (fixed) + compute buffer (context × ubatch) + MTP/draft KV (defaults to f16: pass `-ctkd/-ctvd`) + projector (lazy, up to ~1.2 GB on first image) + desktop. Leave ≥1 GB free *after* the projector.
 
-- a widely supported balanced quant such as Q4_K_M
-- one higher-quality candidate such as Q5_K_M or Q6_K
-- one smaller candidate only when memory, context, or speed requires it
+- Trust llama.cpp's `projected to use N MiB` and `buffer size` lines; sysfs VRAM under-reports until memory is touched.
+- `-ngl all` disables the auto-fitter; a tight config just OOMs or spills.
+- **Check spill per process**: `drm-memory-gtt` in `/proc/<llama-server pid>/fdinfo/*` is GPU memory living in system RAM. A spill of 1+ GB plus a deep prompt caused GPU watchdog resets (`vk::Queue::submit: ErrorDeviceLost`) twice.
+- Always pass `-np` explicitly (default is auto, e.g. 4 slots).
 
-Names and trade-offs vary by format and runtime. Importance-matrix quants can beat similarly sized plain quants when their provenance is sound. Q8 or floating-point weights often cost substantial memory for small practical gains. Compare every viable artifact on the same representative quality tasks and runtime settings; speed or perplexity alone cannot choose the winner.
+## 4. Baseline, then one change at a time
 
-Memory must cover total weights—not active MoE parameters—plus KV/recurrent state, runtime and batch buffers, projector, request slots, and other users. Include host RAM and memory-mapping behavior for CPU or hybrid offload. Prefer the highest-quality quant that passes peak-load tests with real headroom. A configuration that merely initializes does not fit.
-
-If the requested downloader cannot select the winning artifact, use the model host's official CLI/API or add explicit support; never silently fetch another file. A structurally equivalent artifact may estimate fit and speed, but only the final artifact can validate quality.
-
-## 3. Establish a boring baseline
-
-Pin settings needed for a reproducible baseline:
-
-- one request slot and the required total context
-- documented/default offload and projector placement
-- Flash Attention when supported
-- runtime-default batches
-- F16/BF16 KV as the quality baseline when it fits; test Q8 and lower precision as memory-saving candidates
-- the embedded/documented chat template
-
-Avoid speculative decoding, custom tensor splits, forced locking, or many overrides until this works. Keep sampling fixed during end-to-end comparisons because it changes output length and latency, even though raw model-evaluation benchmarks exclude it. Do not load a projector for text-only use.
-
-## 4. Benchmark in stages
-
-Change one variable at a time. Record the exact build, artifact, command, mean/variance, and peak accelerator and host memory. Use the runtime's native benchmark; pass only arguments that benchmark tool supports. Estimate long-run duration from a short prefill first. Run expensive depths one at a time with a timeout and report each result before continuing.
-
-### A. Prove single-slot memory fit
-
-Start the real server at the target context with one slot. Measure idle memory, then peak memory during a representative long prompt and generation. Initialization alone is insufficient.
-
-### B. Measure prefill and decode
-
-For llama.cpp, choose a representative prompt length `P` within the target context and keep all benchmark-supported arguments fixed:
+Baseline: `-fa on`, one slot, target context, q8_0 K and V, default batches, embedded template (`--jinja`). Then vary one thing, recording build, command, mean ± spread and peak memory. Use `llama-bench -o jsonl` (never custom timers):
 
 ```bash
-llama-bench -m MODEL -p P -n 0 -r 5 [BENCH_ARGS]
-llama-bench -m MODEL -p 0 -n 256 -r 5 [BENCH_ARGS]
+llama-bench -m M -p P -n 0 -r 3 [ARGS]          # prefill at a harness-sized P
+llama-bench -m M -p 0 -n 128 -d DEPTH -r 3 [ARGS] # decode at realistic depth, one depth per run
 ```
 
-`pp` measures prompt processing; `tg` measures generation. Use a prompt length representative of the real harness, including system instructions and tool schemas. These microbenchmarks exclude tokenization, sampling, networking, templates, client overhead, and cache reuse.
+Order of levers, biggest first (details and numbers in the reference):
 
-### C. Measure late-context decode
+1. **Platform**: Resizable BAR on (16 → 67 t/s once); newest llama.cpp build (+5–16% prefill); backend A/B (Vulkan vs HIP differ per model: measure decode *and* prefill at depth).
+2. **Speculative decoding**: built-in MTP (`--spec-type draft-mtp --spec-draft-n-max 3–4`) is the largest decode win on models that ship it; verify acceptance in the server log. N-gram drafting helps only copy-heavy edits and can hurt when MTP already accepts ~all drafts — A/B it.
+3. **KV type**: backend fast paths can require matching K/V types (Vulkan FA: both q8_0; q5_1 V or f16 was slower at depth).
+4. **Batches**: sweep `-b/-ub` pairs separately on a bounded prompt; stop at the plateau. Large ubatch helps prefill (MoE offload most) but grows the compute buffer and the longest GPU job — keep `-ub 512–1024` at long context on Vulkan.
+5. **Threads (CPU/offload only)**: pin to P-cores (`-t 12 -C 0xfff` on 6P+8E); E-cores hurt decode; `--poll 100` helped offload decode.
+6. **MoE offload**: `-ngl 999 -ncmoe N` (each layer ≈ 1.5 GB VRAM ↔ 1.6 GB RAM); `-lm none` needs `--no-host`; `-lm mmap` is much slower.
 
-Short-context `tg` is optimistic. Use `-d` to prefill tokens before decode, one depth per run:
+## 5. Deployment checks in the real server
 
-```bash
-llama-bench -m MODEL -p 0 -n 128 -d DEPTH -r 3 [BENCH_ARGS]
-```
+- **Depth**: confirm prefill and decode near the context you will actually reach. Known Vulkan cliff near 131k (llama.cpp #27734): set `GGML_VK_SUBALLOCATION_BLOCK_SIZE=4294967296` (`lct serve --env`).
+- **Prompt cache**: send a cold turn then an append-only follow-up; the log must show `selected slot by LCP similarity` with `f_keep` ≈ 1 and only new tokens processed. `selected slot by LRU` means a miss.
+  - Hybrid (recurrent) models cannot trim state: reuse needs an exact prefix up to a checkpoint. `--cache-reuse` is auto-disabled for them and with a projector — drop it. `-cms 2048` bounds rollback after an interrupted reply.
+  - `--cache-ram N` keeps prompts in RAM; too small → rereads, too big → OOM with large offloaded models.
+  - **Two clients** (chat + classifier/titles): `-np 2 --kv-unified --no-cache-idle-slots`. Without the last flag, every new request clears idle slots and the chat rereads its whole prompt.
+  - Client-side prompt changes (dates, tool lists toggled) defeat caching; check the harness.
+- **Vision**: measure VRAM after the first image, not at startup.
+- **Soak**: a few real multi-turn sessions; watch GTT spill, RAM, temperature and the kernel log (`journalctl -k | grep amdgpu`).
 
-Start near a typical depth, then approach the realistic worst case only if needed. Keep `DEPTH` below approximately `target_context - n_gen`. Filling a large depth still takes time even when excluded from the reported generation timing.
+## 6. Report
 
-### D. Tune KV precision
-
-Compare supported KV types with everything else fixed. Lower precision can save substantial context memory but may alter long-context quality and sometimes speed. Measure both throughput and retrieval/summary quality; tokens per second cannot detect quality loss.
-
-### E. Tune prefill independently
-
-Use a bounded representative prompt to sweep paired logical/physical batch sizes. Run pairs separately because multi-value options may create a Cartesian product. Tune generation threads and batch/prefill threads independently when the runtime supports both. Larger batches can improve prefill without changing quality, but gains are not monotonic: stop at the plateau or first failure. Re-run the winner in the real server at target context because benchmark fit does not prove deployment fit.
-
-### F. Test deployment features
-
-Only after the baseline, compare full versus automatic/partial offload, CPU-MoE, projector placement, and required concurrency. Runtime slot/KV semantics differ: verify whether context is shared, divided, or replicated. Re-run peak-memory and throughput tests with the real server after each change.
-
-Offload can affect prefill and decode differently. Sparse CPU-MoE may decode quickly while cold prefill remains limited by CPU or RAM bandwidth, so report both. For vision, compare image-ingestion latency and peak memory with the projector on host versus accelerator. Measure hybrid inference on the target machine; CPU, memory bandwidth, interconnect, architecture, and runtime all matter.
-
-### G. Validate real workloads
-
-Run representative chats, tools, structured output, long documents, and images. Record time to first token, prefill/decode speed at real depth, peak memory, correctness, tool-call validity, and failures. Compare a cold first request with append-only follow-ups to verify prompt-cache reuse; client-side message changes can defeat it. Exercise several multi-turn sessions or a short soak test to expose cache and OOM problems.
-
-## 5. Select and report
-
-Choose the simplest configuration that passes quality checks, meets speed at realistic depth, survives peak memory and concurrency, and retains safe system headroom. Keep only flags required for correctness, reproducibility, or a measured benefit.
-
-Return:
-
-1. exact download command when a download is needed
-2. exact recommended serve command
-3. a useful text-only or low-memory variant, if any
-4. measured cold/cached prefill and decode speeds, depths, and peak accelerator/host memory
-5. why the quant, KV, context, batches, and offload won
-6. one fallback for OOM and one for insufficient speed
-
-Never present estimates as measurements. Remove flags that merely repeat defaults unless pinning them is valuable for reproducibility.
+Return: exact download command, exact serve command (or `lct` profile), measured cold/cached prefill and decode at stated depths, peak VRAM/GTT/RAM, why each non-default flag won, and one fallback each for OOM and for low speed. Remove flags that repeat defaults unless pinning them matters. Mark every estimate as an estimate. Keep it short: flag diffs, not essays.

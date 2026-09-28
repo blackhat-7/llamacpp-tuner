@@ -5,66 +5,60 @@ description: Compare and choose the best current local LLM or VLM for a user's w
 
 # Select a Local Model
 
-Give an evidence-backed shortlist, not a model dump. Releases change quickly, so search current sources instead of relying on memory.
+Give an evidence-backed shortlist, not a model dump. Releases change weekly: search current sources, never rely on memory. For this user's host, measured numbers and past verdicts are in `../tune-local-model/references/host-7900xtx.md`; read it first and start from its shortlist.
 
-## 1. Define “best”
+## 1. Define "best"
 
-Collect only missing information:
+Ask only for what is missing:
 
-- weighted use cases and examples of real tasks
-- native modalities versus acceptable preprocessing such as PDF extraction, OCR, or video frame sampling
-- tool/function calling, structured output, and agent-loop needs
-- accelerator/backend and dedicated or shared memory, multi-device topology, RAM, CPU, and OS
-- runtime or serving format, if fixed
-- required context capacity, typical prompt size, first-response latency, late-context generation speed, and concurrency
-- privacy, license, language, censorship, and power constraints
+- weighted use cases with real example tasks (chat, agentic coding in a harness, long documents, vision)
+- hard limits: decode t/s floor, context floor, whole-model-in-VRAM or offload allowed, uncensored, license
+- accelerator, VRAM, RAM, CPU, OS, backend; other VRAM users (desktop, wallpaper, second server)
+- the harness: its system-prompt size (agent harnesses send 10–27k tokens every cold turn), whether it needs tool calls, images, parallel requests
 
-Separate hard requirements from preferences. “Best” means best for these constraints, not the highest headline benchmark.
+Separate hard requirements from preferences. Quality usually beats speed: users reject a faster model that is visibly dumber.
 
-## 2. Build a small current candidate set
+## 2. Build a current candidate set
 
-Search official model cards, release notes, runtime support, and model-host metadata. Prefer official checkpoints or established fine-tuners and quantizers with clear provenance.
+Search model hosts, official cards and runtime release notes. For each candidate verify the exact release, instruct/reasoning mode, dense vs MoE (total params = memory, active params = compute), file sizes, context, modalities, chat template and license.
 
-For every candidate verify the exact:
+- A quantizer's model card describes the quant. Read the base model's card for capabilities.
+- Confirm the runtime supports the architecture on the user's backend (mainline llama.cpp, not a fork; Vulkan/HIP kernels exist). Unsupported arch = reject.
+- Names lie: a "Qwen3.8-9B-Distill" was a Qwen3.5-9B fine-tune; a rumored "Qwen3.8-35B-A3B" did not exist.
+- Do not transfer evidence from a nearby size or family member.
 
-- generation, parameter variant, instruct/reasoning mode, and release
-- dense or MoE architecture; total parameters govern storage while active parameters mainly govern compute
-- artifact format, file size, license, context, modalities, and chat template
-- runtime support for the architecture, projector, reasoning, tools, and structured output
-- quantized artifact provenance and available files
+## 3. Check fit with arithmetic, then measure
 
-Do not substitute evidence from a nearby size or family member.
+Memory = all weights + KV at target context + recurrent state + compute buffer (grows with context × ubatch) + projector (loads lazily on first image) + draft/MTP head + other users. Per-token KV cost comes from the attention-layer count, KV heads and head dim, not total layers: hybrid models (DeltaNet/SSM + few attention layers) are cheap per token.
 
-## 3. Check practical fit
+- Decode speed is bounded by bytes read per token. Fully on GPU: weight size / VRAM bandwidth. Experts in system RAM: dual-channel DDR5 gives ~55–60 GB/s effective, so a 30 t/s floor allows only ~1 GB of RAM reads per token (A3B-class at Q4). An A6B with most experts in RAM ran ~15–18 t/s however it was tuned.
+- Prefill cost scales with active params × prompt length. Cold turns in an agent harness are dominated by it.
+- Dense models slow with depth (27B: 40 → 36.7 t/s from 0 to 30k); extrapolate before promising a speed at 200k.
+- Treat advertised max context as a capability. Reject configs that only fit on paper.
 
-Use actual artifact sizes where possible. Account for weights, KV/recurrent state at the required context, runtime and batch buffers, projector, parallel requests, and memory used by the display or other processes.
+## 4. Compare on evidence the user trusts
 
-Reject configurations that only fit on paper or require unrequested host-memory offload. Distinguish full accelerator execution, hybrid offload, and CPU/RAM inference. Treat advertised maximum context as a capability, not a sensible default. Verify that the active client/harness context limit and server limit agree; do not infer runtime behavior from an inactive configuration file.
+Lead with independent evidence, then label vendor numbers as vendor-reported:
 
-## 4. Compare the relevant capabilities
+1. community reports: r/LocalLLaMA (RSS works with a browser User-Agent, e.g. `https://www.reddit.com/r/LocalLLaMA/search.rss?q=...`; slow down on 429), Hugging Face discussions, Hacker News
+2. third-party boards: Artificial Analysis, SWE-rebench, Terminal-Bench, KLD/perplexity studies by quantizers
+3. vendor tables last
 
-Use exact-model evaluations closest to the workload:
+Report how divided the community is. Vendor tables have hidden looping, knowledge drops, broken MTP heads and tool-call failures ("benchmaxxed").
 
-- knowledge, reasoning, and instruction following
-- tool choice, argument correctness, multi-step agents, and search
-- long-context retrieval and document understanding
-- OCR, charts, scientific figures, and vision
-- coding, math, multilingual, or domain tasks when relevant
+- Agentic harness work needs tool-call validity and instruction following, not chat scores. Test in the real harness when in doubt.
+- Fine-tunes: require provenance and retention evidence. Abliterated/"uncensored" builds cost a little (MMLU −0.2, ARC −1.2 in one case) and have no agentic evals; "fewer thinking tokens" tunes can condense too hard for long tasks. Verify "uncensored" claims: some builds still refuse.
+- Quant quality: Q4_K_M ≈ BF16 on agent benchmarks for a 27B; Q2 drops clearly. Prefer KLD studies over perplexity.
 
-Label vendor-reported, third-party, and anecdotal evidence. Check reasoning mode, token budget, prompts, and whether scores are comparable. Results for a base or full-precision model are evidence, not proof, for a quantized fine-tune. For altered or “uncensored” models, require provenance and capability-retention evidence; fewer refusals do not imply greater intelligence.
+## 5. Recommend
 
-Tool reliability also depends on the runtime, template, parser, and harness. A function-calling claim alone is insufficient.
+Return at most: **default**, **quality alternative** (only if worth its cost), **speed alternative** (only if meaningfully different). For each: exact repo and file, evidence with links, deployment class (full GPU / expert offload / CPU), expected speed marked measured or estimated, the main caveat, confidence. Say plainly when the current model remains best. Keep the answer short; lead with the verdict.
 
-## 5. Recommend and validate
+When evidence cannot decide, propose 2–3 real tasks run on each model with the same harness, template, sampling and context. Never present an estimate as a measurement. Hand the choice to `tune-local-model`.
 
-Return no more than:
+## Rules learned the hard way
 
-1. **Default:** best overall match
-2. **Quality alternative:** only if its extra cost is worthwhile
-3. **Speed/simplicity alternative:** only if meaningfully different
-
-State each exact model ID, evidence, deployment class, important caveat, and confidence. Include source links, fit uncertainties, and say plainly when the user's current model remains best.
-
-When published evidence cannot decide, propose the smallest representative A/B set that can. Keep tools, templates, sampling, context, and comparable quantization fixed; score task success, tool-call validity, source fidelity, hallucinations, cold and cached latency, and user preference.
-
-Never invent memory or throughput figures. Measure them on the target system when they matter. Hand the chosen model to `tune-local-model`.
+- Check the user's real bottleneck first. "Too many compactions" was fixed by more context on the same model, not a new model.
+- Spare system RAM rarely makes a VRAM-bound dense model faster. It is best used for the prompt cache, a CPU side model for background jobs, embeddings, and fast model swaps.
+- One GPU server slot shared by chat and background jobs (titles, memory reviews, a safety classifier) evicts the chat's prompt cache; plan a second slot or a CPU side model.
+- A CPU side model suits only short prompts: CPU prefill is ~90 t/s for an A3B, so a 20k-token prompt takes minutes.
