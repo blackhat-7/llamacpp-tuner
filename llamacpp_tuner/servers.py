@@ -141,8 +141,25 @@ def usage(pid: int) -> Usage:
     return Usage(cpu, gpu, int(ram), int(vram))
 
 
+def _temperature(hwmon: Path, label: str) -> int | None:
+    """°C of the hwmon sensor with this label, if present."""
+    for sensor in hwmon.glob("temp*_label"):
+        with contextlib.suppress(OSError, ValueError):
+            if sensor.read_text().strip() == label:
+                return (
+                    int(
+                        sensor.with_name(
+                            sensor.name.replace("label", "input")
+                        ).read_text()
+                    )
+                    // 1000
+                )
+    return None
+
+
 def system() -> dict[str, int]:
-    """Whole-machine CPU ticks, RAM and, for the first GPU that reports it, VRAM and load."""
+    """Whole-machine CPU ticks, RAM and temperature and, for the first GPU that
+    reports them, VRAM, load and hotspot temperature."""
     cpu = Path("/proc/stat").read_text().split("\n", 1)[0].split()[1:]
     meminfo = {
         line.split(":")[0]: int(line.split()[1]) * 1024
@@ -161,5 +178,14 @@ def system() -> dict[str, int]:
             found["vram_used"] = int((device / "mem_info_vram_used").read_text())
             found["vram_total"] = int((device / "mem_info_vram_total").read_text())
             found["gpu_busy"] = int((device / "gpu_busy_percent").read_text())
+            # The hotspot (junction) is what throttles, not the edge sensor.
+            for hwmon in device.glob("hwmon/hwmon*"):
+                if (celsius := _temperature(hwmon, "junction")) is not None:
+                    found["gpu_temp"] = celsius
             break
+    for hwmon in Path("/sys/class/hwmon").glob("hwmon*"):
+        with contextlib.suppress(OSError):
+            is_cpu = (hwmon / "name").read_text().strip() == "coretemp"
+            if is_cpu and (celsius := _temperature(hwmon, "Package id 0")) is not None:
+                found["cpu_temp"] = celsius
     return found

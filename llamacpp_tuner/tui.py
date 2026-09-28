@@ -185,8 +185,15 @@ def hint_line(keys: str) -> Text:
     return text
 
 
-def meter(label: str, percent: float, detail: str = "", width: int = 8) -> Text:
-    """A labelled bar such as 'gpu ▕████▌   ▏ 58%', coloured by load."""
+def meter(
+    label: str,
+    percent: float,
+    detail: str = "",
+    temp: int | None = None,
+    hot: int = 85,
+    width: int = 8,
+) -> Text:
+    """A labelled bar such as 'gpu ▕████▌   ▏ 58% 71°', coloured by load and heat."""
     percent = max(0.0, min(percent, 100.0))
     eighths = round(percent / 100 * width * 8)
     bar = "█" * (eighths // 8) + (" ▏▎▍▌▋▊▉"[eighths % 8] if eighths % 8 else "")
@@ -198,6 +205,10 @@ def meter(label: str, percent: float, detail: str = "", width: int = 8) -> Text:
         ("▏", EDGE),
         (f"{percent:3.0f}%", NUMBER),
         (f" {detail}" if detail else "", SOFT),
+        (
+            f" {temp}°" if temp is not None else "",
+            GOOD if temp is None or temp < hot - 15 else WARN if temp < hot else BAD,
+        ),
         "   ",
     )
 
@@ -731,12 +742,15 @@ class LctApp(App[None]):
             cpu = busy / (system["cpu_total"] - before["cpu_total"]) * 100
         ram = system["ram_used"] / system["ram_total"] * 100
         line = Text.assemble(
-            meter("cpu", cpu),
+            # Intel's limit is 100 °C; the 7900 XTX hotspot's is 110 °C.
+            meter("cpu", cpu, temp=system.get("cpu_temp"), hot=90),
             meter("ram", ram, f"{system['ram_used'] / 1024**3:.0f}G"),
         )
         if "vram_total" in system:
             vram = system["vram_used"] / system["vram_total"] * 100
-            line.append_text(meter("gpu", system["gpu_busy"]))
+            line.append_text(
+                meter("gpu", system["gpu_busy"], temp=system.get("gpu_temp"), hot=100)
+            )
             line.append_text(
                 meter("vram", vram, f"{system['vram_used'] / 1024**3:.1f}G")
             )
