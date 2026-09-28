@@ -341,11 +341,11 @@ class LctApp(App[None]):
         self.profiles: dict[str, dict] = {}
         self.stacks: dict[str, list[str]] = {}
         # Running servers by profile: pid, address once listening, and live usage
-        # (CPU % of the machine, RAM, VRAM) from the last two samples.
+        # (CPU % of the machine, GPU %, RAM, VRAM) from the last two samples.
         self.servers: dict[str, int] = {}
         self.urls: dict[str, str] = {}
-        self.usage: dict[str, tuple[float, int, int]] = {}
-        self.samples: dict[str, tuple[float, float]] = {}
+        self.usage: dict[str, tuple[float, float, int, int]] = {}
+        self.samples: dict[str, tuple[float, servers.Usage]] = {}
         self.system_sample: dict[str, int] = {}
         self.stopping: set[str] = set()
         self.models: dict[str, Path] = {}
@@ -658,10 +658,12 @@ class LctApp(App[None]):
             (mark, style), (name[:21].ljust(self.name_width()), style)
         )
         if name in self.usage:
-            cpu, ram, vram = self.usage[name]
+            cpu, gpu, ram, vram = self.usage[name]
             label.append(f"{cpu:3.0f}% cpu {ram / 1024**3:4.1f}G ram ", style=NUMBER)
             if vram:
-                label.append(f"{vram / 1024**3:4.1f}G vram", style=NUMBER)
+                label.append(
+                    f"{gpu:3.0f}% gpu {vram / 1024**3:4.1f}G vram", style=NUMBER
+                )
         elif details["missing"]:
             label.append("model missing", style=WARN)
         else:
@@ -676,14 +678,13 @@ class LctApp(App[None]):
         options = self.query_one("#profiles", OptionList)
         for name, pid in self.servers.items():
             used = servers.usage(pid)
-            then, before = self.samples.get(name, (now, used.cpu_seconds))
-            cpu = (
-                (used.cpu_seconds - before) / (now - then) / cpus * 100
-                if now > then
-                else 0.0
-            )
-            self.samples[name] = (now, used.cpu_seconds)
-            self.usage[name] = (cpu, used.ram, used.vram)
+            then, before = self.samples.get(name, (now, used))
+            elapsed = now - then or 1.0
+            cpu = (used.cpu_seconds - before.cpu_seconds) / elapsed / cpus * 100
+            # Engines can overlap (compute and graphics), so cap at 100.
+            gpu = min((used.gpu_seconds - before.gpu_seconds) / elapsed * 100, 100.0)
+            self.samples[name] = (now, used)
+            self.usage[name] = (cpu, gpu, used.ram, used.vram)
             if name in self.profiles:
                 # In place, so the highlight and scroll position stay put.
                 options.replace_option_prompt(name, self.profile_label(name))

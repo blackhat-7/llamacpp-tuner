@@ -90,6 +90,7 @@ def url(name: str) -> str:
 
 class Usage(NamedTuple):
     cpu_seconds: float
+    gpu_seconds: float
     ram: int
     vram: int
 
@@ -107,8 +108,8 @@ def _tree(pid: int) -> list[int]:
 
 
 def usage(pid: int) -> Usage:
-    """CPU time used so far, resident RAM and GPU memory of a server's processes."""
-    cpu = ram = vram = 0.0
+    """CPU and GPU time used so far, resident RAM and VRAM of a server's processes."""
+    cpu = gpu = ram = vram = 0.0
     for current in _tree(pid):
         with contextlib.suppress(OSError):
             # Fields after the ')' that ends the command name; utime and stime are 12, 13.
@@ -117,8 +118,9 @@ def usage(pid: int) -> Usage:
             for line in Path(f"/proc/{current}/status").read_text().splitlines():
                 if line.startswith("VmRSS"):  # absent for zombies
                     ram += int(line.split()[1]) * 1024
-            # amdgpu reports each client's VRAM in fdinfo; several fds can share a client.
-            clients = {}
+            # amdgpu reports each client's VRAM and busy time per engine (ns) in fdinfo;
+            # several fds can share a client.
+            clients: dict[str, tuple[int, int]] = {}
             for fdinfo in Path(f"/proc/{current}/fdinfo").iterdir():
                 with contextlib.suppress(OSError):
                     info = dict(
@@ -128,9 +130,15 @@ def usage(pid: int) -> Usage:
                     )
                     if "drm-memory-vram" in info:
                         size = int(info["drm-memory-vram"].split()[0]) * 1024
-                        clients[info.get("drm-client-id", fdinfo.name)] = size
-            vram += sum(clients.values())
-    return Usage(cpu, int(ram), int(vram))
+                        busy = sum(
+                            int(value.split()[0])
+                            for key, value in info.items()
+                            if key.startswith("drm-engine-")
+                        )
+                        clients[info.get("drm-client-id", fdinfo.name)] = (size, busy)
+            vram += sum(size for size, _ in clients.values())
+            gpu += sum(busy for _, busy in clients.values()) / 1e9
+    return Usage(cpu, gpu, int(ram), int(vram))
 
 
 def system() -> dict[str, int]:
