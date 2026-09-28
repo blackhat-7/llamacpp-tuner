@@ -384,3 +384,37 @@ def test_running_servers_show_live_usage(monkeypatch, workspace):
             assert "ram" in text(app, "#meters")
 
     asyncio.run(run())
+
+
+def test_stack_members_are_nested_once_and_start_alone(monkeypatch, workspace):
+    write_aliases({"a": str(workspace), "b": str(workspace), "solo": str(workspace)})
+    (workspace.parent / "aliases.toml").write_text(
+        (workspace.parent / "aliases.toml").read_text()
+        + '[stacks]\nboth = ["a", "b"]\n'
+    )
+    monkeypatch.setattr(
+        "llamacpp_tuner.servers.LCT", [sys.executable, "-c", FAKE_SERVER]
+    )
+
+    async def run() -> None:
+        app = LctApp()
+        async with app.run_test(size=(120, 40)) as pilot:
+            options = app.query_one("#profiles", OptionList)
+            ids = [
+                str(options.get_option_at_index(i).id)
+                for i in range(options.option_count)
+            ]
+            assert "stack:both/a" in ids and "stack:both/b" in ids and "solo" in ids
+            assert "a" not in ids  # only under its stack
+            assert "└─" in row(app, "#profiles", "stack:both/b")
+
+            await pilot.press("down")
+            assert app.selected_profile() == "a"
+            assert "Model" in row(app, "#settings", "model")
+            await pilot.press("enter")
+            await until(pilot, lambda: "a" in app.urls)
+            assert "b" not in app.servers
+            await pilot.press("enter")
+            await until(pilot, lambda: not app.servers)
+
+    asyncio.run(run())

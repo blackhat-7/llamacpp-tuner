@@ -387,6 +387,9 @@ class LctApp(App[None]):
         self.samples: dict[str, tuple[float, servers.Usage]] = {}
         self.system_sample: dict[str, int] = {}
         self.stopping: set[str] = set()
+        # Profile-list row ids per profile and the tree branch each draws, so live
+        # usage can redraw rows in place.
+        self.rows: dict[str, list[tuple[str, str]]] = {}
         self.models: dict[str, Path] = {}
         self.projectors: dict[str, Path] = {}
         self.editing = ""
@@ -650,11 +653,16 @@ class LctApp(App[None]):
 
     # Serve page: profiles on the left, the highlighted profile's settings on the right
 
-    def selected_profile(self) -> str:
+    def selected_row(self) -> str:
         options = self.query_one("#profiles", OptionList)
         if options.highlighted is None:
             return ""
         return str(options.get_option_at_index(options.highlighted).id)
+
+    def selected_profile(self) -> str:
+        """The highlighted profile, or 'stack:<name>' on a stack's own row."""
+        row = self.selected_row()
+        return row.split("/", 1)[1] if row.startswith("stack:") and "/" in row else row
 
     def refresh_profiles(self, select: str = "") -> None:
         try:
@@ -668,38 +676,93 @@ class LctApp(App[None]):
     def server_mark(self, name: str) -> tuple[str, str]:
         if name in self.urls:
             return "● ", GOOD
-        return ("◌ ", WARN) if name in self.servers else ("  ", "")
+        return ("◌ ", WARN) if name in self.servers else ("○ ", MUTED)
 
     def render_profiles(self, select: str = "") -> None:
-        """Stacks first, then profiles, each with its live server state."""
+        """Stacks with their profiles nested under them, then the other profiles."""
         options = self.query_one("#profiles", OptionList)
-        current = select or self.selected_profile()
+        current = select or self.selected_row()
         options.clear_options()
-        for name, members in self.stacks.items():
-            up = [m for m in members if m in self.servers]
-            mark = "● " if len(up) == len(members) else "◐ " if up else "  "
-            label = Text.assemble(
-                (mark, GOOD if up else ""),
-                (name[:21].ljust(self.name_width()), "bold"),
-                (" + ".join(members), SOFT),
+        self.rows = {}
+        grouped = {member for members in self.stacks.values() for member in members}
+
+        def heading(title: str) -> None:
+            options.add_option(
+                Option(Text(title, style=f"bold {MUTED}"), disabled=True)
             )
-            options.add_option(Option(label, f"stack:{name}"))
-        for name in self.profiles:
+
+        if self.stacks:
+            heading("STACKS")
+        for stack, members in self.stacks.items():
+            options.add_option(Option(self.stack_label(stack), f"stack:{stack}"))
+            for i, member in enumerate(members):
+                branch = "└─ " if i == len(members) - 1 else "├─ "
+                row = f"stack:{stack}/{member}"
+                self.rows.setdefault(member, []).append((row, branch))
+                if member in self.profiles:
+                    options.add_option(Option(self.profile_label(member, branch), row))
+        others = [name for name in self.profiles if name not in grouped]
+        if self.stacks and others:
+            options.add_option(Option(Text(""), disabled=True))
+            heading("PROFILES")
+        for name in others:
+            self.rows[name] = [(name, "")]
             options.add_option(Option(self.profile_label(name), name))
-        ids = [f"stack:{n}" for n in self.stacks] + list(self.profiles)
-        if ids:
-            options.highlighted = ids.index(current) if current in ids else 0
+        ids = [
+            str(options.get_option_at_index(i).id) for i in range(options.option_count)
+        ]
+        # A renamed or newly saved profile is asked for by name; find its row.
+        match = next(
+            (
+                i
+                for i, row in enumerate(ids)
+                if row == current or row.endswith(f"/{current}")
+            ),
+            None,
+        )
+        enabled = [
+            i
+            for i in range(options.option_count)
+            if not options.get_option_at_index(i).disabled
+        ]
+        if enabled:
+            options.highlighted = match if match is not None else enabled[0]
         self.show_settings()
 
     def name_width(self) -> int:
-        """Pad names to the longest one, so the numbers after them line up."""
-        return min(max(map(len, [*self.stacks, *self.profiles]), default=0), 21) + 2
+        """Pad names so the numbers after them line up, nested rows included."""
+        widths = [len(name) for name in [*self.stacks, *self.profiles]]
+        nested = [len(m) + 5 for members in self.stacks.values() for m in members]
+        return min(max([*widths, *nested], default=0), 26) + 2
 
-    def profile_label(self, name: str) -> Text:
+    def stack_label(self, stack: str) -> Text:
+        members = self.stacks[stack]
+        up = [m for m in members if m in self.servers]
+        mark = "● " if up and len(up) == len(members) else "◐ " if up else "○ "
+        label = Text.assemble(
+            (mark, GOOD if up else MUTED),
+            (stack[:21].ljust(self.name_width()), "bold"),
+            (f"{len(up)}/{len(members)} up  ", GOOD if up else MUTED),
+        )
+        if up:
+            ram = sum(self.usage.get(m, (0, 0, 0, 0))[2] for m in up)
+            vram = sum(self.usage.get(m, (0, 0, 0, 0))[3] for m in up)
+            label.append("ram ", style=MUTED).append(
+                f"{ram / 1024**3:.1f}G  ", style=NUMBER
+            )
+            label.append("vram ", style=MUTED).append(
+                f"{vram / 1024**3:.1f}G", style=NUMBER
+            )
+        return label
+
+    def profile_label(self, name: str, branch: str = "") -> Text:
         details = self.profiles[name]
         mark, style = self.server_mark(name)
+        indent = "   " + branch if branch else ""
         label = Text.assemble(
-            (mark, style), (name[:21].ljust(self.name_width()), style)
+            (indent, MUTED),
+            (mark, style),
+            (name[:21].ljust(self.name_width() - len(indent)), style),
         )
         if name in self.usage:
             cpu, gpu, ram, vram = self.usage[name]
@@ -733,7 +796,10 @@ class LctApp(App[None]):
             self.usage[name] = (cpu, gpu, used.ram, used.vram)
             if name in self.profiles:
                 # In place, so the highlight and scroll position stay put.
-                options.replace_option_prompt(name, self.profile_label(name))
+                for row, branch in self.rows.get(name, []):
+                    options.replace_option_prompt(row, self.profile_label(name, branch))
+        for stack in self.stacks:
+            options.replace_option_prompt(f"stack:{stack}", self.stack_label(stack))
         system, before = servers.system(), self.system_sample
         self.system_sample = system
         cpu = 0.0
