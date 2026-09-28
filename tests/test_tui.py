@@ -380,7 +380,7 @@ def test_running_servers_show_live_usage(monkeypatch, workspace):
             await until(pilot, lambda: "mine" in app.urls)
             app.measure()
             await pilot.pause()
-            assert "% cpu" in row(app, "#profiles", "mine")
-            assert "ram" in text(app, "#title")
+            assert "cpu" in row(app, "#profiles", "mine")
+            assert "ram" in text(app, "#meters")
 
     asyncio.run(run())

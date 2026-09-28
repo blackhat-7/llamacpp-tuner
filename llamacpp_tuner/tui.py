@@ -54,6 +54,7 @@ from llamacpp_tuner.servers import LCT, child_env, interrupt
 # Kanagawa Dragon (rebelot/kanagawa.nvim), to match the user's editor and terminal.
 ACCENT, MUTED, GOOD, WARN = "#8ba4b0", "#737c73", "#87a987", "#e6c384"
 NUMBER, MEDIA, SOFT = "#b6927b", "#a292a3", "#9e9b93"
+BAD, EDGE, CAP = "#c4746e", "#393836", "#2d4f67"
 
 THEME = Theme(
     name="lct",
@@ -69,18 +70,24 @@ THEME = Theme(
     dark=True,
 )
 
-CSS = """
+CSS = (
+    """
 Screen { padding: 1 2 0 2; }
 * { scrollbar-size-vertical: 1; scrollbar-background: $background; scrollbar-color: $panel; }
-#top { height: 1; }
-#title { width: 1fr; }
+#top { height: 1; margin-bottom: 1; }
+#title { width: auto; padding-right: 3; }
+#meters { width: 1fr; }
 #state { width: auto; }
 Tabs { height: 2; margin-bottom: 1; }
 Tabs Tab { padding: 0 3 0 0; color: $text-muted; }
 Tabs Tab.-active { color: $accent; text-style: bold; }
 ContentSwitcher { height: 1fr; }
 .page { height: 1fr; }
-.column { width: 1fr; height: 1fr; padding-right: 4; }
+.column { width: 1fr; height: 1fr; }
+.panel { border: round """
+    + EDGE
+    + """; border-title-color: $text-muted; border-title-style: bold; padding: 0 1; margin-right: 1; }
+.panel:focus-within { border: round $accent; border-title-color: $accent; }
 #profiles-column { width: 3fr; }
 .heading { color: $accent; text-style: bold; margin-bottom: 1; }
 .gap { margin-top: 1; }
@@ -95,11 +102,14 @@ Input:focus { background: $selection; }
 #editor { height: 1; margin-top: 1; display: none; }
 #editor.-open { display: block; }
 #editor Label { width: auto; color: $accent; text-style: bold; padding-right: 2; }
-#log { height: 8; background: transparent; border: none; padding: 0; }
-#splitter { margin-top: 1; color: $accent; text-style: bold; }
-#splitter:hover { background: $panel; }
+#log { height: 8; background: transparent; border: round """
+    + EDGE
+    + """; border-title-color: $text-muted; border-title-style: bold; padding: 0 1; }
+#splitter { height: 1; content-align: center middle; color: $text-muted; }
+#splitter:hover { color: $accent; }
 #hints { height: 1; margin-top: 1; }
 """
+)
 
 HINTS = {
     "serve": "enter start/stop  tab settings  n new  d delete",
@@ -166,12 +176,30 @@ def compact(count: int | None) -> str:
 
 
 def hint_line(keys: str) -> Text:
-    """Render 'enter start  e edit' with keys in the accent colour."""
+    """Render 'enter start  e edit' as key caps followed by what they do."""
     text = Text()
     for part in keys.split("  "):
         key, _, label = part.partition(" ")
-        text.append(f"{key} ", style=ACCENT).append(f"{label}    ", style=MUTED)
+        text.append(f" {key} ", style=f"bold {ACCENT} on {CAP}")
+        text.append(f" {label}   ", style=MUTED)
     return text
+
+
+def meter(label: str, percent: float, detail: str = "", width: int = 8) -> Text:
+    """A labelled bar such as 'gpu ▕████▌   ▏ 58%', coloured by load."""
+    percent = max(0.0, min(percent, 100.0))
+    eighths = round(percent / 100 * width * 8)
+    bar = "█" * (eighths // 8) + (" ▏▎▍▌▋▊▉"[eighths % 8] if eighths % 8 else "")
+    colour = GOOD if percent < 60 else WARN if percent < 85 else BAD
+    return Text.assemble(
+        (f"{label} ", MUTED),
+        ("▕", EDGE),
+        (bar.ljust(width), colour),
+        ("▏", EDGE),
+        (f"{percent:3.0f}%", NUMBER),
+        (f" {detail}" if detail else "", SOFT),
+        "   ",
+    )
 
 
 def setting_row(label: str, value: Text | str) -> Text:
@@ -278,12 +306,12 @@ def repo_view(info: ModelInfo) -> Group:
 
 
 class Splitter(Static):
-    """The Output heading, drawn as a rule; drag it to resize the log below."""
+    """A grip above the log; drag it to resize the log."""
 
     dragging = False
 
     def render(self) -> Text:
-        return Text.assemble("Output ", ("─" * max(self.size.width - 7, 0), MUTED))
+        return Text("╌╌╌  ⠿ drag  ╌╌╌")
 
     def on_mouse_down(self, event: events.MouseDown) -> None:
         self.dragging = True
@@ -362,7 +390,8 @@ class LctApp(App[None]):
 
     def compose(self) -> ComposeResult:
         with Horizontal(id="top"):
-            yield Static("lct", id="title")
+            yield Static(Text.assemble(("◆ ", ACCENT), ("lct", "bold")), id="title")
+            yield Static("", id="meters")
             yield Static("", id="state")
         yield Tabs(
             Tab("Serve", id="serve"),
@@ -371,38 +400,42 @@ class LctApp(App[None]):
         )
         with ContentSwitcher(initial="serve-page"):
             with Horizontal(id="serve-page", classes="page"):
-                with Vertical(classes="column", id="profiles-column"):
-                    yield Label("Profiles", classes="heading")
+                with Vertical(classes="column panel", id="profiles-column") as panel:
+                    panel.border_title = "Profiles"
                     yield PickList(id="profiles")
-                with Vertical(classes="column"):
-                    yield Label("Settings", classes="heading")
+                with Vertical(classes="column panel") as panel:
+                    panel.border_title = "Settings"
                     yield PickList(id="settings")
             with Vertical(id="download-page", classes="page"):
                 with Horizontal(id="search-row"):
                     yield Label("Search")
                     yield Input(id="repo")
                 with Horizontal():
-                    with Vertical(classes="column"):
+                    with Vertical(classes="column panel") as panel:
+                        panel.border_title = "Repositories"
                         yield Label("", id="results-heading", classes="heading")
                         yield PickList(id="results")
-                    with VerticalScroll(classes="column"):
+                    with VerticalScroll(classes="column panel") as panel:
+                        panel.border_title = "Details"
                         yield Static(id="repo-info")
                         yield Label("", id="files-heading", classes="heading gap")
                         yield PickList(id="files")
                         yield Static(id="repo-summary", classes="gap")
             with Horizontal(id="bench-page", classes="page"):
-                with Vertical(classes="column"):
-                    yield Label("Model", classes="heading")
+                with Vertical(classes="column panel") as panel:
+                    panel.border_title = "Model"
                     yield PickList(id="bench-model")
-                with Vertical(classes="column"):
-                    yield Label("Settings", classes="heading")
+                with Vertical(classes="column panel") as panel:
+                    panel.border_title = "Settings"
                     yield PickList(id="bench-settings")
                     yield Static(id="results-table", classes="gap")
         with Horizontal(id="editor"):
             yield Label("", id="editor-label")
             yield Input(id="editor-input")
         yield Splitter(id="splitter")
-        yield RichLog(id="log", wrap=True, highlight=True, max_lines=5000)
+        log = RichLog(id="log", wrap=True, highlight=True, max_lines=5000)
+        log.border_title = "Output"
+        yield log
         yield Static(id="hints")
 
     def get_theme_variable_defaults(self) -> dict[str, str]:
@@ -659,11 +692,13 @@ class LctApp(App[None]):
         )
         if name in self.usage:
             cpu, gpu, ram, vram = self.usage[name]
-            label.append(f"{cpu:3.0f}% cpu {ram / 1024**3:4.1f}G ram ", style=NUMBER)
-            if vram:
-                label.append(
-                    f"{gpu:3.0f}% gpu {vram / 1024**3:4.1f}G vram", style=NUMBER
-                )
+            for unit, value in (
+                ("cpu", f"{cpu:3.0f}%"),
+                ("gpu", f"{gpu:3.0f}%" if vram else "   –"),
+                ("ram", f"{ram / 1024**3:4.1f}G"),
+                ("vram", f"{vram / 1024**3:4.1f}G" if vram else "    –"),
+            ):
+                label.append(f"{unit} ", style=MUTED).append(f"{value}  ", style=NUMBER)
         elif details["missing"]:
             label.append("model missing", style=WARN)
         else:
@@ -694,23 +729,18 @@ class LctApp(App[None]):
         if before and system["cpu_total"] > before["cpu_total"]:
             busy = system["cpu_busy"] - before["cpu_busy"]
             cpu = busy / (system["cpu_total"] - before["cpu_total"]) * 100
+        ram = system["ram_used"] / system["ram_total"] * 100
         line = Text.assemble(
-            ("lct   ", "bold"),
-            ("cpu ", MUTED),
-            (f"{cpu:.0f}%  ", NUMBER),
-            ("ram ", MUTED),
-            (
-                f"{system['ram_used'] / 1024**3:.0f}/{system['ram_total'] / 1024**3:.0f}G  ",
-                NUMBER,
-            ),
+            meter("cpu", cpu),
+            meter("ram", ram, f"{system['ram_used'] / 1024**3:.0f}G"),
         )
         if "vram_total" in system:
-            line.append("gpu ", style=MUTED).append(
-                f"{system['gpu_busy']}%  ", style=NUMBER
+            vram = system["vram_used"] / system["vram_total"] * 100
+            line.append_text(meter("gpu", system["gpu_busy"]))
+            line.append_text(
+                meter("vram", vram, f"{system['vram_used'] / 1024**3:.1f}G")
             )
-            vram = f"{system['vram_used'] / 1024**3:.1f}/{system['vram_total'] / 1024**3:.0f}G"
-            line.append("vram ", style=MUTED).append(vram, style=NUMBER)
-        self.query_one("#title", Static).update(line)
+        self.query_one("#meters", Static).update(line)
 
     @on(OptionList.OptionHighlighted, "#profiles")
     def show_settings(self) -> None:
