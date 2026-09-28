@@ -11,7 +11,8 @@ Next task: `PLAN.md`. Rules: `AGENTS.md`.
 - The TUI tracks many servers: stacks first (`enter` toggles the whole stack), each profile marked ◌ loading / ● ready with its RAM. Server log lines start with the profile name.
 - Stack `local` in `tmp/aliases.toml` = `swift-qwen` (GPU, :6868) + `side` (Qwen3.6-35B-A3B UD-Q4_K_S on CPU, :6869, served as model `side`) + `embed` (Qwen3-Embedding-0.6B Q8_0 on CPU, :6870).
 - Measured `side` on CPU: loads in 10 s, 20.5 GiB RAM, decode ~15 t/s, prefill ~91 t/s (3k prompt 33 s cold, 4 tokens when cached), a title in under 1 s.
-- Measured `swift-qwen` with MTP: code edit ~120 t/s, prose ~60 t/s. N-gram drafting rejected (see `DECISIONS.md`).
+- `swift-qwen` now 150k, two slots sharing one KV pool: VRAM 23.5/24 GiB with an image; code edit ~114 t/s, prose ~54 t/s. N-gram drafting rejected.
+- Pi's auto-mode classifier runs on `swift-qwen`'s second slot (~2.3 s a pass); on `side` it took 10–25 s and timed out on parallel tool calls.
 - Consumers live in the `ai-harnesses` repo: `pi --local`, `claude-local` Haiku → side, code-review-graph embeddings → :6870.
 - Checks: `pytest` 55/55, ruff clean, pyright clean.
 
