@@ -66,8 +66,7 @@ def workspace(monkeypatch, tmp_path):
     )
     yield model
     # Servers outlive the UI by design; do not let a failed test leak one.
-    state = tmp_path / "server.json"
-    if state.exists():
+    for state in (tmp_path / "servers").glob("*.json"):
         with contextlib.suppress(ProcessLookupError):
             os.killpg(json.loads(state.read_text())["pid"], signal.SIGKILL)
 
@@ -107,7 +106,9 @@ def test_tab_moves_between_panes_and_pages_switch_after_search(workspace):
 
 def test_a_click_only_highlights_and_a_double_click_starts(monkeypatch, workspace):
     write_aliases({"a": str(workspace), "b": str(workspace)})
-    monkeypatch.setattr("llamacpp_tuner.tui.LCT", [sys.executable, "-c", FAKE_SERVER])
+    monkeypatch.setattr(
+        "llamacpp_tuner.servers.LCT", [sys.executable, "-c", FAKE_SERVER]
+    )
 
     async def run() -> None:
         app = LctApp()
@@ -115,51 +116,55 @@ def test_a_click_only_highlights_and_a_double_click_starts(monkeypatch, workspac
             await pilot.click("#profiles", offset=(4, 1))
             await pilot.pause(0.3)
             assert app.selected_profile() == "b"
-            assert not app.server_pid
+            assert not app.servers
             await pilot.click("#profiles", offset=(4, 1), times=2)
-            await until(pilot, lambda: app.serving == "b")
+            await until(pilot, lambda: "b" in app.urls)
             await pilot.press("enter")
-            await until(pilot, lambda: not app.server_pid)
+            await until(pilot, lambda: not app.servers)
 
     asyncio.run(run())
 
 
 def test_enter_starts_and_stops_the_highlighted_profile(monkeypatch, workspace):
     write_aliases({"mine": str(workspace)})
-    monkeypatch.setattr("llamacpp_tuner.tui.LCT", [sys.executable, "-c", FAKE_SERVER])
+    monkeypatch.setattr(
+        "llamacpp_tuner.servers.LCT", [sys.executable, "-c", FAKE_SERVER]
+    )
 
     async def run() -> None:
         app = LctApp()
         async with app.run_test(size=(100, 40)) as pilot:
             await pilot.press("enter")
-            await until(pilot, lambda: app.serving == "mine")
-            assert "http://127.0.0.1:9" in text(app, "#state")
+            await until(pilot, lambda: "mine" in app.urls)
+            assert "● mine :9" in text(app, "#state")
             await pilot.press("enter")
             await until(pilot, lambda: "idle" in text(app, "#state"))
-            assert not app.server_pid
+            assert not app.servers
 
     asyncio.run(run())
 
 
 def test_quitting_leaves_the_server_and_a_new_ui_stops_it(monkeypatch, workspace):
     write_aliases({"mine": str(workspace)})
-    monkeypatch.setattr("llamacpp_tuner.tui.LCT", [sys.executable, "-c", FAKE_SERVER])
+    monkeypatch.setattr(
+        "llamacpp_tuner.servers.LCT", [sys.executable, "-c", FAKE_SERVER]
+    )
 
     async def run() -> None:
         app = LctApp()
         async with app.run_test(size=(100, 40)) as pilot:
             await pilot.press("enter")
-            await until(pilot, lambda: app.serving == "mine")
-            pid = app.server_pid
+            await until(pilot, lambda: "mine" in app.urls)
+            pid = app.servers["mine"]
             await pilot.press("q")
         os.kill(pid, 0)  # still running
 
         app = LctApp()
         async with app.run_test(size=(100, 40)) as pilot:
-            await until(pilot, lambda: app.serving == "mine")
-            assert "http://127.0.0.1:9" in text(app, "#state")
+            await until(pilot, lambda: "mine" in app.urls)
+            assert "● mine :9" in text(app, "#state")
             await pilot.press("enter")
-            await until(pilot, lambda: not app.server_pid)
+            await until(pilot, lambda: not app.servers)
         with pytest.raises(ProcessLookupError):
             os.kill(pid, 0)
 
@@ -320,5 +325,28 @@ def test_benchmark_settings_edit_and_results_stream(monkeypatch, workspace, tmp_
             assert app.results == [("m.gguf", "pp1024", "900.0", "± 1.0")]
             log = "\n".join(line.text for line in app.query_one("#log", RichLog).lines)
             assert "-p 1024" in log
+
+    asyncio.run(run())
+
+
+def test_enter_on_a_stack_starts_and_stops_all_of_it(monkeypatch, workspace):
+    write_aliases({"a": str(workspace), "b": str(workspace)})
+    (workspace.parent / "aliases.toml").write_text(
+        (workspace.parent / "aliases.toml").read_text()
+        + '[stacks]\nboth = ["a", "b"]\n'
+    )
+    monkeypatch.setattr(
+        "llamacpp_tuner.servers.LCT", [sys.executable, "-c", FAKE_SERVER]
+    )
+
+    async def run() -> None:
+        app = LctApp()
+        async with app.run_test(size=(120, 40)) as pilot:
+            assert app.selected_profile() == "stack:both"
+            await pilot.press("enter")
+            await until(pilot, lambda: {"a", "b"} <= set(app.urls))
+            assert "● a" in text(app, "#state") and "● b" in text(app, "#state")
+            await pilot.press("enter")
+            await until(pilot, lambda: not app.servers)
 
     asyncio.run(run())

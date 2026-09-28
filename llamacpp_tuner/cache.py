@@ -31,9 +31,8 @@ def get_llama_dir() -> Path:
     return path
 
 
-def get_server_log_path() -> Path:
-    return get_cache_dir() / "server.log"
-
-
-def get_server_state_path() -> Path:
-    return get_cache_dir() / "server.json"
+def get_servers_dir() -> Path:
+    """Per-profile pid and log files of servers started with `lct up` or the TUI."""
+    path = get_cache_dir() / "servers"
+    path.mkdir(parents=True, exist_ok=True)
+    return path

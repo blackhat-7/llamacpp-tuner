@@ -1,15 +1,11 @@
 """Terminal UI for serving, downloading and benchmarking models."""
 
 import asyncio
-import contextlib
 import html
 import json
 import os
 import re
 import shlex
-import signal
-import subprocess
-import sys
 from collections.abc import Callable
 from pathlib import Path
 
@@ -36,8 +32,14 @@ from textual.widgets import (
 )
 from textual.widgets.option_list import Option
 
-from llamacpp_tuner.cache import get_server_log_path, get_server_state_path
-from llamacpp_tuner.cli import load_aliases, pick_projector, serve, write_aliases
+from llamacpp_tuner import servers
+from llamacpp_tuner.cli import (
+    load_aliases,
+    load_stacks,
+    pick_projector,
+    serve,
+    write_aliases,
+)
 from llamacpp_tuner.downloader import (
     list_downloaded_models,
     model_files,
@@ -46,8 +48,7 @@ from llamacpp_tuner.downloader import (
     search_repos,
 )
 from llamacpp_tuner.llama import get_llama_binary
-
-LCT = [sys.executable, "-m", "llamacpp_tuner.cli"]
+from llamacpp_tuner.servers import LCT, child_env, interrupt
 
 # Kanagawa Dragon (rebelot/kanagawa.nvim), to match the user's editor and terminal.
 ACCENT, MUTED, GOOD, WARN = "#8ba4b0", "#737c73", "#87a987", "#e6c384"
@@ -130,10 +131,6 @@ BENCH_SETTINGS = {
 DEFAULTS = {"ctx": "model default", "host": "127.0.0.1", "port": "8080"}
 
 
-def child_env() -> dict[str, str]:
-    return {**os.environ, "PYTHONUNBUFFERED": "1", "HF_HUB_DISABLE_PROGRESS_BARS": "1"}
-
-
 async def spawn(cmd: list[str]) -> asyncio.subprocess.Process:
     # A new session lets one SIGINT reach lct and llama-server, like Ctrl-C does.
     return await asyncio.create_subprocess_exec(
@@ -144,22 +141,6 @@ async def spawn(cmd: list[str]) -> asyncio.subprocess.Process:
         start_new_session=True,
         limit=2**20,
     )
-
-
-def interrupt(pid: int) -> None:
-    with contextlib.suppress(ProcessLookupError):
-        os.killpg(pid, signal.SIGINT)
-
-
-def alive(pid: int) -> bool:
-    # Reap the server if this UI started it, or a finished one lingers as a zombie.
-    with contextlib.suppress(ChildProcessError):
-        os.waitpid(pid, os.WNOHANG)
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    return True
 
 
 def gib(num_bytes: int) -> str:
@@ -331,13 +312,16 @@ class LctApp(App[None]):
         super().__init__()
         self.procs: dict[str, asyncio.subprocess.Process] = {}
         self.profiles: dict[str, dict] = {}
+        self.stacks: dict[str, list[str]] = {}
+        # Running servers by profile: pid, address once listening, RAM in bytes.
+        self.servers: dict[str, int] = {}
+        self.urls: dict[str, str] = {}
+        self.ram: dict[str, int] = {}
+        self.stopping: set[str] = set()
         self.models: dict[str, Path] = {}
         self.projectors: dict[str, Path] = {}
         self.editing = ""
         self.edit_target: tuple[str, str] | None = None
-        self.serving = self.url = ""
-        self.server_pid = 0
-        self.stopping = False
         # A question awaiting y, and what y does.
         self.pending: tuple[str, Callable[[], object]] | None = None
         self.with_projector = True
@@ -403,12 +387,12 @@ class LctApp(App[None]):
         self.refresh_profiles()
         self.show_bench_settings()
         self.query_one("#profiles").focus()
-        with contextlib.suppress(FileNotFoundError):
-            state = json.loads(get_server_state_path().read_text())
-            self.follow_server(state["name"], state["pid"])
+        for name, pid in servers.running().items():
+            self.follow_server(name, pid)
+        self.set_interval(3, self.measure_ram)
 
     def stop_children(self) -> None:
-        """Stop downloads and benchmarks; the server is left running on purpose."""
+        """Stop downloads and benchmarks; servers are left running on purpose."""
         for proc in self.procs.values():
             interrupt(proc.pid)
 
@@ -427,11 +411,18 @@ class LctApp(App[None]):
 
     def update_state(self, text: str = "", style: str = "") -> None:
         """Set the top-right status and redraw the key hints."""
+        state = Text(text, style=style)
         if not text:
-            text, style = ("○ idle", MUTED)
-            if self.serving:
-                text, style = f"● serving {self.serving} · {self.url}", GOOD
-        self.query_one("#state", Static).update(Text(text, style=style))
+            for name in self.servers:
+                if url := self.urls.get(name):
+                    port = url.rsplit(":", 1)[-1]
+                    state.append(f"● {name} :{port}  ", style=GOOD)
+                else:
+                    state.append(f"◌ {name}  ", style=WARN)
+            state.rstrip()
+            if not state:
+                state = Text("○ idle", style=MUTED)
+        self.query_one("#state", Static).update(state)
         self.update_hints()
 
     def update_hints(self) -> None:
@@ -586,20 +577,37 @@ class LctApp(App[None]):
 
     def refresh_profiles(self, select: str = "") -> None:
         try:
-            aliases = load_aliases()
+            aliases, self.stacks = load_aliases(), load_stacks()
         except click.ClickException as error:
             self.fail(error.message)
-            aliases = {}
+            aliases, self.stacks = {}, {}
         self.profiles = {name: profile(args) for name, args in aliases.items()}
+        self.render_profiles(select)
+
+    def server_mark(self, name: str) -> tuple[str, str]:
+        if name in self.urls:
+            return "● ", GOOD
+        return ("◌ ", WARN) if name in self.servers else ("  ", "")
+
+    def render_profiles(self, select: str = "") -> None:
+        """Stacks first, then profiles, each with its live server state."""
         options = self.query_one("#profiles", OptionList)
         current = select or self.selected_profile()
         options.clear_options()
-        for name, details in self.profiles.items():
-            running = name == self.serving
+        for name, members in self.stacks.items():
+            up = [m for m in members if m in self.servers]
+            mark = "● " if len(up) == len(members) else "◐ " if up else "  "
             label = Text.assemble(
-                ("● " if running else "  ", GOOD),
-                (name[:21].ljust(22), GOOD if running else ""),
+                (mark, GOOD if up else ""),
+                (name[:21].ljust(22), "bold"),
+                (" + ".join(members), SOFT),
             )
+            options.add_option(Option(label, f"stack:{name}"))
+        for name, details in self.profiles.items():
+            mark, style = self.server_mark(name)
+            label = Text.assemble((mark, style), (name[:21].ljust(22), style))
+            if name in self.ram:
+                label.append(f"{gib(self.ram[name])} RAM  ", style=NUMBER)
             if details["missing"]:
                 label.append("model missing", style=WARN)
             else:
@@ -607,9 +615,16 @@ class LctApp(App[None]):
                 if details["mmproj"] != "none":
                     label.append("images", style=MEDIA)
             options.add_option(Option(label, name))
-        if names := list(self.profiles):
-            options.highlighted = names.index(current) if current in names else 0
+        ids = [f"stack:{n}" for n in self.stacks] + list(self.profiles)
+        if ids:
+            options.highlighted = ids.index(current) if current in ids else 0
         self.show_settings()
+
+    def measure_ram(self) -> None:
+        ram = {name: servers.memory(pid) for name, pid in self.servers.items()}
+        if ram != self.ram:
+            self.ram = ram
+            self.render_profiles()
 
     @on(OptionList.OptionHighlighted, "#profiles")
     def show_settings(self) -> None:
@@ -618,6 +633,16 @@ class LctApp(App[None]):
         options = self.query_one("#settings", OptionList)
         highlighted = options.highlighted
         options.clear_options()
+        if self.editing.startswith("stack:"):
+            stack = self.editing.removeprefix("stack:")
+            rows = [("Stack", Text(stack, style="bold"))]
+            for member in self.stacks[stack]:
+                mark, style = self.server_mark(member)
+                rows.append(("Profile", Text(mark + member, style=style)))
+            rows.append(("", Text("edit [stacks] in aliases.toml", style=MUTED)))
+            for label, value in rows:
+                options.add_option(Option(setting_row(label, value), disabled=True))
+            return
         if not details:
             empty = Text("No profiles yet. Press n to create one.", style=MUTED)
             options.add_option(Option(empty, disabled=True))
@@ -709,7 +734,8 @@ class LctApp(App[None]):
         self.open_editor(("serve", "name"), SETTINGS["name"], name)
 
     def action_delete(self) -> None:
-        if self.page == "serve" and (name := self.editing) and not self.edit_target:
+        name = self.editing
+        if self.page == "serve" and name in self.profiles and not self.edit_target:
             question = f"press y to delete {name}, any other key keeps it"
             self.ask(question, lambda: self.delete_profile(name))
 
@@ -720,66 +746,60 @@ class LctApp(App[None]):
 
     @on(OptionList.OptionSelected, "#profiles")
     def toggle_server(self) -> None:
-        if self.server_pid:
-            self.stopping = True
+        """Enter on a profile starts or stops it; on a stack, all of its profiles."""
+        selected = self.selected_profile()
+        stack = self.stacks.get(selected.removeprefix("stack:"))
+        names = stack if selected.startswith("stack:") and stack else [selected]
+        if all(name in self.servers for name in names):
+            for name in names:
+                self.stopping.add(name)
+                interrupt(self.servers[name])
             self.update_state("◌ stopping", WARN)
-            interrupt(self.server_pid)
-        elif name := self.selected_profile():
-            self.start_server(name)
+            return
+        for name in names:
+            if name not in self.servers and name in self.profiles:
+                self.start_server(name)
 
     def start_server(self, name: str) -> None:
-        # The server writes to a file, not a pipe, so it outlives the UI; a later
-        # UI finds it through the state file and can stop it.
-        cmd = [*LCT, "serve", name]
-        log_path = get_server_log_path()
-        log_path.parent.mkdir(parents=True, exist_ok=True)
-        with log_path.open("w") as log:
-            log.write(f"$ {shlex.join(cmd)}\n")
-            log.flush()
-            proc = subprocess.Popen(
-                cmd,
-                stdin=subprocess.DEVNULL,
-                stdout=log,
-                stderr=subprocess.STDOUT,
-                env=child_env(),
-                start_new_session=True,
-            )
-        state = {"name": name, "pid": proc.pid}
-        get_server_state_path().write_text(json.dumps(state))
-        self.follow_server(name, proc.pid)
+        try:
+            pid = servers.start(name)
+        except (OSError, RuntimeError) as error:
+            self.fail(str(error))
+            return
+        self.follow_server(name, pid)
 
     @work(group="server")
     async def follow_server(self, name: str, pid: int) -> None:
-        """Show the server's log until it exits."""
-        self.server_pid = pid
-        self.update_state(f"◌ loading {name}", WARN)
+        """Show one server's log, prefixed with its name, until it exits."""
+        self.servers[name] = pid
+        self.render_profiles()
+        self.update_state()
         log = self.query_one("#log", RichLog)
-        with get_server_log_path().open(errors="replace") as file:
+        with servers.log_path(name).open(errors="replace") as file:
             partial = ""
             while True:
                 # Check before reading, so lines written just before exit still show.
-                running = alive(pid)
+                running = servers.alive(pid)
                 if chunk := file.readline():
                     partial += chunk
                     if not partial.endswith("\n"):
                         continue
                     line, partial = partial.rstrip(), ""
                     if "listening on" in line:
-                        self.serving = name
-                        self.url = line.split("listening on")[-1].strip()
+                        self.urls[name] = line.split("listening on")[-1].strip()
+                        self.render_profiles()
                         self.update_state()
-                        self.refresh_profiles()
-                    log.write(
-                        Text(line, style=ACCENT) if line.startswith("$ ") else line
-                    )
+                    style = ACCENT if line.startswith("$ ") else ""
+                    log.write(Text.assemble((f"{name} ", MUTED), (line, style)))
                 elif running:
                     await asyncio.sleep(0.2)
                 else:
                     break
-        get_server_state_path().unlink(missing_ok=True)
-        if not self.stopping:
+        if name not in self.stopping:
             self.fail(f"{name} stopped. See the output log.")
-        self.server_pid, self.serving, self.stopping = 0, "", False
+        self.stopping.discard(name)
+        for state in (self.servers, self.urls, self.ram):
+            state.pop(name, None)
         self.refresh_profiles()
         self.update_state()
 

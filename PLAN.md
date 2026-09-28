@@ -16,3 +16,6 @@ Each line carries its own done-check. A task too big for one session gets split 
 - [~] **Validate Swift aliases.** `swift-qwen` (128k + projector) projects 21408 MiB, fits. Still needed: `swift-qwen-no-img` at 160k, run only while no other server holds the GPU. Done when the number is in `PROGRESS.md`.
 - [x] **Merge to main.** Merged as PR #1.
 - [x] **Kanagawa Dragon theme.** TUI colours match the user's nvim and alacritty. Done: screenshots at 120, 52 tests.
+- [x] **Several servers at once.** `[stacks]` in `aliases.toml`; `lct up/down/ps`; the TUI runs and tracks many servers (state, address, RAM). Done: 55 tests, live `lct up local`.
+- [x] **CPU side lane and embeddings.** Profiles `side` (Qwen3.6-35B-A3B on CPU, port 6869, model name `side`) and `embed` (Qwen3-Embedding-0.6B, port 6870), stack `local`. Done when both answer after `lct up local`.
+- [x] **N-gram drafting on the 27B.** Rejected: `draft-mtp,ngram-mod` made a code edit slower (120 → 105 t/s), prose unchanged (~60). MTP alone stays.

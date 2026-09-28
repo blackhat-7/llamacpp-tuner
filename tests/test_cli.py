@@ -1,11 +1,13 @@
 """Tests for the lct CLI."""
 
+import sys
 from pathlib import Path
 from unittest.mock import patch
 
 from click.testing import CliRunner
 
-from llamacpp_tuner.cli import main
+from llamacpp_tuner import servers
+from llamacpp_tuner.cli import load_aliases, load_stacks, main, write_aliases
 
 
 def test_setup_reports_binary():
@@ -187,3 +189,58 @@ def test_models_lists_namespaced_path(monkeypatch, tmp_path):
 
     assert result.exit_code == 0
     assert "owner/repo/model.gguf" in result.output
+
+
+FAKE_SERVER = """
+import time
+print("main: server is listening on http://127.0.0.1:9", flush=True)
+try:
+    time.sleep(30)
+except KeyboardInterrupt:
+    pass
+"""
+
+
+def test_up_starts_a_stack_waits_and_down_stops_it(monkeypatch, tmp_path):
+    aliases = tmp_path / "aliases.toml"
+    aliases.write_text('a = "m.gguf"\nb = "m.gguf"\n\n[stacks]\nboth = ["a", "b"]\n')
+    monkeypatch.setenv("LCT_HOME", str(tmp_path))
+    monkeypatch.setattr("llamacpp_tuner.cli.get_aliases_path", lambda: aliases)
+    monkeypatch.setattr(
+        "llamacpp_tuner.servers.LCT", [sys.executable, "-c", FAKE_SERVER]
+    )
+    try:
+        result = CliRunner().invoke(main, ["up", "both"])
+        assert result.exit_code == 0, result.output
+        assert "a: http://127.0.0.1:9" in result.output
+        assert set(servers.running()) == {"a", "b"}
+        assert "b " in CliRunner().invoke(main, ["ps"]).output
+
+        result = CliRunner().invoke(main, ["down"])
+        assert "a: stopped" in result.output and "b: stopped" in result.output
+        assert servers.running() == {}
+    finally:
+        for pid in servers.running().values():
+            servers.interrupt(pid)
+
+
+def test_up_rejects_unknown_names(monkeypatch, tmp_path):
+    aliases = tmp_path / "aliases.toml"
+    aliases.write_text('a = "m.gguf"\n[stacks]\nbad = ["a", "nope"]\n')
+    monkeypatch.setattr("llamacpp_tuner.cli.get_aliases_path", lambda: aliases)
+
+    result = CliRunner().invoke(main, ["up", "bad"])
+
+    assert result.exit_code != 0
+    assert "Unknown profile or stack: nope" in result.output
+
+
+def test_writing_aliases_keeps_stacks(monkeypatch, tmp_path):
+    aliases = tmp_path / "aliases.toml"
+    aliases.write_text('a = "m.gguf"\n[stacks]\nall = ["a"]\n')
+    monkeypatch.setattr("llamacpp_tuner.cli.get_aliases_path", lambda: aliases)
+
+    write_aliases({"a": "m.gguf", "b": "n.gguf"})
+
+    assert load_aliases() == {"a": "m.gguf", "b": "n.gguf"}
+    assert load_stacks() == {"all": ["a"]}

@@ -4,12 +4,13 @@ import json
 import shlex
 import signal
 import subprocess
+import time
 import tomllib
 from pathlib import Path
 
 import click
 
-from llamacpp_tuner import __version__
+from llamacpp_tuner import __version__, servers
 from llamacpp_tuner.cache import get_aliases_path, get_models_dir
 from llamacpp_tuner.downloader import (
     download_mmproj,
@@ -21,31 +22,65 @@ from llamacpp_tuner.downloader import (
 from llamacpp_tuner.llama import install_llama, run_server
 
 
-def load_aliases() -> dict[str, str]:
-    """Read serve aliases, each mapping a name to 'serve' arguments."""
+def _read_aliases_file() -> dict:
     path = get_aliases_path()
     if not path.is_file():
         return {}
     try:
-        aliases = tomllib.loads(path.read_text())
+        return tomllib.loads(path.read_text())
     except tomllib.TOMLDecodeError as error:
         raise click.ClickException(f"Invalid {path}: {error}") from error
+
+
+def load_aliases() -> dict[str, str]:
+    """Read serve aliases, each mapping a name to 'serve' arguments."""
+    aliases = _read_aliases_file()
+    aliases.pop("stacks", None)
     for name, value in aliases.items():
         if not isinstance(value, str):
             raise click.ClickException(
-                f"Alias '{name}' in {path} must be a string of serve arguments."
+                f"Alias '{name}' in {get_aliases_path()} must be a string of serve arguments."
             )
     return aliases
 
 
+def load_stacks() -> dict[str, list[str]]:
+    """Read the [stacks] table: a name for a set of profiles started together."""
+    stacks = _read_aliases_file().get("stacks", {})
+    for name, members in stacks.items():
+        if not (isinstance(members, list) and all(isinstance(m, str) for m in members)):
+            raise click.ClickException(
+                f"Stack '{name}' in {get_aliases_path()} must be a list of profile names."
+            )
+    return stacks
+
+
 def write_aliases(aliases: dict[str, str]) -> None:
-    """Replace every alias. Rewriting the file drops its comments."""
-    get_aliases_path().write_text(
-        "".join(
+    """Replace every alias, keeping stacks. Rewriting the file drops its comments."""
+    stacks = load_stacks()
+    lines = [
+        f"{json.dumps(key)} = {json.dumps(value)}\n" for key, value in aliases.items()
+    ]
+    if stacks:
+        lines.append("\n[stacks]\n")
+        lines += [
             f"{json.dumps(key)} = {json.dumps(value)}\n"
-            for key, value in aliases.items()
-        )
-    )
+            for key, value in stacks.items()
+        ]
+    get_aliases_path().write_text("".join(lines))
+
+
+def expand_names(names: tuple[str, ...]) -> list[str]:
+    """Turn stack and profile names into profile names, in order, without repeats."""
+    aliases, stacks = load_aliases(), load_stacks()
+    profiles: list[str] = []
+    for name in names:
+        for profile in stacks.get(name, [name]):
+            if profile not in aliases:
+                raise click.ClickException(f"Unknown profile or stack: {profile}")
+            if profile not in profiles:
+                profiles.append(profile)
+    return profiles
 
 
 def pick_projector(model: str, mmproj: Path | None, no_mmproj: bool) -> Path | None:
@@ -211,6 +246,69 @@ def list_models() -> None:
         size_gib = model.stat().st_size / (1024**3)
         tag = " [projector]" if "mmproj" in model.name.lower() else ""
         click.echo(f"{model.relative_to(root)} ({size_gib:.2f} GiB){tag}")
+
+
+@main.command()
+@click.argument("names", nargs=-1, required=True)
+def up(names: tuple[str, ...]) -> None:
+    """Start profiles or stacks in the background and wait until they listen.
+
+    Servers keep running after this exits; stop them with 'lct down'.
+    """
+    pending = {}
+    for name in expand_names(names):
+        pid = servers.running().get(name) or servers.start(name)
+        pending[name] = pid
+    failed = []
+    try:
+        while pending:
+            for name, pid in list(pending.items()):
+                if address := servers.url(name):
+                    click.echo(f"{name}: {address}")
+                elif not servers.alive(pid):
+                    failed.append(name)
+                    click.echo(
+                        f"{name}: exited, see {servers.log_path(name)}", err=True
+                    )
+                else:
+                    continue
+                del pending[name]
+            time.sleep(0.5)
+    except KeyboardInterrupt:
+        click.echo(f"Still loading in the background: {', '.join(pending)}")
+        return
+    if failed:
+        raise click.ClickException(f"Failed to start: {', '.join(failed)}")
+
+
+@main.command()
+@click.argument("names", nargs=-1)
+def down(names: tuple[str, ...]) -> None:
+    """Stop running profiles or stacks; with no names, stop every server."""
+    active = servers.running()
+    targets = [n for n in expand_names(names) if n in active] if names else list(active)
+    for name in targets:
+        servers.interrupt(active[name])
+    deadline = time.monotonic() + 60
+    while (
+        any(servers.alive(active[n]) for n in targets) and time.monotonic() < deadline
+    ):
+        time.sleep(0.2)
+    for name in targets:
+        state = "still stopping" if servers.alive(active[name]) else "stopped"
+        click.echo(f"{name}: {state}")
+
+
+@main.command()
+def ps() -> None:
+    """List running servers with their address and resident memory."""
+    active = servers.running()
+    if not active:
+        click.echo("No servers running.")
+    for name, pid in active.items():
+        address = servers.url(name) or "loading"
+        ram = servers.memory(pid) / 1024**3
+        click.echo(f"{name:<20} {address:<28} {ram:5.1f} GiB RAM  pid {pid}")
 
 
 @main.command()
