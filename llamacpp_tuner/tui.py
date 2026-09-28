@@ -6,6 +6,7 @@ import json
 import os
 import re
 import shlex
+import time
 from collections.abc import Callable
 from pathlib import Path
 
@@ -72,7 +73,7 @@ CSS = """
 Screen { padding: 1 2 0 2; }
 * { scrollbar-size-vertical: 1; scrollbar-background: $background; scrollbar-color: $panel; }
 #top { height: 1; }
-#title { width: 1fr; text-style: bold; }
+#title { width: 1fr; }
 #state { width: auto; }
 Tabs { height: 2; margin-bottom: 1; }
 Tabs Tab { padding: 0 3 0 0; color: $text-muted; }
@@ -80,6 +81,7 @@ Tabs Tab.-active { color: $accent; text-style: bold; }
 ContentSwitcher { height: 1fr; }
 .page { height: 1fr; }
 .column { width: 1fr; height: 1fr; padding-right: 4; }
+#profiles-column { width: 3fr; }
 .heading { color: $accent; text-style: bold; margin-bottom: 1; }
 .gap { margin-top: 1; }
 OptionList { border: none; background: transparent; padding: 0; height: auto; max-height: 16; text-wrap: nowrap; text-overflow: ellipsis; }
@@ -94,6 +96,8 @@ Input:focus { background: $selection; }
 #editor.-open { display: block; }
 #editor Label { width: auto; color: $accent; text-style: bold; padding-right: 2; }
 #log { height: 8; background: transparent; border: none; padding: 0; }
+#splitter { margin-top: 1; color: $accent; text-style: bold; }
+#splitter:hover { background: $panel; }
 #hints { height: 1; margin-top: 1; }
 """
 
@@ -273,6 +277,29 @@ def repo_view(info: ModelInfo) -> Group:
     return Group(Text(info.id, style="bold"), Text(""), grid(rows))
 
 
+class Splitter(Static):
+    """The Output heading, drawn as a rule; drag it to resize the log below."""
+
+    dragging = False
+
+    def render(self) -> Text:
+        return Text.assemble("Output ", ("─" * max(self.size.width - 7, 0), MUTED))
+
+    def on_mouse_down(self, event: events.MouseDown) -> None:
+        self.dragging = True
+        self.capture_mouse()
+
+    def on_mouse_up(self, event: events.MouseUp) -> None:
+        self.dragging = False
+        self.release_mouse()
+
+    def on_mouse_move(self, event: events.MouseMove) -> None:
+        if self.dragging:
+            log = self.app.query_one("#log")
+            height = log.region.bottom - event.screen_y - 1
+            log.styles.height = max(3, min(height, self.screen.size.height - 8))
+
+
 class PickList(OptionList):
     """An OptionList where a click only highlights; enter or a double-click acts."""
 
@@ -313,10 +340,13 @@ class LctApp(App[None]):
         self.procs: dict[str, asyncio.subprocess.Process] = {}
         self.profiles: dict[str, dict] = {}
         self.stacks: dict[str, list[str]] = {}
-        # Running servers by profile: pid, address once listening, RAM in bytes.
+        # Running servers by profile: pid, address once listening, and live usage
+        # (CPU % of the machine, RAM, VRAM) from the last two samples.
         self.servers: dict[str, int] = {}
         self.urls: dict[str, str] = {}
-        self.ram: dict[str, int] = {}
+        self.usage: dict[str, tuple[float, int, int]] = {}
+        self.samples: dict[str, tuple[float, float]] = {}
+        self.system_sample: dict[str, int] = {}
         self.stopping: set[str] = set()
         self.models: dict[str, Path] = {}
         self.projectors: dict[str, Path] = {}
@@ -341,7 +371,7 @@ class LctApp(App[None]):
         )
         with ContentSwitcher(initial="serve-page"):
             with Horizontal(id="serve-page", classes="page"):
-                with Vertical(classes="column"):
+                with Vertical(classes="column", id="profiles-column"):
                     yield Label("Profiles", classes="heading")
                     yield PickList(id="profiles")
                 with Vertical(classes="column"):
@@ -371,7 +401,7 @@ class LctApp(App[None]):
         with Horizontal(id="editor"):
             yield Label("", id="editor-label")
             yield Input(id="editor-input")
-        yield Label("Output", classes="heading gap")
+        yield Splitter(id="splitter")
         yield RichLog(id="log", wrap=True, highlight=True, max_lines=5000)
         yield Static(id="hints")
 
@@ -389,7 +419,7 @@ class LctApp(App[None]):
         self.query_one("#profiles").focus()
         for name, pid in servers.running().items():
             self.follow_server(name, pid)
-        self.set_interval(3, self.measure_ram)
+        self.set_interval(2, self.measure)
 
     def stop_children(self) -> None:
         """Stop downloads and benchmarks; servers are left running on purpose."""
@@ -413,12 +443,19 @@ class LctApp(App[None]):
         """Set the top-right status and redraw the key hints."""
         state = Text(text, style=style)
         if not text:
+            # Loading servers by name; ready ones as a count, since each profile row
+            # already shows its own state.
             for name in self.servers:
-                if url := self.urls.get(name):
-                    port = url.rsplit(":", 1)[-1]
-                    state.append(f"● {name} :{port}  ", style=GOOD)
-                else:
+                if name not in self.urls:
                     state.append(f"◌ {name}  ", style=WARN)
+            if ready := [n for n in self.servers if n in self.urls]:
+                port = self.urls[ready[0]].rsplit(":", 1)[-1]
+                summary = (
+                    f"{ready[0]} :{port}"
+                    if len(ready) == 1
+                    else f"{len(ready)} serving"
+                )
+                state.append(f"● {summary}", style=GOOD)
             state.rstrip()
             if not state:
                 state = Text("○ idle", style=MUTED)
@@ -599,32 +636,80 @@ class LctApp(App[None]):
             mark = "● " if len(up) == len(members) else "◐ " if up else "  "
             label = Text.assemble(
                 (mark, GOOD if up else ""),
-                (name[:21].ljust(22), "bold"),
+                (name[:21].ljust(self.name_width()), "bold"),
                 (" + ".join(members), SOFT),
             )
             options.add_option(Option(label, f"stack:{name}"))
-        for name, details in self.profiles.items():
-            mark, style = self.server_mark(name)
-            label = Text.assemble((mark, style), (name[:21].ljust(22), style))
-            if name in self.ram:
-                label.append(f"{gib(self.ram[name])} RAM  ", style=NUMBER)
-            if details["missing"]:
-                label.append("model missing", style=WARN)
-            else:
-                label.append(f"{tokens(int(details['ctx'] or 0))} ctx  ", style=NUMBER)
-                if details["mmproj"] != "none":
-                    label.append("images", style=MEDIA)
-            options.add_option(Option(label, name))
+        for name in self.profiles:
+            options.add_option(Option(self.profile_label(name), name))
         ids = [f"stack:{n}" for n in self.stacks] + list(self.profiles)
         if ids:
             options.highlighted = ids.index(current) if current in ids else 0
         self.show_settings()
 
-    def measure_ram(self) -> None:
-        ram = {name: servers.memory(pid) for name, pid in self.servers.items()}
-        if ram != self.ram:
-            self.ram = ram
-            self.render_profiles()
+    def name_width(self) -> int:
+        """Pad names to the longest one, so the numbers after them line up."""
+        return min(max(map(len, [*self.stacks, *self.profiles]), default=0), 21) + 2
+
+    def profile_label(self, name: str) -> Text:
+        details = self.profiles[name]
+        mark, style = self.server_mark(name)
+        label = Text.assemble(
+            (mark, style), (name[:21].ljust(self.name_width()), style)
+        )
+        if name in self.usage:
+            cpu, ram, vram = self.usage[name]
+            label.append(f"{cpu:3.0f}% cpu {ram / 1024**3:4.1f}G ram ", style=NUMBER)
+            if vram:
+                label.append(f"{vram / 1024**3:4.1f}G vram", style=NUMBER)
+        elif details["missing"]:
+            label.append("model missing", style=WARN)
+        else:
+            label.append(f"{tokens(int(details['ctx'] or 0))} ctx  ", style=NUMBER)
+            if details["mmproj"] != "none":
+                label.append("images", style=MEDIA)
+        return label
+
+    def measure(self) -> None:
+        """Sample each server and the machine; CPU % comes from the change since the last sample."""
+        now, cpus = time.monotonic(), os.cpu_count() or 1
+        options = self.query_one("#profiles", OptionList)
+        for name, pid in self.servers.items():
+            used = servers.usage(pid)
+            then, before = self.samples.get(name, (now, used.cpu_seconds))
+            cpu = (
+                (used.cpu_seconds - before) / (now - then) / cpus * 100
+                if now > then
+                else 0.0
+            )
+            self.samples[name] = (now, used.cpu_seconds)
+            self.usage[name] = (cpu, used.ram, used.vram)
+            if name in self.profiles:
+                # In place, so the highlight and scroll position stay put.
+                options.replace_option_prompt(name, self.profile_label(name))
+        system, before = servers.system(), self.system_sample
+        self.system_sample = system
+        cpu = 0.0
+        if before and system["cpu_total"] > before["cpu_total"]:
+            busy = system["cpu_busy"] - before["cpu_busy"]
+            cpu = busy / (system["cpu_total"] - before["cpu_total"]) * 100
+        line = Text.assemble(
+            ("lct   ", "bold"),
+            ("cpu ", MUTED),
+            (f"{cpu:.0f}%  ", NUMBER),
+            ("ram ", MUTED),
+            (
+                f"{system['ram_used'] / 1024**3:.0f}/{system['ram_total'] / 1024**3:.0f}G  ",
+                NUMBER,
+            ),
+        )
+        if "vram_total" in system:
+            line.append("gpu ", style=MUTED).append(
+                f"{system['gpu_busy']}%  ", style=NUMBER
+            )
+            vram = f"{system['vram_used'] / 1024**3:.1f}/{system['vram_total'] / 1024**3:.0f}G"
+            line.append("vram ", style=MUTED).append(vram, style=NUMBER)
+        self.query_one("#title", Static).update(line)
 
     @on(OptionList.OptionHighlighted, "#profiles")
     def show_settings(self) -> None:
@@ -798,7 +883,7 @@ class LctApp(App[None]):
         if name not in self.stopping:
             self.fail(f"{name} stopped. See the output log.")
         self.stopping.discard(name)
-        for state in (self.servers, self.urls, self.ram):
+        for state in (self.servers, self.urls, self.usage, self.samples):
             state.pop(name, None)
         self.refresh_profiles()
         self.update_state()

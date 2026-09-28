@@ -244,3 +244,13 @@ def test_writing_aliases_keeps_stacks(monkeypatch, tmp_path):
 
     assert load_aliases() == {"a": "m.gguf", "b": "n.gguf"}
     assert load_stacks() == {"all": ["a"]}
+
+
+def test_usage_and_system_read_live_numbers():
+    import os
+
+    used = servers.usage(os.getpid())
+    assert used.cpu_seconds > 0 and used.ram > 0
+    system = servers.system()
+    assert 0 < system["ram_used"] < system["ram_total"]
+    assert system["cpu_busy"] <= system["cpu_total"]

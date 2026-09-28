@@ -301,14 +301,17 @@ def down(names: tuple[str, ...]) -> None:
 
 @main.command()
 def ps() -> None:
-    """List running servers with their address and resident memory."""
+    """List running servers with their address, RAM and VRAM."""
     active = servers.running()
     if not active:
         click.echo("No servers running.")
     for name, pid in active.items():
         address = servers.url(name) or "loading"
-        ram = servers.memory(pid) / 1024**3
-        click.echo(f"{name:<20} {address:<28} {ram:5.1f} GiB RAM  pid {pid}")
+        used = servers.usage(pid)
+        click.echo(
+            f"{name:<20} {address:<28} {used.ram / 1024**3:5.1f} GiB RAM"
+            f" {used.vram / 1024**3:5.1f} GiB VRAM  pid {pid}"
+        )
 
 
 @main.command()

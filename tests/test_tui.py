@@ -345,8 +345,42 @@ def test_enter_on_a_stack_starts_and_stops_all_of_it(monkeypatch, workspace):
             assert app.selected_profile() == "stack:both"
             await pilot.press("enter")
             await until(pilot, lambda: {"a", "b"} <= set(app.urls))
-            assert "● a" in text(app, "#state") and "● b" in text(app, "#state")
+            assert "● 2 serving" in text(app, "#state")
             await pilot.press("enter")
             await until(pilot, lambda: not app.servers)
+
+    asyncio.run(run())
+
+
+def test_dragging_the_output_rule_resizes_the_log(workspace):
+    async def run() -> None:
+        app = LctApp()
+        async with app.run_test(size=(100, 40)) as pilot:
+            log = app.query_one("#log")
+            before = log.region.height
+            await pilot.mouse_down("#splitter")
+            await pilot.hover("#splitter", offset=(5, -10))
+            await pilot.mouse_up("#splitter", offset=(5, -10))
+            await pilot.pause()
+            assert log.region.height > before + 5
+
+    asyncio.run(run())
+
+
+def test_running_servers_show_live_usage(monkeypatch, workspace):
+    write_aliases({"mine": str(workspace)})
+    monkeypatch.setattr(
+        "llamacpp_tuner.servers.LCT", [sys.executable, "-c", FAKE_SERVER]
+    )
+
+    async def run() -> None:
+        app = LctApp()
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.press("enter")
+            await until(pilot, lambda: "mine" in app.urls)
+            app.measure()
+            await pilot.pause()
+            assert "% cpu" in row(app, "#profiles", "mine")
+            assert "ram" in text(app, "#title")
 
     asyncio.run(run())

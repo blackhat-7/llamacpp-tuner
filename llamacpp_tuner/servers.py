@@ -8,6 +8,7 @@ import signal
 import subprocess
 import sys
 from pathlib import Path
+from typing import NamedTuple
 
 from llamacpp_tuner.cache import get_servers_dir
 
@@ -87,15 +88,70 @@ def url(name: str) -> str:
     return ""
 
 
-def memory(pid: int) -> int:
-    """Resident bytes of a server's process tree (lct plus llama-server)."""
-    total, pending = 0, [pid]
+class Usage(NamedTuple):
+    cpu_seconds: float
+    ram: int
+    vram: int
+
+
+def _tree(pid: int) -> list[int]:
+    """A server's process and its descendants (lct, then llama-server)."""
+    found, pending = [], [pid]
     while pending:
         current = pending.pop()
+        found.append(current)
         with contextlib.suppress(OSError):
-            for line in Path(f"/proc/{current}/status").read_text().splitlines():
-                if line.startswith("VmRSS"):  # absent for zombies
-                    total += int(line.split()[1]) * 1024
             children = Path(f"/proc/{current}/task/{current}/children").read_text()
             pending += [int(child) for child in children.split()]
-    return total
+    return found
+
+
+def usage(pid: int) -> Usage:
+    """CPU time used so far, resident RAM and GPU memory of a server's processes."""
+    cpu = ram = vram = 0.0
+    for current in _tree(pid):
+        with contextlib.suppress(OSError):
+            # Fields after the ')' that ends the command name; utime and stime are 12, 13.
+            stat = Path(f"/proc/{current}/stat").read_text().rsplit(")", 1)[1].split()
+            cpu += (int(stat[11]) + int(stat[12])) / os.sysconf("SC_CLK_TCK")
+            for line in Path(f"/proc/{current}/status").read_text().splitlines():
+                if line.startswith("VmRSS"):  # absent for zombies
+                    ram += int(line.split()[1]) * 1024
+            # amdgpu reports each client's VRAM in fdinfo; several fds can share a client.
+            clients = {}
+            for fdinfo in Path(f"/proc/{current}/fdinfo").iterdir():
+                with contextlib.suppress(OSError):
+                    info = dict(
+                        line.split(":", 1)
+                        for line in fdinfo.read_text().splitlines()
+                        if ":" in line
+                    )
+                    if "drm-memory-vram" in info:
+                        size = int(info["drm-memory-vram"].split()[0]) * 1024
+                        clients[info.get("drm-client-id", fdinfo.name)] = size
+            vram += sum(clients.values())
+    return Usage(cpu, int(ram), int(vram))
+
+
+def system() -> dict[str, int]:
+    """Whole-machine CPU ticks, RAM and, for the first GPU that reports it, VRAM and load."""
+    cpu = Path("/proc/stat").read_text().split("\n", 1)[0].split()[1:]
+    meminfo = {
+        line.split(":")[0]: int(line.split()[1]) * 1024
+        for line in Path("/proc/meminfo").read_text().splitlines()
+    }
+    found = {
+        "cpu_busy": sum(map(int, cpu))
+        - int(cpu[3])
+        - int(cpu[4]),  # minus idle, iowait
+        "cpu_total": sum(map(int, cpu)),
+        "ram_used": meminfo["MemTotal"] - meminfo["MemAvailable"],
+        "ram_total": meminfo["MemTotal"],
+    }
+    for device in sorted(Path("/sys/class/drm").glob("card[0-9]*/device")):
+        with contextlib.suppress(OSError, ValueError):
+            found["vram_used"] = int((device / "mem_info_vram_used").read_text())
+            found["vram_total"] = int((device / "mem_info_vram_total").read_text())
+            found["gpu_busy"] = int((device / "gpu_busy_percent").read_text())
+            break
+    return found
