@@ -254,3 +254,18 @@ def test_usage_and_system_read_live_numbers():
     system = servers.system()
     assert 0 < system["ram_used"] < system["ram_total"]
     assert system["cpu_busy"] <= system["cpu_total"]
+
+
+def test_serve_passes_env_to_llama_server(monkeypatch):
+    with (
+        patch("llamacpp_tuner.cli.resolve_model", return_value=Path("m.gguf")),
+        patch("llamacpp_tuner.cli.run_server") as run_server,
+    ):
+        result = CliRunner().invoke(
+            main, ["serve", "m.gguf", "--env", "A=1", "--env", "B=x=y"]
+        )
+        bad = CliRunner().invoke(main, ["serve", "m.gguf", "--env", "A"])
+
+    assert result.exit_code == 0
+    assert run_server.call_args.kwargs["env"] == {"A": "1", "B": "x=y"}
+    assert bad.exit_code != 0 and "NAME=VALUE" in bad.output

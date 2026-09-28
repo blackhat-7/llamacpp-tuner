@@ -38,6 +38,8 @@ qwen = """owner/model-GGUF --quant Q6_K --ctx 32768 \
   --extra-args '-ngl all -fa on -ctk q8_0 -ctv q8_0'"""
 ```
 
+Use `--env NAME=VALUE` (repeatable) for backend variables such as `GGML_VK_SUBALLOCATION_BLOCK_SIZE`; they go into llama-server's environment.
+
 `uv run lct serve qwen` then expands to those arguments. Options typed after the alias replace the alias's value for that option; `--extra-args` is replaced as a whole.
 
 ### Several servers at once

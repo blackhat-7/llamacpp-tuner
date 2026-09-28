@@ -121,7 +121,7 @@ def test_run_server_terminates_child_on_signal(monkeypatch):
             return -15
 
     server = FakeServer()
-    monkeypatch.setattr(llama.subprocess, "Popen", lambda command: server)
+    monkeypatch.setattr(llama.subprocess, "Popen", lambda command, **kwargs: server)
 
     llama.run_server([])
 
@@ -144,7 +144,9 @@ def test_run_server_reports_server_failure(monkeypatch):
         def wait(self):
             return 1
 
-    monkeypatch.setattr(llama.subprocess, "Popen", lambda command: FakeServer())
+    monkeypatch.setattr(
+        llama.subprocess, "Popen", lambda command, **kwargs: FakeServer()
+    )
 
     with pytest.raises(llama.subprocess.CalledProcessError):
         llama.run_server([])

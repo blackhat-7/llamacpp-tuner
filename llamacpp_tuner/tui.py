@@ -260,6 +260,7 @@ def profile(args: str) -> dict:
     mmproj_tokens = ["--mmproj", str(p["mmproj"])] if p["mmproj"] else []
     mmproj_tokens += ["--no-mmproj"] if p["no_mmproj"] else []
     mmproj_tokens += ["--no-mmproj-offload"] if p["no_mmproj_offload"] else []
+    env_tokens = [token for item in p["env"] for token in ("--env", item)]
     return {
         "missing": model is None,
         "model": model.name if model else f"{p['model']} {selector or ''}".strip(),
@@ -270,6 +271,7 @@ def profile(args: str) -> dict:
         "extra": p["extra_args"] or "",
         "model_tokens": model_tokens,
         "mmproj_tokens": mmproj_tokens,
+        "env_tokens": env_tokens,
     }
 
 
@@ -883,6 +885,7 @@ class LctApp(App[None]):
             raise ValueError(f"{values['mmproj']} is not a downloaded projector.")
         for flag, key in (("--ctx", "ctx"), ("--host", "host"), ("--port", "port")):
             args += [flag, values[key]] if values[key] else []
+        args += details["env_tokens"]
         return args + (["--extra-args", values["extra"]] if values["extra"] else [])
 
     def save_setting(self, key: str, value: str) -> bool:

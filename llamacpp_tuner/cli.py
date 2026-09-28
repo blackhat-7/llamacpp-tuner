@@ -183,6 +183,12 @@ def pull(
 @click.option("--no-mmproj", is_flag=True, help="Disable multimodal support")
 @click.option("--no-mmproj-offload", is_flag=True, help="Keep the projector off GPU")
 @click.option("--extra-args", "-e", default="", help="Arguments passed to llama-server")
+@click.option(
+    "--env",
+    "env",
+    multiple=True,
+    help="NAME=VALUE added to llama-server's environment; repeatable",
+)
 def serve(
     model: str,
     quant: str | None,
@@ -194,6 +200,7 @@ def serve(
     no_mmproj: bool,
     no_mmproj_offload: bool,
     extra_args: str,
+    env: tuple[str, ...],
 ) -> None:
     """Run llama-server, overriding only explicitly supplied settings.
 
@@ -203,6 +210,8 @@ def serve(
         raise click.UsageError("--quant and --file cannot be combined.")
     if mmproj and no_mmproj:
         raise click.UsageError("--mmproj and --no-mmproj cannot be combined.")
+    if bad := [item for item in env if "=" not in item]:
+        raise click.UsageError(f"--env needs NAME=VALUE, got: {', '.join(bad)}")
 
     try:
         model_path = resolve_model(model, quant=quant, filename=filename)
@@ -222,7 +231,7 @@ def serve(
             if no_mmproj_offload:
                 server_args.append("--no-mmproj-offload")
         server_args.extend(shlex.split(extra_args))
-        run_server(server_args)
+        run_server(server_args, env=dict(item.split("=", 1) for item in env))
     except click.ClickException:
         raise
     except (FileNotFoundError, ValueError) as error:

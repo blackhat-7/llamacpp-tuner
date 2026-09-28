@@ -74,14 +74,17 @@ def install_llama(force: bool = False, extra_cmake_args: Sequence[str] = ()) -> 
     return build_from_source(force=force, extra_cmake_args=extra_cmake_args)
 
 
-def run_server(args: list[str]) -> None:
+def run_server(args: list[str], env: dict[str, str] | None = None) -> None:
+    """Run llama-server in the foreground; env adds variables to its environment."""
     binary = get_llama_binary()
     if not binary:
         raise FileNotFoundError(
             "llama-server not found. Install it or run 'lct setup'."
         )
     command = [str(binary), *args]
-    with subprocess.Popen(command) as server:
+    with subprocess.Popen(
+        command, env={**os.environ, **env} if env else None
+    ) as server:
         # Without this, a SIGTERM to lct kills only the wrapper and orphans
         # llama-server, leaving the model resident in VRAM.
         def shutdown(signum: int, frame: object) -> None:
