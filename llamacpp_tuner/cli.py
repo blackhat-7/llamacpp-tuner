@@ -15,11 +15,21 @@ from llamacpp_tuner.cache import get_aliases_path, get_models_dir
 from llamacpp_tuner.downloader import (
     download_mmproj,
     download_model,
+    download_repository,
     get_mmproj_path,
     list_downloaded_models,
     resolve_model,
+    resolve_repository,
 )
+from llamacpp_tuner.jeeves import install_jeeves, run_jeeves
 from llamacpp_tuner.llama import install_llama, run_server
+
+BACKEND = click.option(
+    "--backend",
+    type=click.Choice(["llama", "jeeves"]),
+    default="llama",
+    help="llama.cpp, or Jeeves's own PyTorch server",
+)
 
 
 def _read_aliases_file() -> dict:
@@ -109,19 +119,30 @@ def main() -> None:
 
 
 @main.command()
-@click.option("--force", is_flag=True, help="Rebuild the managed llama.cpp checkout")
+@BACKEND
+@click.option("--force", is_flag=True, help="Rebuild or reinstall the backend")
 @click.option(
     "--cmake-arg",
     multiple=True,
     help="Additional CMake argument; use --cmake-arg=-DNAME=VALUE",
 )
-def setup(force: bool, cmake_arg: tuple[str, ...]) -> None:
-    """Find llama-server or build llama.cpp from source."""
+@click.option(
+    "--torch-index",
+    help="PyTorch wheel index for Jeeves, such as "
+    "https://download.pytorch.org/whl/rocm7.2; default is PyPI (CUDA)",
+)
+def setup(
+    backend: str, force: bool, cmake_arg: tuple[str, ...], torch_index: str | None
+) -> None:
+    """Find llama-server or build llama.cpp from source, or install Jeeves."""
     try:
-        binary = install_llama(force=force, extra_cmake_args=cmake_arg)
+        if backend == "jeeves":
+            click.echo(f"Jeeves: {install_jeeves(torch_index, force=force)}")
+        else:
+            binary = install_llama(force=force, extra_cmake_args=cmake_arg)
+            click.echo(f"llama-server: {binary}")
     except (OSError, RuntimeError, subprocess.CalledProcessError) as error:
         raise click.ClickException(str(error)) from error
-    click.echo(f"llama-server: {binary}")
 
 
 @main.command()
@@ -131,6 +152,9 @@ def setup(force: bool, cmake_arg: tuple[str, ...]) -> None:
 @click.option("--force", "-f", is_flag=True, help="Re-download existing files")
 @click.option("--no-mmproj", is_flag=True, help="Do not download a vision projector")
 @click.option("--mmproj-file", help="Exact projector filename")
+@click.option(
+    "--all", "whole", is_flag=True, help="Every file, for non-GGUF models (Jeeves)"
+)
 def pull(
     repo_id: str,
     quant: str | None,
@@ -138,10 +162,19 @@ def pull(
     force: bool,
     no_mmproj: bool,
     mmproj_file: str | None,
+    whole: bool,
 ) -> None:
-    """Download an exact GGUF artifact from Hugging Face."""
+    """Download an exact GGUF artifact, or a whole repository, from Hugging Face."""
+    if whole:
+        if quant or filename or mmproj_file:
+            raise click.UsageError("--all cannot be combined with a file choice.")
+        try:
+            click.echo(f"Model: {download_repository(repo_id, force=force)}")
+        except Exception as error:
+            raise click.ClickException(str(error)) from error
+        return
     if bool(quant) == bool(filename):
-        raise click.UsageError("Provide exactly one of --quant or --file.")
+        raise click.UsageError("Provide exactly one of --quant, --file or --all.")
     if no_mmproj and mmproj_file:
         raise click.UsageError("--no-mmproj and --mmproj-file cannot be combined.")
 
@@ -187,8 +220,9 @@ def pull(
     "--env",
     "env",
     multiple=True,
-    help="NAME=VALUE added to llama-server's environment; repeatable",
+    help="NAME=VALUE added to the server's environment; repeatable",
 )
+@BACKEND
 def serve(
     model: str,
     quant: str | None,
@@ -201,10 +235,13 @@ def serve(
     no_mmproj_offload: bool,
     extra_args: str,
     env: tuple[str, ...],
+    backend: str,
 ) -> None:
     """Run llama-server, overriding only explicitly supplied settings.
 
     MODEL is a GGUF path, a downloaded repository, or an alias from aliases.toml.
+    With --backend jeeves, --ctx is Jeeves's --max-len and --extra-args go to
+    its server.
     """
     if quant and filename:
         raise click.UsageError("--quant and --file cannot be combined.")
@@ -213,7 +250,23 @@ def serve(
     if bad := [item for item in env if "=" not in item]:
         raise click.UsageError(f"--env needs NAME=VALUE, got: {', '.join(bad)}")
 
+    environment = dict(item.split("=", 1) for item in env)
+
     try:
+        if backend == "jeeves":
+            if quant or filename or mmproj or no_mmproj_offload:
+                raise click.UsageError(
+                    "Jeeves takes a whole model directory, not a file or projector."
+                )
+            weights = resolve_repository(model)
+            jeeves_args = ["--model", str(weights)]
+            jeeves_args += ["--drafter", str(weights / "drafter_k4.safetensors")]
+            for flag, value in (("--max-len", ctx), ("--host", host), ("--port", port)):
+                if value is not None:
+                    jeeves_args.extend([flag, str(value)])
+            run_jeeves(jeeves_args + shlex.split(extra_args), env=environment)
+            return
+
         model_path = resolve_model(model, quant=quant, filename=filename)
 
         selected_mmproj = pick_projector(model, mmproj, no_mmproj)
@@ -231,14 +284,14 @@ def serve(
             if no_mmproj_offload:
                 server_args.append("--no-mmproj-offload")
         server_args.extend(shlex.split(extra_args))
-        run_server(server_args, env=dict(item.split("=", 1) for item in env))
+        run_server(server_args, env=environment)
     except click.ClickException:
         raise
     except (FileNotFoundError, ValueError) as error:
         raise click.ClickException(str(error)) from error
     except subprocess.CalledProcessError as error:
         raise click.ClickException(
-            f"llama-server exited with code {error.returncode}."
+            f"The server exited with code {error.returncode}."
         ) from error
 
 

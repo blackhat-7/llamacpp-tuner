@@ -269,3 +269,46 @@ def test_serve_passes_env_to_llama_server(monkeypatch):
     assert result.exit_code == 0
     assert run_server.call_args.kwargs["env"] == {"A": "1", "B": "x=y"}
     assert bad.exit_code != 0 and "NAME=VALUE" in bad.output
+
+
+def test_serve_jeeves_maps_common_args(tmp_path):
+    with patch("llamacpp_tuner.cli.run_jeeves") as run_jeeves:
+        result = CliRunner().invoke(
+            main,
+            ["serve", str(tmp_path), "--backend", "jeeves", "--ctx", "2048"]
+            + ["--port", "6871", "--no-mmproj", "--extra-args", "--max-rows 2"],
+        )
+        bad = CliRunner().invoke(
+            main, ["serve", str(tmp_path), "--backend", "jeeves", "-q", "Q4_K_M"]
+        )
+
+    assert result.exit_code == 0, result.output
+    assert run_jeeves.call_args.args[0] == [
+        "--model",
+        str(tmp_path),
+        "--drafter",
+        str(tmp_path / "drafter_k4.safetensors"),
+        "--max-len",
+        "2048",
+        "--port",
+        "6871",
+        "--max-rows",
+        "2",
+    ]
+    assert bad.exit_code != 0 and "whole model directory" in bad.output
+
+
+def test_pull_all_downloads_the_whole_repository():
+    with patch(
+        "llamacpp_tuner.cli.download_repository", return_value=Path("models/o%2Fr")
+    ) as download:
+        result = CliRunner().invoke(main, ["pull", "o/r", "--all"])
+
+    assert result.exit_code == 0
+    download.assert_called_once_with("o/r", force=False)
+
+
+def test_address_reads_llama_and_jeeves_lines():
+    assert servers.address("main: server is listening on http://h:1") == "http://h:1"
+    assert servers.address('{"serving": "http://h:2", "block": 4}') == "http://h:2"
+    assert servers.address("loading model") == ""

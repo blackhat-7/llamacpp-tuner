@@ -3,7 +3,7 @@
 Handoff note. Rewritten at the end of every session, never appended to. Cap 40 lines.
 Next task: `PLAN.md`. Rules: `AGENTS.md`.
 
-**Last session:** 2026-09-28
+**Last session:** 2026-10-01
 
 ## State
 
@@ -14,13 +14,15 @@ Next task: `PLAN.md`. Rules: `AGENTS.md`.
 - `swift-qwen`: 112k, two slots, `-ub 512`, 4 GiB Vulkan suballocation blocks (`--env`). 1.7 GB VRAM free at start; decode ~119 t/s code, ~57 prose. Deep-prompt (>100k) prefill not re-measured yet.
 - Pi's auto-mode classifier runs on `swift-qwen`'s second slot (~2.3 s a pass); on `side` it took 10–25 s and timed out on parallel tool calls.
 - Consumers live in the `ai-harnesses` repo: `pi --local`, `claude-local` Haiku → side, code-review-graph embeddings → :6870.
-- Checks: `pytest` 55/55, ruff clean, pyright clean.
+- Profile `jeeves` (PostHog/jeeves, `--backend jeeves`, fp8, 4096 ctx, 2 rows, :6871): 15 GB VRAM, first start ~20 min (Triton autotune), then 16 s. 3 questions: 32 s thinking, 0.4 s without. Cannot share the GPU with `swift-qwen`.
+- Checks: `pytest` 64/64, ruff clean, pyright clean.
 
 ## Gotchas
 
+- **Jeeves on ROCm needs a one-line patch:** `inference/engine.py` forces `EFFICIENT_ATTENTION`, which rejects GQA on ROCm. Applied by hand in `tmp/jeeves/src` (`EFFICIENT = [..., SDPBackend.MATH]`); `lct setup --backend jeeves --force` wipes it.
+
 - **With `--kv-unified`, llama-server's default `--cache-idle-slots` clears idle slots on every new request.** Use `--no-cache-idle-slots` or two clients evict each other's cache.
 - **Check per-process spill, not just card VRAM.** `drm-memory-gtt` in `/proc/<llama-server pid>/fdinfo/*` is GPU memory living in system RAM. Large spill + deep prompt = GPU watchdog reset (`ErrorDeviceLost`).
-
 - **One GPU slot: any background request evicts the chat's prompt cache.** A 957-token title request forced a 22 s re-read of an 18k prompt. Keep background jobs on `side`.
 - **RAM is BIOS-limited to DDR5-4800;** the kit is rated 5200 (XMP off). CPU decode is bandwidth-bound (~57 GB/s measured).
 - **sysfs `mem_info_vram_used` under-reports at startup** (lazy commit). Trust llama.cpp's `projected to use N MiB` line or the sum of its `buffer size` lines.

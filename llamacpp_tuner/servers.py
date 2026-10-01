@@ -76,15 +76,24 @@ def start(name: str) -> int:
     return proc.pid
 
 
+def address(line: str) -> str:
+    """The address a server announces in a log line, if this is that line."""
+    if "listening on" in line:  # llama-server
+        return line.split("listening on")[-1].strip()
+    if line.startswith('{"serving": '):  # Jeeves
+        return json.loads(line)["serving"]
+    return ""
+
+
 def url(name: str) -> str:
-    """The address from llama-server's 'listening on' line, empty while loading."""
+    """The server's announced address, empty while loading."""
     with (
         contextlib.suppress(FileNotFoundError),
         log_path(name).open(errors="replace") as log,
     ):
         for line in log:
-            if "listening on" in line:
-                return line.split("listening on")[-1].strip()
+            if found := address(line):
+                return found
     return ""
 
 

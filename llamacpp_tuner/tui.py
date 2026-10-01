@@ -46,6 +46,7 @@ from llamacpp_tuner.downloader import (
     model_files,
     repo_details,
     resolve_model,
+    resolve_repository,
     search_repos,
 )
 from llamacpp_tuner.llama import get_llama_binary
@@ -249,12 +250,16 @@ def profile(args: str) -> dict:
     ctx = serve.make_context("serve", shlex.split(args), resilient_parsing=True)
     p = ctx.params
     try:
-        model = resolve_model(p["model"], quant=p["quant"], filename=p["filename"])
-        mmproj = pick_projector(p["model"], p["mmproj"], p["no_mmproj"])
+        if p["backend"] == "jeeves":
+            model, mmproj = resolve_repository(p["model"]), None
+        else:
+            model = resolve_model(p["model"], quant=p["quant"], filename=p["filename"])
+            mmproj = pick_projector(p["model"], p["mmproj"], p["no_mmproj"])
     except (FileNotFoundError, ValueError):
         model = mmproj = None
     selector = p["filename"] or p["quant"]
     model_tokens = [p["model"]]
+    model_tokens += ["--backend", p["backend"]] if p["backend"] != "llama" else []
     model_tokens += ["--file", p["filename"]] if p["filename"] else []
     model_tokens += ["--quant", p["quant"]] if p["quant"] else []
     mmproj_tokens = ["--mmproj", str(p["mmproj"])] if p["mmproj"] else []
@@ -263,7 +268,9 @@ def profile(args: str) -> dict:
     env_tokens = [token for item in p["env"] for token in ("--env", item)]
     return {
         "missing": model is None,
-        "model": model.name if model else f"{p['model']} {selector or ''}".strip(),
+        "model": model.name
+        if model and model.is_file()
+        else f"{p['model']} {selector or ''}".strip(),
         "mmproj": Path(mmproj).name if mmproj else "none",
         "ctx": str(p["ctx"] or ""),
         "host": p["host"] or "",
@@ -984,8 +991,8 @@ class LctApp(App[None]):
                     if not partial.endswith("\n"):
                         continue
                     line, partial = partial.rstrip(), ""
-                    if "listening on" in line:
-                        self.urls[name] = line.split("listening on")[-1].strip()
+                    if found := servers.address(line):
+                        self.urls[name] = found
                         self.render_profiles()
                         self.update_state()
                     style = ACCENT if line.startswith("$ ") else ""

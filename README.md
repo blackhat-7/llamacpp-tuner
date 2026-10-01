@@ -59,6 +59,18 @@ uv run lct down side     # stop one; 'lct down' alone stops every server
 
 Servers run detached and keep running after `lct up` or the TUI exits. Their logs are in `servers/<name>.log` in the cache directory.
 
+### Jeeves
+
+[Jeeves](https://github.com/PostHog/jeeves) is a reasoning classifier that llama.cpp cannot run. `--backend jeeves` runs it on its own PyTorch server, installed into a separate venv in the cache directory. Profiles, stacks, `lct up/down/ps` and the TUI treat it like any other server.
+
+```bash
+uv run lct setup --backend jeeves --torch-index https://download.pytorch.org/whl/rocm7.2  # omit the index on NVIDIA
+uv run lct pull PostHog/jeeves --all
+uv run lct serve PostHog/jeeves --backend jeeves --ctx 4096 --port 6871 --extra-args '--max-rows 2 --precision fp8'
+```
+
+`--ctx` becomes Jeeves's `--max-len`; `--extra-args` go to `python -m inference.serve`. It answers `POST /v1/systemone`, not the OpenAI API.
+
 ### Terminal UI
 
 ```bash

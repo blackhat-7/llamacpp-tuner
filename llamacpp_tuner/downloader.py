@@ -10,6 +10,7 @@ from huggingface_hub import (
     ModelInfo,
     hf_hub_download,
     list_repo_files,
+    snapshot_download,
 )
 from huggingface_hub.errors import EntryNotFoundError, HfHubHTTPError
 
@@ -250,6 +251,28 @@ def resolve_model(
     selector = filename or quant or model
     raise FileNotFoundError(
         f"Model not found: {model} ({selector}). Download it with 'lct pull'."
+    )
+
+
+def download_repository(repo_id: str, force: bool = False) -> Path:
+    """Download every file of a repository, for models that are not GGUF files."""
+    return Path(
+        snapshot_download(
+            repo_id, local_dir=_repository_dir(repo_id), force_download=force
+        )
+    )
+
+
+def resolve_repository(model: str) -> Path:
+    """Resolve a local directory or a fully downloaded repository offline."""
+    supplied = Path(model).expanduser()
+    if supplied.is_dir():
+        return supplied
+    path = _repository_dir(model)
+    if (path / "config.json").is_file():
+        return path
+    raise FileNotFoundError(
+        f"Model not found: {model}. Download it with 'lct pull {model} --all'."
     )
 
 

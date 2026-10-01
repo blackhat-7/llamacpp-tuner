@@ -81,12 +81,18 @@ def run_server(args: list[str], env: dict[str, str] | None = None) -> None:
         raise FileNotFoundError(
             "llama-server not found. Install it or run 'lct setup'."
         )
-    command = [str(binary), *args]
+    run_process([str(binary), *args], env=env)
+
+
+def run_process(
+    command: list[str], env: dict[str, str] | None = None, cwd: Path | None = None
+) -> None:
+    """Run a server in the foreground until it exits or lct is stopped."""
     with subprocess.Popen(
-        command, env={**os.environ, **env} if env else None
+        command, env={**os.environ, **env} if env else None, cwd=cwd
     ) as server:
         # Without this, a SIGTERM to lct kills only the wrapper and orphans
-        # llama-server, leaving the model resident in VRAM.
+        # the server, leaving the model resident in VRAM.
         def shutdown(signum: int, frame: object) -> None:
             server.terminate()
 
@@ -94,7 +100,7 @@ def run_server(args: list[str], env: dict[str, str] | None = None) -> None:
             signal.signal(sig, shutdown)
         code = server.wait()
 
-    # A negative code means llama-server was stopped by a signal, which is how
+    # A negative code means the server was stopped by a signal, which is how
     # a requested shutdown ends.
     if code > 0:
         raise subprocess.CalledProcessError(code, command)
