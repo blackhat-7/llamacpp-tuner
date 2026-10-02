@@ -386,6 +386,8 @@ class LctApp(App[None]):
         Binding("slash", "search"),
         Binding("escape", "leave"),
         Binding("q", "quit"),
+        # Textual reserves ctrl+c for copy and only hints at ctrl+q; quit like any terminal app.
+        Binding("ctrl+c", "quit", priority=True),
         Binding("ctrl+l", "clear_log"),
     ]
 

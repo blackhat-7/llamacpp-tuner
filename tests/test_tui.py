@@ -164,6 +164,18 @@ def test_enter_starts_and_stops_the_highlighted_profile(monkeypatch, workspace):
     asyncio.run(run())
 
 
+def test_ctrl_c_quits_even_from_a_text_field(workspace):
+    async def run() -> None:
+        app = LctApp()
+        async with app.run_test(size=(100, 40)) as pilot:
+            await pilot.press("2", "slash")
+            assert isinstance(app.focused, Input)
+            await pilot.press("ctrl+c")
+            await until(pilot, lambda: not app.is_running)
+
+    asyncio.run(run())
+
+
 def test_quitting_leaves_the_server_and_a_new_ui_stops_it(monkeypatch, workspace):
     write_aliases({"mine": str(workspace)})
     monkeypatch.setattr(
