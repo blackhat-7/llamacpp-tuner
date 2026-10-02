@@ -6,7 +6,6 @@ Model selection and tuning live in reusable Agent Skills instead of Python heuri
 
 - [`skills/select-local-model`](skills/select-local-model/SKILL.md)
 - [`skills/tune-local-model`](skills/tune-local-model/SKILL.md)
-- [`skills/jeeves`](skills/jeeves/SKILL.md): classify text with the Jeeves server
 
 ## Usage
 
