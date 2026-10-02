@@ -3,7 +3,7 @@
 Handoff note. Rewritten at the end of every session, never appended to. Cap 40 lines.
 Next task: `PLAN.md`. Rules: `AGENTS.md`.
 
-**Last session:** 2026-10-01
+**Last session:** 2026-10-02
 
 ## State
 
@@ -14,12 +14,12 @@ Next task: `PLAN.md`. Rules: `AGENTS.md`.
 - `swift-qwen`: 112k, two slots, `-ub 512`, 4 GiB Vulkan suballocation blocks (`--env`). 1.7 GB VRAM free at start; decode ~119 t/s code, ~57 prose. Deep-prompt (>100k) prefill not re-measured yet.
 - Pi's auto-mode classifier runs on `swift-qwen`'s second slot (~2.3 s a pass); on `side` it took 10–25 s and timed out on parallel tool calls.
 - Consumers live in the `ai-harnesses` repo: `pi --local`, `claude-local` Haiku → side, code-review-graph embeddings → :6870.
-- Profile `jeeves` (PostHog/jeeves, `--backend jeeves`, fp8, 4096 ctx, 2 rows, :6871): 15 GB VRAM, first start ~20 min (Triton autotune), then 16 s. 3 questions: 32 s thinking, 0.4 s without. Cannot share the GPU with `swift-qwen`.
+- Profile `jeeves` (PostHog/jeeves, `--backend jeeves`, fp8, 4096 ctx, 2 rows, :6871): 15 GB VRAM. 3 questions: 70 s thinking, 0.9 s without (Jeeves master + ROCm fix; the pre-#7 commit took 32 s). Cannot share the GPU with `swift-qwen`.
 - Checks: `pytest` 64/64, ruff clean, pyright clean.
 
 ## Gotchas
 
-- **Jeeves on ROCm needs a one-line patch:** `inference/engine.py` forces `EFFICIENT_ATTENTION`, which rejects GQA on ROCm. Applied by hand in `tmp/jeeves/src` (`EFFICIENT = [..., SDPBackend.MATH]`); `lct setup --backend jeeves --force` wipes it.
+- **Jeeves upstream does not run on ROCm.** `tmp/jeeves/src` is on branch `rocm-attention` of `blackhat-7/jeeves` (commit `5469a2c`). Upstream takes PRs from collaborators only. `lct setup --backend jeeves --force` re-clones upstream and loses the fix.
 
 - **With `--kv-unified`, llama-server's default `--cache-idle-slots` clears idle slots on every new request.** Use `--no-cache-idle-slots` or two clients evict each other's cache.
 - **Check per-process spill, not just card VRAM.** `drm-memory-gtt` in `/proc/<llama-server pid>/fdinfo/*` is GPU memory living in system RAM. Large spill + deep prompt = GPU watchdog reset (`ErrorDeviceLost`).
