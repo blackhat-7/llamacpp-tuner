@@ -788,6 +788,8 @@ class LctApp(App[None]):
                 ("vram", f"{vram / 1024**3:4.1f}G" if vram else "    –"),
             ):
                 label.append(f"{unit} ", style=MUTED).append(f"{value}  ", style=NUMBER)
+            if details["slots"] != "1":
+                label.append(f"{details['slots']} slots", style=NUMBER)
         elif details["missing"]:
             label.append("model missing", style=WARN)
         else:

@@ -100,6 +100,9 @@ def test_profile_row_shows_parallel_slots(workspace):
         async with app.run_test(size=(100, 40)):
             assert "128k ctx  5 slots" in row(app, "#profiles", "swarm")
             assert "slots" not in row(app, "#profiles", "solo")
+            app.usage["swarm"] = (0.0, 0.0, 2**30, 2**30)
+            app.render_profiles()
+            assert "vram  1.0G  5 slots" in row(app, "#profiles", "swarm")
 
     asyncio.run(run())
 
