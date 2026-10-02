@@ -8,6 +8,7 @@ import re
 import shlex
 import time
 from collections.abc import Callable
+from itertools import pairwise
 from pathlib import Path
 
 import click
@@ -266,6 +267,10 @@ def profile(args: str) -> dict:
     mmproj_tokens += ["--no-mmproj"] if p["no_mmproj"] else []
     mmproj_tokens += ["--no-mmproj-offload"] if p["no_mmproj_offload"] else []
     env_tokens = [token for item in p["env"] for token in ("--env", item)]
+    extra = (p["extra_args"] or "").split()
+    slots = next(
+        (v for flag, v in pairwise(extra) if flag in ("-np", "--parallel")), "1"
+    )
     return {
         "missing": model is None,
         "model": model.name
@@ -276,6 +281,7 @@ def profile(args: str) -> dict:
         "host": p["host"] or "",
         "port": str(p["port"] or ""),
         "extra": p["extra_args"] or "",
+        "slots": slots,
         "model_tokens": model_tokens,
         "mmproj_tokens": mmproj_tokens,
         "env_tokens": env_tokens,
@@ -786,6 +792,8 @@ class LctApp(App[None]):
             label.append("model missing", style=WARN)
         else:
             label.append(f"{tokens(int(details['ctx'] or 0))} ctx  ", style=NUMBER)
+            if details["slots"] != "1":
+                label.append(f"{details['slots']} slots  ", style=NUMBER)
             if details["mmproj"] != "none":
                 label.append("images", style=MEDIA)
         return label

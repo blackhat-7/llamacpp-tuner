@@ -15,7 +15,9 @@ Next task: `PLAN.md`. Rules: `AGENTS.md`.
 - Pi's auto-mode classifier runs on `swift-qwen`'s second slot (~2.3 s a pass); on `side` it took 10–25 s and timed out on parallel tool calls.
 - Consumers live in the `ai-harnesses` repo: `pi --local`, `claude-local` Haiku → side, code-review-graph embeddings → :6870.
 - Profile `jeeves` (PostHog/jeeves, `--backend jeeves`, fp8, 4096 ctx, 2 rows, :6871): 15 GB VRAM. 3 questions: 70 s thinking, 0.9 s without (Jeeves master + ROCm fix; the pre-#7 commit took 32 s). Cannot share the GPU with `swift-qwen`.
-- Checks: `pytest` 64/64, ruff clean, pyright clean.
+- Profile `swarm` (Qwen3.6-35B-A3B UD-Q4_K_S on GPU, `-np 5`, 128k total = ~26k per agent, MTP, :6872) for parallel agents. Not loaded yet: VRAM fit (~23.3 GB est.) and 80 t/s per agent unmeasured. Cannot share the GPU with `swift-qwen`.
+- The TUI profile list shows `N slots` when the extra args set `-np`/`--parallel`.
+- Checks: `pytest` 65/65, ruff clean, pyright clean.
 
 ## Gotchas
 

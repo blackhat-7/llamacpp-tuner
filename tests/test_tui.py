@@ -87,6 +87,23 @@ def test_renders_every_page_at_common_widths(width, workspace):
     asyncio.run(run())
 
 
+def test_profile_row_shows_parallel_slots(workspace):
+    write_aliases(
+        {
+            "swarm": f"{workspace} --ctx 131072 --extra-args '-ngl all -np 5'",
+            "solo": f"{workspace} --ctx 4096",
+        }
+    )
+
+    async def run() -> None:
+        app = LctApp()
+        async with app.run_test(size=(100, 40)):
+            assert "128k ctx  5 slots" in row(app, "#profiles", "swarm")
+            assert "slots" not in row(app, "#profiles", "solo")
+
+    asyncio.run(run())
+
+
 def test_tab_moves_between_panes_and_pages_switch_after_search(workspace):
     async def run() -> None:
         app = LctApp()
