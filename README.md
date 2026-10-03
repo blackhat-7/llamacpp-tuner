@@ -7,6 +7,25 @@ Model selection and tuning live in reusable Agent Skills instead of Python heuri
 - [`skills/select-local-model`](skills/select-local-model/SKILL.md)
 - [`skills/tune-local-model`](skills/tune-local-model/SKILL.md)
 
+## Install
+
+Run it from a clone; models, builds and `aliases.toml` go in the clone's `tmp/`:
+
+```bash
+git clone https://github.com/blackhat-7/llamacpp-tuner
+cd llamacpp-tuner
+uv run lct setup
+```
+
+Or install the `lct` command and run it from anywhere; data goes in `~/.cache/lct` (`LCT_HOME` overrides). Drop `uv run` from the commands below.
+
+```bash
+uv tool install git+https://github.com/blackhat-7/llamacpp-tuner
+lct setup
+```
+
+`uv run lct` outside the clone fails with "Failed to spawn: `lct`".
+
 ## Usage
 
 ```bash
