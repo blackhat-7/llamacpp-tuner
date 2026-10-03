@@ -22,7 +22,7 @@ from llamacpp_tuner.downloader import (
     resolve_repository,
 )
 from llamacpp_tuner.jeeves import install_jeeves, run_jeeves
-from llamacpp_tuner.llama import install_llama, run_server
+from llamacpp_tuner.llama import install_llama, list_devices, run_server
 from llamacpp_tuner.strata import run_strata
 
 BACKEND = click.option(
@@ -135,7 +135,7 @@ def main() -> None:
 def setup(
     backend: str, force: bool, cmake_arg: tuple[str, ...], torch_index: str | None
 ) -> None:
-    """Find or download llama-server (CUDA or --cmake-arg build it), or install Jeeves."""
+    """Find or download llama-server for this GPU (--cmake-arg builds it), or install Jeeves."""
     try:
         if backend == "strata":
             raise click.UsageError("Strata installs with its own ./setup.sh.")
@@ -144,6 +144,14 @@ def setup(
         else:
             binary = install_llama(force=force, extra_cmake_args=cmake_arg)
             click.echo(f"llama-server: {binary}")
+            devices = list_devices(binary)
+            click.echo(devices)
+            if "(none)" in devices:
+                click.echo(
+                    "No GPU found: install your GPU driver (NVIDIA, or Vulkan for "
+                    "AMD/Intel), then run 'lct setup --force'.",
+                    err=True,
+                )
     except (OSError, RuntimeError, subprocess.CalledProcessError) as error:
         raise click.ClickException(str(error)) from error
 

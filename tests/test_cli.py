@@ -10,14 +10,33 @@ from llamacpp_tuner import servers
 from llamacpp_tuner.cli import load_aliases, load_stacks, main, write_aliases
 
 
-def test_setup_reports_binary():
-    with patch(
-        "llamacpp_tuner.cli.install_llama", return_value=Path("/bin/llama-server")
+def test_setup_reports_binary_and_devices():
+    with (
+        patch(
+            "llamacpp_tuner.cli.install_llama", return_value=Path("/bin/llama-server")
+        ),
+        patch("llamacpp_tuner.cli.list_devices", return_value="  Vulkan0: AMD GPU"),
     ):
         result = CliRunner().invoke(main, ["setup"])
 
     assert result.exit_code == 0
-    assert "/bin/llama-server" in result.output
+    assert "/bin/llama-server" in result.output and "Vulkan0: AMD GPU" in result.output
+    assert "No GPU found" not in result.output
+
+
+def test_setup_says_how_to_fix_a_missing_gpu():
+    with (
+        patch(
+            "llamacpp_tuner.cli.install_llama", return_value=Path("/bin/llama-server")
+        ),
+        patch(
+            "llamacpp_tuner.cli.list_devices",
+            return_value="Available devices:\n  (none)",
+        ),
+    ):
+        result = CliRunner().invoke(main, ["setup"])
+
+    assert result.exit_code == 0 and "No GPU found" in result.output
 
 
 def test_pull_requires_quant_or_file():

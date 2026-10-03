@@ -17,12 +17,12 @@ Next task: `PLAN.md`. Rules: `AGENTS.md`.
 - Profile `jeeves` (PostHog/jeeves, `--backend jeeves`, fp8, 4096 ctx, 2 rows, :6871): 15 GB VRAM. 3 questions: 70 s thinking, 0.9 s without (Jeeves master + ROCm fix; the pre-#7 commit took 32 s). Cannot share the GPU with `swift-qwen`.
 - Profile `swarm` (Qwen3.6-35B-A3B UD-IQ4_NL on GPU, `-np 5`, `--ctx 327680` = 64k per agent, MTP, :6868 like `swift-qwen` so `pi --local` finds it) for parallel Pi agents. Loads: 23.0 GB VRAM, 171 MB GTT. One short reply: 183 t/s. 5-way speed unmeasured. Cannot share the GPU with `swift-qwen`.
 - Profile `strata-flash-next` (`--backend strata`): Strata engine in `~/Documents/projects/Strata`, Flash-Next GSQ-RCO IQ3_S, 127.0.0.1:8080, in no stack. 50 GiB RAM, 20 GiB VRAM (config adds `--vram-reserve-mib 4000` and temp 1.0 sampling). Cannot share the GPU with `swift-qwen`.
-- `lct setup` downloads the newest prebuilt llama.cpp release (Vulkan; Metal on macOS) into `<cache>/llama.cpp/build/bin` and runs `--version` to check it. `nvcc` or `--cmake-arg` still build from source. Fresh install measured: 3 s.
-- Checks: `pytest` 73/73, ruff clean, pyright clean.
+- `lct setup` picks a prebuilt llama.cpp by GPU: `nvidia-smi` → CUDA 12.8 + bundled runtime, else Vulkan, macOS Metal; into `<cache>/llama.cpp/build/bin`, then prints `--list-devices`. Only `--cmake-arg` builds. Live: Vulkan 3 s; CUDA path simulated (fake `nvidia-smi`), 30 s, libs resolve; no real NVIDIA test yet.
+- Checks: `pytest` 74/74, ruff clean, pyright clean.
 
 ## Gotchas
 
-- **`test_enter_on_a_stack_starts_and_stops_all_of_it` is flaky** (~1 in 6 runs, also before the slots change). Rerun before blaming a change.
+- **TUI tests flake under load** (`test_enter_on_a_stack…`, `test_a_click_only…`; seen at load average 20). Rerun before blaming a change.
 - **Jeeves upstream does not run on ROCm.** `tmp/jeeves/src` is on branch `rocm-attention` of `blackhat-7/jeeves` (commit `267cff8`). Upstream takes PRs from collaborators only. `lct setup --backend jeeves --force` re-clones upstream and loses the fix.
 - **With `--kv-unified`, llama-server's default `--cache-idle-slots` clears idle slots on every new request.** Use `--no-cache-idle-slots` or two clients evict each other's cache.
 - **Check per-process spill, not just card VRAM.** `drm-memory-gtt` in `/proc/<llama-server pid>/fdinfo/*` is GPU memory living in system RAM. Large spill + deep prompt = GPU watchdog reset (`ErrorDeviceLost`).

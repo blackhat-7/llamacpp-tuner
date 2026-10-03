@@ -91,72 +91,92 @@ def test_build_enables_vulkan_without_cuda(monkeypatch, tmp_path):
     assert "-DGGML_CUDA=ON" not in commands[0]
 
 
-def fake_release(monkeypatch, tmp_path, script: str) -> None:
-    """Serve a release list and a tarball whose llama-server runs `script`."""
-    archive = tmp_path / "llama-b1-bin-ubuntu-vulkan-x64.tar.gz"
-    with tarfile.open(archive, "w:gz") as tar:
-        data = f"#!/bin/sh\n{script}\n".encode()
-        info = tarfile.TarInfo("llama-b1/llama-server")
-        info.size, info.mode = len(data), 0o755
-        tar.addfile(info, io.BytesIO(data))
-    releases = [
-        {
-            "assets": [
-                {"name": "cudart-llama-b1-bin-ubuntu-vulkan-x64.tar.gz"},
-                {
-                    "name": archive.name,
-                    "browser_download_url": f"https://x/{archive.name}",
-                },
-            ]
-        }
-    ]
+SERVER = "llama-b1/llama-server"
+
+
+def fake_release(monkeypatch, tmp_path, archives: dict[str, dict[str, str]], gpu=None):
+    """Publish one release whose tarballs hold {member path: shell script}."""
+    for name, files in archives.items():
+        with tarfile.open(tmp_path / name, "w:gz") as tar:
+            for member, script in files.items():
+                data = f"#!/bin/sh\n{script}\n".encode()
+                info = tarfile.TarInfo(member)
+                info.size, info.mode = len(data), 0o755
+                tar.addfile(info, io.BytesIO(data))
+    assets = [{"name": n, "browser_download_url": f"https://x/{n}"} for n in archives]
     monkeypatch.setattr(llama.platform, "system", lambda: "Linux")
     monkeypatch.setattr(llama.platform, "machine", lambda: "x86_64")
+    monkeypatch.setattr(
+        llama.shutil, "which", lambda name: gpu if name == "nvidia-smi" else None
+    )
     monkeypatch.setattr(llama, "get_llama_dir", lambda: tmp_path / "llama")
     (tmp_path / "llama").mkdir()
     monkeypatch.setattr(
         llama.urllib.request,
         "urlopen",
-        lambda url, timeout: io.BytesIO(json.dumps(releases).encode()),
+        lambda url, timeout: io.BytesIO(json.dumps([{"assets": assets}]).encode()),
     )
     monkeypatch.setattr(
         llama.urllib.request,
         "urlretrieve",
-        lambda url, path: shutil.copy(archive, path),
+        lambda url, path: shutil.copy(tmp_path / url.rsplit("/", 1)[-1], path),
     )
 
 
-def test_download_release_installs_a_running_server(monkeypatch, tmp_path):
-    fake_release(monkeypatch, tmp_path, "echo 'version: 1'")
+VULKAN = "llama-b1-bin-ubuntu-vulkan-x64.tar.gz"
+CUDA = "llama-b1-bin-ubuntu-cuda-12.8-x64.tar.gz"
+CUDART = "cudart-llama-b1-bin-ubuntu-cuda-12.8-x64.tar.gz"
+
+
+def test_download_release_installs_vulkan_without_nvidia(monkeypatch, tmp_path):
+    fake_release(
+        monkeypatch,
+        tmp_path,
+        {VULKAN: {SERVER: "echo vulkan"}, CUDA: {SERVER: "echo cuda"}},
+    )
 
     binary = llama.download_release()
 
     assert binary == tmp_path / "llama" / "build" / "bin" / "llama-server"
-    assert llama.subprocess.run([binary], capture_output=True).returncode == 0
+    assert llama.subprocess.run([binary], capture_output=True).stdout == b"vulkan\n"
+
+
+def test_download_release_puts_the_cuda_runtime_beside_llama_on_nvidia(
+    monkeypatch, tmp_path
+):
+    fake_release(
+        monkeypatch,
+        tmp_path,
+        {
+            VULKAN: {SERVER: "echo vulkan"},
+            CUDA: {SERVER: "echo cuda"},
+            CUDART: {"cudart/libcudart.so.12": ""},
+        },
+        gpu="/usr/bin/nvidia-smi",
+    )
+
+    binary = llama.download_release()
+
+    assert llama.subprocess.run([binary], capture_output=True).stdout == b"cuda\n"
+    assert (binary.parent / "libcudart.so.12").is_file()
 
 
 def test_download_release_fails_when_the_server_cannot_start(monkeypatch, tmp_path):
     fake_release(
-        monkeypatch, tmp_path, "echo 'libvulkan.so.1: not found' >&2; exit 127"
+        monkeypatch,
+        tmp_path,
+        {VULKAN: {SERVER: "echo 'libvulkan.so.1: not found' >&2; exit 127"}},
     )
 
-    with pytest.raises(RuntimeError, match="(?s)libvulkan.so.1.*Vulkan"):
+    with pytest.raises(RuntimeError, match="(?s)libvulkan.so.1.*GPU driver"):
         llama.download_release()
 
 
 @pytest.mark.parametrize(
-    ("nvcc", "cmake_args", "expected"),
-    [
-        (None, (), "download"),
-        ("/opt/cuda/bin/nvcc", (), "build"),
-        (None, ("-DX=1",), "build"),
-    ],
+    ("cmake_args", "expected"), [((), "download"), (("-DX=1",), "build")]
 )
-def test_install_downloads_unless_cuda_or_cmake_args(
-    monkeypatch, nvcc, cmake_args, expected
-):
+def test_install_downloads_unless_given_cmake_args(monkeypatch, cmake_args, expected):
     monkeypatch.setattr(llama, "get_llama_binary", lambda: None)
-    monkeypatch.setattr(llama.shutil, "which", lambda name: nvcc)
     monkeypatch.setattr(llama, "download_release", lambda: "download")
     monkeypatch.setattr(llama, "build_from_source", lambda **kwargs: "build")
 

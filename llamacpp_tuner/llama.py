@@ -72,75 +72,106 @@ def build_from_source(
     return binary
 
 
-def _release_suffix() -> str:
-    """The release asset for this machine: Vulkan, or Metal on macOS."""
+def _release_assets() -> list[tuple[str, str]]:
+    """(prefix, suffix) of each release asset for this machine's GPU.
+
+    NVIDIA gets CUDA plus its runtime libraries, everything else Vulkan, macOS Metal.
+    """
+    system = platform.system()
     arch = "arm64" if platform.machine().lower() in ("arm64", "aarch64") else "x64"
-    return {
-        "Linux": f"-bin-ubuntu-vulkan-{arch}.tar.gz",
-        "Darwin": f"-bin-macos-{arch}.tar.gz",
-        "Windows": f"-bin-win-vulkan-{arch}.zip",
-    }.get(platform.system(), "")
+    if system == "Darwin":
+        return [("llama-", f"-bin-macos-{arch}.tar.gz")]
+    # nvidia-smi ships with NVIDIA's driver, which is all CUDA 12 needs once
+    # the runtime libraries come from the release; no toolkit or compiler.
+    cuda = {"Linux": "ubuntu-cuda-12.8-x64.tar.gz", "Windows": "win-cuda-12.4-x64.zip"}
+    if shutil.which("nvidia-smi") and arch == "x64" and system in cuda:
+        build = f"-bin-{cuda[system]}"
+        return [("llama-", build), ("cudart-llama-", build)]
+    vulkan = {
+        "Linux": f"ubuntu-vulkan-{arch}.tar.gz",
+        "Windows": f"win-vulkan-{arch}.zip",
+    }
+    return [("llama-", f"-bin-{vulkan[system]}")] if system in vulkan else []
+
+
+def _asset_urls(wanted: list[tuple[str, str]]) -> list[str]:
+    """Download URLs of the newest release that has every wanted asset."""
+    with urllib.request.urlopen(RELEASES_URL, timeout=30) as response:
+        releases = json.load(response)
+    for release in releases:
+        urls = [
+            next(
+                (
+                    asset["browser_download_url"]
+                    for asset in release["assets"]
+                    if asset["name"].startswith(prefix)
+                    and asset["name"].endswith(suffix)
+                ),
+                None,
+            )
+            for prefix, suffix in wanted
+        ]
+        if wanted and all(urls):
+            return [url for url in urls if url]
+    raise RuntimeError(
+        f"No prebuilt llama.cpp for {platform.system()} {platform.machine()}. "
+        "Build it: lct setup --cmake-arg=-DGGML_VULKAN=ON"
+    )
 
 
 def download_release() -> Path:
     """Install the newest prebuilt llama.cpp for this machine and check it runs."""
-    suffix = _release_suffix()
-    with urllib.request.urlopen(RELEASES_URL, timeout=30) as response:
-        releases = json.load(response)
-    url = next(
-        (
-            asset["browser_download_url"]
-            for release in releases
-            for asset in release["assets"]
-            if suffix
-            and asset["name"].startswith("llama-")
-            and asset["name"].endswith(suffix)
-        ),
-        None,
-    )
-    if not url:
-        raise RuntimeError(
-            f"No prebuilt llama.cpp for {platform.system()} {platform.machine()}. "
-            "Build it: lct setup --cmake-arg=-DGGML_VULKAN=ON"
-        )
-
+    urls = _asset_urls(_release_assets())
     source_dir = get_llama_dir()
     bin_dir = source_dir / "build" / "bin"
     with tempfile.TemporaryDirectory(dir=source_dir) as scratch:
-        archive = Path(scratch) / url.rsplit("/", 1)[-1]
-        urllib.request.urlretrieve(url, archive)
-        unpacked = Path(scratch) / "unpacked"
-        shutil.unpack_archive(archive, unpacked, filter="data")
-        # Tarballs wrap everything in one llama-bNNNN folder; zips do not.
-        entries = list(unpacked.iterdir())
-        root = entries[0] if len(entries) == 1 and entries[0].is_dir() else unpacked
+        staged = Path(scratch) / "bin"
+        for i, url in enumerate(urls):
+            print(f"Downloading {url}", flush=True)
+            archive = Path(scratch) / url.rsplit("/", 1)[-1]
+            urllib.request.urlretrieve(url, archive)
+            unpacked = Path(scratch) / str(i)
+            shutil.unpack_archive(archive, unpacked, filter="data")
+            # Tarballs wrap everything in one folder; zips do not. The CUDA
+            # runtime lands beside llama.cpp, which loads libraries from its
+            # own folder.
+            entries = list(unpacked.iterdir())
+            root = entries[0] if len(entries) == 1 and entries[0].is_dir() else unpacked
+            shutil.copytree(root, staged, symlinks=True, dirs_exist_ok=True)
+        # Swap only once everything downloaded, so a failure keeps the old install.
         shutil.rmtree(bin_dir.parent, ignore_errors=True)
         bin_dir.parent.mkdir(parents=True)
-        root.rename(bin_dir)
+        staged.rename(bin_dir)
 
     binary = _managed_binary(source_dir)
     if not binary:
-        raise RuntimeError(f"{url} has no llama-server.")
+        raise RuntimeError(f"{urls[0]} has no llama-server.")
     check = subprocess.run(
         [str(binary), "--version"], capture_output=True, text=True, check=False
     )
     if check.returncode != 0:
         raise RuntimeError(
             f"The prebuilt llama-server does not run here:\n{check.stderr.strip()}\n"
-            "Install your GPU driver's Vulkan support, or build from source: "
+            "Install your GPU driver, or build from source: "
             "lct setup --cmake-arg=-DGGML_VULKAN=ON"
         )
     return binary
 
 
+def list_devices(binary: Path) -> str:
+    """llama.cpp's own list of the GPUs it can use, '(none)' when it finds none."""
+    result = subprocess.run(
+        [str(binary), "--list-devices"], capture_output=True, text=True, check=False
+    )
+    return (result.stdout or result.stderr).strip()
+
+
 def install_llama(force: bool = False, extra_cmake_args: Sequence[str] = ()) -> Path:
-    """Find llama-server, else download a prebuilt one; CUDA or CMake arguments build it."""
+    """Find llama-server, else download a prebuilt one; CMake arguments build it."""
     existing = get_llama_binary()
     if existing and not force:
         return existing
-    # CUDA machines keep the source build they had (prebuilt CUDA needs a
-    # matching runtime); CMake arguments only mean something to a source build.
-    if extra_cmake_args or shutil.which("nvcc"):
+    if extra_cmake_args:
         return build_from_source(force=force, extra_cmake_args=extra_cmake_args)
     return download_release()
 

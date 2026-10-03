@@ -9,7 +9,7 @@ Model selection and tuning live in reusable Agent Skills instead of Python heuri
 
 ## Install
 
-You need [uv](https://docs.astral.sh/uv/) (`curl -LsSf https://astral.sh/uv/install.sh | sh`), `git`, and a GPU driver with Vulkan (macOS uses Metal). No compiler.
+You need [uv](https://docs.astral.sh/uv/) (`curl -LsSf https://astral.sh/uv/install.sh | sh`), `git`, and your GPU driver. No compiler, no CUDA toolkit.
 
 Install the `lct` command; its data goes in `~/.cache/lct` (`LCT_HOME` overrides):
 
@@ -26,17 +26,19 @@ cd llamacpp-tuner
 uv run lct setup
 ```
 
-`lct setup` uses `llama-server` from `PATH` if there is one. Otherwise it downloads the newest prebuilt llama.cpp (Vulkan; Metal on macOS) and checks it starts. It prints the path. Confirm your GPU is found by running that path with `--list-devices`:
+`lct setup` uses `llama-server` from `PATH` if there is one. Otherwise it downloads the newest prebuilt llama.cpp for your GPU and checks it starts:
 
-```bash
-~/.cache/lct/llama.cpp/build/bin/llama-server --list-devices   # tool install; a clone uses tmp/llama.cpp/...
-```
+| GPU | Build | Needs |
+|---|---|---|
+| NVIDIA (`nvidia-smi` works) | CUDA 12, runtime included (~765 MB) | NVIDIA driver 570 or newer |
+| AMD, Intel | Vulkan (~32 MB) | Vulkan driver: Arch `vulkan-radeon`/`vulkan-intel`, Ubuntu `mesa-vulkan-drivers` |
+| Apple silicon | Metal (~12 MB) | nothing |
 
-If only the CPU shows up, install your GPU's Vulkan driver (Arch: `vulkan-radeon`, `vulkan-intel` or `nvidia-utils`; Ubuntu: `mesa-vulkan-drivers`) and run `lct setup --force`.
+It ends by listing the GPUs llama.cpp can use, e.g. `Vulkan0: AMD Radeon RX 7900 XTX` or `CUDA0: NVIDIA GeForce RTX 4090`. If it says `(none)`, install the driver above and run `lct setup --force`.
 
 ### Building from source
 
-`lct setup` builds from source instead when `nvcc` is installed (CUDA) or when you pass `--cmake-arg`, e.g. `lct setup --cmake-arg=-DGGML_VULKAN=ON`. That needs a compiler and the Vulkan headers:
+`lct setup --cmake-arg=...` builds from source instead, e.g. `--cmake-arg=-DGGML_VULKAN=ON`; with `nvcc` installed it builds CUDA. That needs a compiler and, for Vulkan, its headers:
 
 ```bash
 sudo pacman -S git cmake base-devel vulkan-headers shaderc spirv-headers        # Arch
