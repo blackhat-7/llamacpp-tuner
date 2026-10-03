@@ -1,16 +1,21 @@
 """Build and run llama.cpp."""
 
+import json
 import os
 import platform
 import shutil
 import signal
 import subprocess
+import tempfile
+import urllib.request
 from collections.abc import Sequence
 from pathlib import Path
 
 from llamacpp_tuner.cache import get_llama_dir
 
 LLAMA_REPO_URL = "https://github.com/ggml-org/llama.cpp.git"
+# Every llama.cpp build is published as a prerelease, so "latest" finds none.
+RELEASES_URL = "https://api.github.com/repos/ggml-org/llama.cpp/releases?per_page=10"
 
 
 def _managed_binary(source_dir: Path, name: str = "llama-server") -> Path | None:
@@ -67,11 +72,77 @@ def build_from_source(
     return binary
 
 
+def _release_suffix() -> str:
+    """The release asset for this machine: Vulkan, or Metal on macOS."""
+    arch = "arm64" if platform.machine().lower() in ("arm64", "aarch64") else "x64"
+    return {
+        "Linux": f"-bin-ubuntu-vulkan-{arch}.tar.gz",
+        "Darwin": f"-bin-macos-{arch}.tar.gz",
+        "Windows": f"-bin-win-vulkan-{arch}.zip",
+    }.get(platform.system(), "")
+
+
+def download_release() -> Path:
+    """Install the newest prebuilt llama.cpp for this machine and check it runs."""
+    suffix = _release_suffix()
+    with urllib.request.urlopen(RELEASES_URL, timeout=30) as response:
+        releases = json.load(response)
+    url = next(
+        (
+            asset["browser_download_url"]
+            for release in releases
+            for asset in release["assets"]
+            if suffix
+            and asset["name"].startswith("llama-")
+            and asset["name"].endswith(suffix)
+        ),
+        None,
+    )
+    if not url:
+        raise RuntimeError(
+            f"No prebuilt llama.cpp for {platform.system()} {platform.machine()}. "
+            "Build it: lct setup --cmake-arg=-DGGML_VULKAN=ON"
+        )
+
+    source_dir = get_llama_dir()
+    bin_dir = source_dir / "build" / "bin"
+    with tempfile.TemporaryDirectory(dir=source_dir) as scratch:
+        archive = Path(scratch) / url.rsplit("/", 1)[-1]
+        urllib.request.urlretrieve(url, archive)
+        unpacked = Path(scratch) / "unpacked"
+        shutil.unpack_archive(archive, unpacked, filter="data")
+        # Tarballs wrap everything in one llama-bNNNN folder; zips do not.
+        entries = list(unpacked.iterdir())
+        root = entries[0] if len(entries) == 1 and entries[0].is_dir() else unpacked
+        shutil.rmtree(bin_dir.parent, ignore_errors=True)
+        bin_dir.parent.mkdir(parents=True)
+        root.rename(bin_dir)
+
+    binary = _managed_binary(source_dir)
+    if not binary:
+        raise RuntimeError(f"{url} has no llama-server.")
+    check = subprocess.run(
+        [str(binary), "--version"], capture_output=True, text=True, check=False
+    )
+    if check.returncode != 0:
+        raise RuntimeError(
+            f"The prebuilt llama-server does not run here:\n{check.stderr.strip()}\n"
+            "Install your GPU driver's Vulkan support, or build from source: "
+            "lct setup --cmake-arg=-DGGML_VULKAN=ON"
+        )
+    return binary
+
+
 def install_llama(force: bool = False, extra_cmake_args: Sequence[str] = ()) -> Path:
+    """Find llama-server, else download a prebuilt one; CUDA or CMake arguments build it."""
     existing = get_llama_binary()
     if existing and not force:
         return existing
-    return build_from_source(force=force, extra_cmake_args=extra_cmake_args)
+    # CUDA machines keep the source build they had (prebuilt CUDA needs a
+    # matching runtime); CMake arguments only mean something to a source build.
+    if extra_cmake_args or shutil.which("nvcc"):
+        return build_from_source(force=force, extra_cmake_args=extra_cmake_args)
+    return download_release()
 
 
 def run_server(args: list[str], env: dict[str, str] | None = None) -> None:

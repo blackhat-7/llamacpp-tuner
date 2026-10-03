@@ -121,7 +121,7 @@ def main() -> None:
 
 @main.command()
 @BACKEND
-@click.option("--force", is_flag=True, help="Rebuild or reinstall the backend")
+@click.option("--force", is_flag=True, help="Reinstall the backend")
 @click.option(
     "--cmake-arg",
     multiple=True,
@@ -135,7 +135,7 @@ def main() -> None:
 def setup(
     backend: str, force: bool, cmake_arg: tuple[str, ...], torch_index: str | None
 ) -> None:
-    """Find llama-server or build llama.cpp from source, or install Jeeves."""
+    """Find or download llama-server (CUDA or --cmake-arg build it), or install Jeeves."""
     try:
         if backend == "strata":
             raise click.UsageError("Strata installs with its own ./setup.sh.")

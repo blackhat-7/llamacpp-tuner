@@ -22,3 +22,4 @@ Each line carries its own done-check. A task too big for one session gets split 
 - [x] **Live usage and a resizable log in the TUI.** Per-server CPU/RAM/VRAM, machine CPU/RAM/GPU/VRAM, draggable `Output` rule; `lct ps` shows VRAM. Done: 58 tests, screenshots at 90/120.
 - [x] **Jeeves backend.** `--backend jeeves` runs PostHog/jeeves on its own PyTorch venv; profiles, `lct up/down/ps` and the TUI treat it like llama-server. Done: 64 tests, live fp8 run on the 7900 XTX.
 - [x] **Strata backend.** `--backend strata` starts a Strata run config (`strata-<model>.json`); profiles, `lct up/down/ps` and the TUI treat it like llama-server. Done: 68 tests, live `lct up/down strata-flash-next`.
+- [x] **Setup without a compiler.** `lct setup` downloads a prebuilt llama.cpp release (Vulkan; Metal on macOS) and checks it runs; source build only for `nvcc` or `--cmake-arg`. Done: 73 tests, fresh `LCT_HOME` install in 3 s finds the GPU, README install steps.

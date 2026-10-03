@@ -1,5 +1,9 @@
 """Tests for llama-server discovery and execution."""
 
+import io
+import json
+import shutil
+import tarfile
 from pathlib import Path
 
 import pytest
@@ -85,6 +89,78 @@ def test_build_enables_vulkan_without_cuda(monkeypatch, tmp_path):
     assert llama.build_from_source() == binary
     assert "-DGGML_VULKAN=ON" in commands[0]
     assert "-DGGML_CUDA=ON" not in commands[0]
+
+
+def fake_release(monkeypatch, tmp_path, script: str) -> None:
+    """Serve a release list and a tarball whose llama-server runs `script`."""
+    archive = tmp_path / "llama-b1-bin-ubuntu-vulkan-x64.tar.gz"
+    with tarfile.open(archive, "w:gz") as tar:
+        data = f"#!/bin/sh\n{script}\n".encode()
+        info = tarfile.TarInfo("llama-b1/llama-server")
+        info.size, info.mode = len(data), 0o755
+        tar.addfile(info, io.BytesIO(data))
+    releases = [
+        {
+            "assets": [
+                {"name": "cudart-llama-b1-bin-ubuntu-vulkan-x64.tar.gz"},
+                {
+                    "name": archive.name,
+                    "browser_download_url": f"https://x/{archive.name}",
+                },
+            ]
+        }
+    ]
+    monkeypatch.setattr(llama.platform, "system", lambda: "Linux")
+    monkeypatch.setattr(llama.platform, "machine", lambda: "x86_64")
+    monkeypatch.setattr(llama, "get_llama_dir", lambda: tmp_path / "llama")
+    (tmp_path / "llama").mkdir()
+    monkeypatch.setattr(
+        llama.urllib.request,
+        "urlopen",
+        lambda url, timeout: io.BytesIO(json.dumps(releases).encode()),
+    )
+    monkeypatch.setattr(
+        llama.urllib.request,
+        "urlretrieve",
+        lambda url, path: shutil.copy(archive, path),
+    )
+
+
+def test_download_release_installs_a_running_server(monkeypatch, tmp_path):
+    fake_release(monkeypatch, tmp_path, "echo 'version: 1'")
+
+    binary = llama.download_release()
+
+    assert binary == tmp_path / "llama" / "build" / "bin" / "llama-server"
+    assert llama.subprocess.run([binary], capture_output=True).returncode == 0
+
+
+def test_download_release_fails_when_the_server_cannot_start(monkeypatch, tmp_path):
+    fake_release(
+        monkeypatch, tmp_path, "echo 'libvulkan.so.1: not found' >&2; exit 127"
+    )
+
+    with pytest.raises(RuntimeError, match="(?s)libvulkan.so.1.*Vulkan"):
+        llama.download_release()
+
+
+@pytest.mark.parametrize(
+    ("nvcc", "cmake_args", "expected"),
+    [
+        (None, (), "download"),
+        ("/opt/cuda/bin/nvcc", (), "build"),
+        (None, ("-DX=1",), "build"),
+    ],
+)
+def test_install_downloads_unless_cuda_or_cmake_args(
+    monkeypatch, nvcc, cmake_args, expected
+):
+    monkeypatch.setattr(llama, "get_llama_binary", lambda: None)
+    monkeypatch.setattr(llama.shutil, "which", lambda name: nvcc)
+    monkeypatch.setattr(llama, "download_release", lambda: "download")
+    monkeypatch.setattr(llama, "build_from_source", lambda **kwargs: "build")
+
+    assert llama.install_llama(extra_cmake_args=cmake_args) == expected
 
 
 def test_run_server_requires_binary(monkeypatch):

@@ -9,7 +9,16 @@ Model selection and tuning live in reusable Agent Skills instead of Python heuri
 
 ## Install
 
-Run it from a clone; models, builds and `aliases.toml` go in the clone's `tmp/`:
+You need [uv](https://docs.astral.sh/uv/) (`curl -LsSf https://astral.sh/uv/install.sh | sh`), `git`, and a GPU driver with Vulkan (macOS uses Metal). No compiler.
+
+Install the `lct` command; its data goes in `~/.cache/lct` (`LCT_HOME` overrides):
+
+```bash
+uv tool install git+https://github.com/blackhat-7/llamacpp-tuner
+lct setup
+```
+
+Or run it from a clone; data goes in the clone's `tmp/`. Run every command below from the clone with `uv run` in front (`uv run lct setup`); elsewhere uv fails with "Failed to spawn: `lct`".
 
 ```bash
 git clone https://github.com/blackhat-7/llamacpp-tuner
@@ -17,37 +26,46 @@ cd llamacpp-tuner
 uv run lct setup
 ```
 
-Or install the `lct` command and run it from anywhere; data goes in `~/.cache/lct` (`LCT_HOME` overrides). Drop `uv run` from the commands below.
+`lct setup` uses `llama-server` from `PATH` if there is one. Otherwise it downloads the newest prebuilt llama.cpp (Vulkan; Metal on macOS) and checks it starts. It prints the path. Confirm your GPU is found by running that path with `--list-devices`:
 
 ```bash
-uv tool install git+https://github.com/blackhat-7/llamacpp-tuner
-lct setup
+~/.cache/lct/llama.cpp/build/bin/llama-server --list-devices   # tool install; a clone uses tmp/llama.cpp/...
 ```
 
-`uv run lct` outside the clone fails with "Failed to spawn: `lct`".
+If only the CPU shows up, install your GPU's Vulkan driver (Arch: `vulkan-radeon`, `vulkan-intel` or `nvidia-utils`; Ubuntu: `mesa-vulkan-drivers`) and run `lct setup --force`.
+
+### Building from source
+
+`lct setup` builds from source instead when `nvcc` is installed (CUDA) or when you pass `--cmake-arg`, e.g. `lct setup --cmake-arg=-DGGML_VULKAN=ON`. That needs a compiler and the Vulkan headers:
+
+```bash
+sudo pacman -S git cmake base-devel vulkan-headers shaderc spirv-headers        # Arch
+sudo apt install git cmake build-essential libvulkan-dev glslc spirv-headers    # Debian/Ubuntu
+```
+
+A missing `SPIRV-Headers` in the CMake output means the last package is missing.
 
 ## Usage
 
 ```bash
-# Use llama-server from PATH, or build a managed copy.
-# Builds CUDA when nvcc is available, otherwise Vulkan when vulkaninfo is available.
-uv run lct setup
+# Find or download llama-server (see Install).
+lct setup
 
 # Quant names are open-ended and exact—there is no allowlist or fallback.
-uv run lct pull owner/model-GGUF --quant Q6_K
+lct pull owner/model-GGUF --quant Q6_K
 
 # If a quant matches multiple artifacts, select the exact repository filename.
-uv run lct pull owner/model-GGUF --file model-Q6_K.gguf
+lct pull owner/model-GGUF --file model-Q6_K.gguf
 
 # Serve a downloaded repository without contacting Hugging Face.
-uv run lct serve owner/model-GGUF --quant Q6_K \
+lct serve owner/model-GGUF --quant Q6_K \
   --ctx 32768 \
   --extra-args "-ngl all -fa on -ctk q8_0 -ctv q8_0"
 
 # Exact local paths work too.
-uv run lct serve /models/model.gguf --extra-args "-ngl all"
+lct serve /models/model.gguf --extra-args "-ngl all"
 
-uv run lct models
+lct models
 ```
 
 Save frequently used `serve` arguments as aliases in `aliases.toml` in the lct cache directory (see below):
@@ -59,7 +77,7 @@ qwen = """owner/model-GGUF --quant Q6_K --ctx 32768 \
 
 Use `--env NAME=VALUE` (repeatable) for backend variables such as `GGML_VK_SUBALLOCATION_BLOCK_SIZE`; they go into llama-server's environment.
 
-`uv run lct serve qwen` then expands to those arguments. Options typed after the alias replace the alias's value for that option; `--extra-args` is replaced as a whole.
+`lct serve qwen` then expands to those arguments. Options typed after the alias replace the alias's value for that option; `--extra-args` is replaced as a whole.
 
 ### Several servers at once
 
@@ -71,9 +89,9 @@ local = ["qwen", "side", "embed"]
 ```
 
 ```bash
-uv run lct up local      # start each profile in the background, wait until all listen
-uv run lct ps            # name, address and resident RAM of each running server
-uv run lct down side     # stop one; 'lct down' alone stops every server
+lct up local      # start each profile in the background, wait until all listen
+lct ps            # name, address and resident RAM of each running server
+lct down side     # stop one; 'lct down' alone stops every server
 ```
 
 Servers run detached and keep running after `lct up` or the TUI exits. Their logs are in `servers/<name>.log` in the cache directory.
@@ -83,9 +101,9 @@ Servers run detached and keep running after `lct up` or the TUI exits. Their log
 [Jeeves](https://github.com/PostHog/jeeves) is a reasoning classifier that llama.cpp cannot run. `--backend jeeves` runs it on its own PyTorch server, installed into a separate venv in the cache directory. Profiles, stacks, `lct up/down/ps` and the TUI treat it like any other server.
 
 ```bash
-uv run lct setup --backend jeeves --torch-index https://download.pytorch.org/whl/rocm7.2  # omit the index on NVIDIA
-uv run lct pull PostHog/jeeves --all
-uv run lct serve PostHog/jeeves --backend jeeves --ctx 4096 --port 6871 --extra-args '--max-rows 2 --precision fp8'
+lct setup --backend jeeves --torch-index https://download.pytorch.org/whl/rocm7.2  # omit the index on NVIDIA
+lct pull PostHog/jeeves --all
+lct serve PostHog/jeeves --backend jeeves --ctx 4096 --port 6871 --extra-args '--max-rows 2 --precision fp8'
 ```
 
 `--ctx` becomes Jeeves's `--max-len`; `--extra-args` go to `python -m inference.serve`. It answers `POST /v1/systemone`, not the OpenAI API.
@@ -93,7 +111,7 @@ uv run lct serve PostHog/jeeves --backend jeeves --ctx 4096 --port 6871 --extra-
 ### Terminal UI
 
 ```bash
-uv run lct tui
+lct tui
 ```
 
 It is keyboard-driven and never traps you in a text box: `1`–`3` switch pages, `tab` or `←`/`→` move between the two panes of a page, `esc` backs out, `q` quits. The bottom line always shows the keys for where you are. A mouse click only highlights a row; `enter` or a double-click acts.
@@ -108,10 +126,10 @@ Profiles are the same aliases `lct serve <name>` uses. All output streams into t
 
 A source checkout stores files in `tmp/`; an installed package uses `${XDG_CACHE_HOME:-~/.cache}/lct`. Set `LCT_HOME` to override either location.
 
-After changing GPU vendors, rebuild the managed copy with `uv run lct setup --force`.
+After changing GPU vendors, rebuild the managed copy with `lct setup --force`.
 
 For a custom llama.cpp build:
 
 ```bash
-uv run lct setup --force --cmake-arg=-DGGML_VULKAN=ON
+lct setup --force --cmake-arg=-DGGML_VULKAN=ON
 ```
