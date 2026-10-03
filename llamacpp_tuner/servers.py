@@ -82,6 +82,8 @@ def address(line: str) -> str:
         return line.split("listening on")[-1].strip()
     if line.startswith('{"serving": '):  # Jeeves
         return json.loads(line)["serving"]
+    if line.startswith("ready: http"):  # Strata: "ready: http://host:port/v1  (...)"
+        return line.split()[1].removesuffix("/v1")
     return ""
 
 

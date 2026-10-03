@@ -21,3 +21,4 @@ Each line carries its own done-check. A task too big for one session gets split 
 - [x] **N-gram drafting on the 27B.** Rejected: `draft-mtp,ngram-mod` made a code edit slower (120 → 105 t/s), prose unchanged (~60). MTP alone stays.
 - [x] **Live usage and a resizable log in the TUI.** Per-server CPU/RAM/VRAM, machine CPU/RAM/GPU/VRAM, draggable `Output` rule; `lct ps` shows VRAM. Done: 58 tests, screenshots at 90/120.
 - [x] **Jeeves backend.** `--backend jeeves` runs PostHog/jeeves on its own PyTorch venv; profiles, `lct up/down/ps` and the TUI treat it like llama-server. Done: 64 tests, live fp8 run on the 7900 XTX.
+- [x] **Strata backend.** `--backend strata` starts a Strata run config (`strata-<model>.json`); profiles, `lct up/down/ps` and the TUI treat it like llama-server. Done: 68 tests, live `lct up/down strata-flash-next`.

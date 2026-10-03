@@ -23,12 +23,13 @@ from llamacpp_tuner.downloader import (
 )
 from llamacpp_tuner.jeeves import install_jeeves, run_jeeves
 from llamacpp_tuner.llama import install_llama, run_server
+from llamacpp_tuner.strata import run_strata
 
 BACKEND = click.option(
     "--backend",
-    type=click.Choice(["llama", "jeeves"]),
+    type=click.Choice(["llama", "jeeves", "strata"]),
     default="llama",
-    help="llama.cpp, or Jeeves's own PyTorch server",
+    help="llama.cpp, Jeeves's own PyTorch server, or Strata",
 )
 
 
@@ -136,6 +137,8 @@ def setup(
 ) -> None:
     """Find llama-server or build llama.cpp from source, or install Jeeves."""
     try:
+        if backend == "strata":
+            raise click.UsageError("Strata installs with its own ./setup.sh.")
         if backend == "jeeves":
             click.echo(f"Jeeves: {install_jeeves(torch_index, force=force)}")
         else:
@@ -241,7 +244,8 @@ def serve(
 
     MODEL is a GGUF path, a downloaded repository, or an alias from aliases.toml.
     With --backend jeeves, --ctx is Jeeves's --max-len and --extra-args go to
-    its server.
+    its server. With --backend strata, MODEL is the strata-<model>.json its setup
+    wrote; context and files live in that config.
     """
     if quant and filename:
         raise click.UsageError("--quant and --file cannot be combined.")
@@ -265,6 +269,21 @@ def serve(
                 if value is not None:
                     jeeves_args.extend([flag, str(value)])
             run_jeeves(jeeves_args + shlex.split(extra_args), env=environment)
+            return
+        if backend == "strata":
+            if quant or filename or ctx or mmproj or no_mmproj or no_mmproj_offload:
+                raise click.UsageError(
+                    "Strata's model, context and projector are set in its run config."
+                )
+            strata_args = []
+            for flag, value in (("--host", host), ("--port", port)):
+                if value is not None:
+                    strata_args.extend([flag, str(value)])
+            run_strata(
+                Path(model).expanduser(),
+                strata_args + shlex.split(extra_args),
+                env=environment,
+            )
             return
 
         model_path = resolve_model(model, quant=quant, filename=filename)

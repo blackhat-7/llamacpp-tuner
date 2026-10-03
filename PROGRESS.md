@@ -3,7 +3,7 @@
 Handoff note. Rewritten at the end of every session, never appended to. Cap 40 lines.
 Next task: `PLAN.md`. Rules: `AGENTS.md`.
 
-**Last session:** 2026-10-02
+**Last session:** 2026-10-03
 
 ## State
 
@@ -17,13 +17,12 @@ Next task: `PLAN.md`. Rules: `AGENTS.md`.
 - Consumers live in the `ai-harnesses` repo: `pi --local`, `claude-local` Haiku → side, code-review-graph embeddings → :6870.
 - Profile `jeeves` (PostHog/jeeves, `--backend jeeves`, fp8, 4096 ctx, 2 rows, :6871): 15 GB VRAM. 3 questions: 70 s thinking, 0.9 s without (Jeeves master + ROCm fix; the pre-#7 commit took 32 s). Cannot share the GPU with `swift-qwen`.
 - Profile `swarm` (Qwen3.6-35B-A3B UD-IQ4_NL on GPU, `-np 5`, `--ctx 327680` = 64k per agent, MTP, :6868 like `swift-qwen` so `pi --local` finds it) for parallel Pi agents. Loads: 23.0 GB VRAM, 171 MB GTT. One short reply: 183 t/s. 5-way speed unmeasured. Cannot share the GPU with `swift-qwen`.
-- The TUI profile list shows `N slots` (stopped or running) when the extra args set `-np`/`--parallel`.
-- Checks: `pytest` 66/66, ruff clean, pyright clean.
+- Profile `strata-flash-next` (`--backend strata`): Strata engine in `~/Documents/projects/Strata`, Flash-Next GSQ-RCO IQ3_S, 127.0.0.1:8080, in no stack. 50 GiB RAM, 20 GiB VRAM (config adds `--vram-reserve-mib 4000` and temp 1.0 sampling). Cannot share the GPU with `swift-qwen`.
+- Checks: `pytest` 68/68, ruff clean, pyright clean.
 
 ## Gotchas
 
 - **`test_enter_on_a_stack_starts_and_stops_all_of_it` is flaky** (~1 in 6 runs, also before the slots change). Rerun before blaming a change.
-
 - **Jeeves upstream does not run on ROCm.** `tmp/jeeves/src` is on branch `rocm-attention` of `blackhat-7/jeeves` (commit `267cff8`). Upstream takes PRs from collaborators only. `lct setup --backend jeeves --force` re-clones upstream and loses the fix.
 
 - **With `--kv-unified`, llama-server's default `--cache-idle-slots` clears idle slots on every new request.** Use `--no-cache-idle-slots` or two clients evict each other's cache.
@@ -37,4 +36,5 @@ Next task: `PLAN.md`. Rules: `AGENTS.md`.
 - **Slow downloads: first check for a VPN.** `HF_XET_FIXED_DOWNLOAD_CONCURRENCY=16` measured 13 MB/s on this Wi-Fi.
 - **Check `lct ps` and VRAM before any GPU fit test.** A second GPU model sees ~50 MiB free.
 - **Textual:** `OptionList` needs `text-wrap: nowrap`; never name an `App` method `run`; `_on_click` runs for every class in the MRO; workers are cancelled before `lct tui`'s `finally`.
+- **Aliases `flash-next` and `flash-next-mtp` point at the deleted Q4_K_XL** (removed for Strata's IQ3_S). They show as missing.
 - **Quantizer model cards describe quantization, not the model.** `repo_details` loads the base model's card first.

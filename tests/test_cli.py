@@ -298,6 +298,36 @@ def test_serve_jeeves_maps_common_args(tmp_path):
     assert bad.exit_code != 0 and "whole model directory" in bad.output
 
 
+def test_serve_strata_runs_its_config(tmp_path):
+    config = tmp_path / "strata-iq3_s.json"
+    with patch("llamacpp_tuner.cli.run_strata") as run_strata:
+        result = CliRunner().invoke(
+            main,
+            ["serve", str(config), "--backend", "strata", "--host", "100.64.0.1"]
+            + ["--port", "6868", "--extra-args", "--api-key k"],
+        )
+        bad = CliRunner().invoke(
+            main, ["serve", str(config), "--backend", "strata", "--ctx", "8192"]
+        )
+
+    assert result.exit_code == 0, result.output
+    assert run_strata.call_args.args == (
+        config,
+        ["--host", "100.64.0.1", "--port", "6868", "--api-key", "k"],
+    )
+    assert bad.exit_code != 0 and "run config" in bad.output
+
+
+def test_strata_needs_its_own_setup(tmp_path):
+    missing = CliRunner().invoke(
+        main, ["serve", str(tmp_path / "none.json"), "--backend", "strata"]
+    )
+    setup_result = CliRunner().invoke(main, ["setup", "--backend", "strata"])
+
+    assert missing.exit_code != 0 and "./setup.sh" in missing.output
+    assert setup_result.exit_code != 0 and "./setup.sh" in setup_result.output
+
+
 def test_pull_all_downloads_the_whole_repository():
     with patch(
         "llamacpp_tuner.cli.download_repository", return_value=Path("models/o%2Fr")
@@ -308,7 +338,11 @@ def test_pull_all_downloads_the_whole_repository():
     download.assert_called_once_with("o/r", force=False)
 
 
-def test_address_reads_llama_and_jeeves_lines():
+def test_address_reads_llama_jeeves_and_strata_lines():
     assert servers.address("main: server is listening on http://h:1") == "http://h:1"
     assert servers.address('{"serving": "http://h:2", "block": 4}') == "http://h:2"
+    strata = (
+        "ready: http://h:3/v1  (OpenAI: /v1/chat/completions, context 131072 tokens)"
+    )
+    assert servers.address(strata) == "http://h:3"
     assert servers.address("loading model") == ""

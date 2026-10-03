@@ -253,6 +253,9 @@ def profile(args: str) -> dict:
     try:
         if p["backend"] == "jeeves":
             model, mmproj = resolve_repository(p["model"]), None
+        elif p["backend"] == "strata":
+            model = Path(p["model"]).expanduser()
+            model, mmproj = (model if model.is_file() else None), None
         else:
             model = resolve_model(p["model"], quant=p["quant"], filename=p["filename"])
             mmproj = pick_projector(p["model"], p["mmproj"], p["no_mmproj"])
