@@ -23,7 +23,7 @@ Separate hard requirements from preferences. Quality usually beats speed: users 
 Search model hosts, official cards and runtime release notes. For each candidate verify the exact release, instruct/reasoning mode, dense vs MoE (total params = memory, active params = compute), file sizes, context, modalities, chat template and license.
 
 - A quantizer's model card describes the quant. Read the base model's card for capabilities.
-- Confirm the runtime supports the architecture on the user's backend (mainline llama.cpp, not a fork; Vulkan/HIP kernels exist). Unsupported arch = reject.
+- Confirm the runtime supports the architecture on the user's backend (mainline llama.cpp; Vulkan/HIP kernels exist). Unsupported arch = reject. Exception: a purpose-built engine the user already runs (Strata) made a 125B MoE usable that llama.cpp could not.
 - Names lie: a "Qwen3.8-9B-Distill" was a Qwen3.5-9B fine-tune; a rumored "Qwen3.8-35B-A3B" did not exist.
 - Do not transfer evidence from a nearby size or family member.
 
@@ -47,7 +47,10 @@ Lead with independent evidence, then label vendor numbers as vendor-reported:
 Report how divided the community is. Vendor tables have hidden looping, knowledge drops, broken MTP heads and tool-call failures ("benchmaxxed").
 
 - Agentic harness work needs tool-call validity and instruction following, not chat scores. Test in the real harness when in doubt.
-- Fine-tunes: require provenance and retention evidence. Abliterated/"uncensored" builds cost a little (MMLU −0.2, ARC −1.2 in one case) and have no agentic evals; "fewer thinking tokens" tunes can condense too hard for long tasks. Verify "uncensored" claims: some builds still refuse.
+- Count thinking volume, not only t/s: a local 27B at xhigh wrote ~12.7k output tokens per agent task (Claude 2–5k). Evals with tight wall-clock or turn limits then rank GPU speed, not ability; give local models room or report both.
+- An MoE that is fast but weaker loses on hard agent tasks (A3B 7% vs 27B 43% on the user's hard set). The user picked quality for the daily driver and kept fast/long-context models for side roles.
+- For tiny utility models (cleanup, classification), prompt format can matter more than the model: inline examples in the system prompt and tagged input beat few-shot chat turns by a wide margin.
+- Fine-tunes: require provenance and retention evidence. Abliterated/"uncensored" builds cost a little (MMLU −0.2, ARC −1.2 in one case) and have no agentic evals; "fewer thinking tokens" tunes can condense too hard for long tasks, yet one (Swift 1.5 Flash-Next IQ3_XXS) beat the base model's larger quant on the user's own agent eval (65% vs 58%). Judge each on the harness, not the claim. Verify "uncensored" claims: some builds still refuse.
 - Quant quality: Q4_K_M ≈ BF16 on agent benchmarks for a 27B; Q2 drops clearly. Prefer KLD studies over perplexity.
 
 ## 5. Recommend
@@ -61,4 +64,5 @@ When evidence cannot decide, propose 2–3 real tasks run on each model with the
 - Check the user's real bottleneck first. "Too many compactions" was fixed by more context on the same model, not a new model.
 - Spare system RAM rarely makes a VRAM-bound dense model faster. It is best used for the prompt cache, a CPU side model for background jobs, embeddings, and fast model swaps.
 - One GPU server slot shared by chat and background jobs (titles, memory reviews, a safety classifier) evicts the chat's prompt cache; plan a second slot or a CPU side model.
-- A CPU side model suits only short prompts: CPU prefill is ~90 t/s for an A3B, so a 20k-token prompt takes minutes.
+- A CPU side model suits only short prompts: CPU prefill is ~70–90 t/s for an A3B, so a 20k-token prompt takes minutes. A classifier on it was too slow (15–17 s per tool call); titles are fine.
+- A local model as a bulk LLM judge is usually too slow (27B ~16 t/s with thinking off on hundreds of cases); the user switched grading to Claude.

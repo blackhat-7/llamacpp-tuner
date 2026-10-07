@@ -3,20 +3,20 @@
 Handoff note. Rewritten at the end of every session, never appended to. Cap 40 lines.
 Next task: `PLAN.md`. Rules: `AGENTS.md`.
 
-**Last session:** 2026-10-03
+**Last session:** 2026-10-08 (skills updated from past sessions)
 
 ## State
 
 - `lct up/down/ps` run several servers detached. Stacks are a `[stacks]` table in `aliases.toml`. State is `servers/<name>.json` + `.log` in the cache dir; the old `server.json` is gone.
 - The TUI tracks many servers: stacks first (`enter` toggles the whole stack), each profile marked ◌ loading / ● ready with its RAM. Server log lines start with the profile name.
-- Stack `local-swarm` = `swarm` + `side` + `embed`; only one of the two stacks can run (both use :6868). Stack `local` in `tmp/aliases.toml` = `swift-qwen` (GPU, :6868) + `side` (Qwen3.6-35B-A3B UD-Q4_K_S on CPU, :6869, served as model `side`) + `embed` (Qwen3-Embedding-0.6B Q8_0 on CPU, :6870).
+- Stack `local-swarm` = `swarm` + `side` + `embed`; only one of the two stacks can run (both use :6868). Stack `local` in `tmp/aliases.toml` = `swift-qwen` (GPU, :6868) + `side` (Qwen3.6-35B-A3B UD-IQ4_NL on CPU, :6869, served as model `side`) + `embed` (Qwen3-Embedding-0.6B Q8_0 on CPU, :6870).
 - Stack `birbot` = profile `birbot-a3b` (for `../birbot`): Qwen3.6-35B-A3B UD-IQ4_NL + mmproj-F16, `-np 2`, `--ctx 294912` = 144k each, :6868, model id `local`. After an image: 23.1 GB VRAM, 342 MB GTT, ~1.4 GB card free. Drop to `--ctx 196608` if deep prompts spill.
 - Measured `side` on CPU: loads in 10 s, 20.5 GiB RAM, decode ~15 t/s, prefill ~91 t/s (3k prompt 33 s cold, 4 tokens when cached), a title in under 1 s.
 - `swift-qwen`: 112k, two slots, `-ub 512`, 4 GiB Vulkan suballocation blocks (`--env`). 1.7 GB VRAM free at start; decode ~119 t/s code, ~57 prose. Deep-prompt (>100k) prefill not re-measured yet. Pi's auto-mode classifier uses its second slot (~2.3 s a pass; 10–25 s on `side`).
 - Consumers live in the `ai-harnesses` repo: `pi --local`, `claude-local` Haiku → side, code-review-graph embeddings → :6870.
 - Profile `jeeves` (PostHog/jeeves, `--backend jeeves`, fp8, 4096 ctx, 2 rows, :6871): 15 GB VRAM. 3 questions: 70 s thinking, 0.9 s without (Jeeves master + ROCm fix; the pre-#7 commit took 32 s). Cannot share the GPU with `swift-qwen`.
 - Profile `swarm` (Qwen3.6-35B-A3B UD-IQ4_NL on GPU, `-np 5`, `--ctx 327680` = 64k per agent, MTP, :6868 like `swift-qwen` so `pi --local` finds it) for parallel Pi agents. Loads: 23.0 GB VRAM, 171 MB GTT. One short reply: 183 t/s. 5-way speed unmeasured. Cannot share the GPU with `swift-qwen`.
-- Profile `strata-flash-next` (`--backend strata`): Strata engine in `~/Documents/projects/Strata`, Flash-Next GSQ-RCO IQ3_S, 127.0.0.1:8080, in no stack. 50 GiB RAM, 20 GiB VRAM (config adds `--vram-reserve-mib 4000` and temp 1.0 sampling). Cannot share the GPU with `swift-qwen`.
+- Profile `strata-swift-flash-next` (`--backend strata`): Strata engine in `~/Documents/projects/Strata`, Swift 1.5 Flash-Next IQ3_XXS, 262k, :6868, in no stack. 45 GiB RAM, 20 GiB VRAM. Rerunning Strata's `setup.sh` resets `--vram-reserve-mib` and sampling. Cannot share the GPU with `swift-qwen`.
 - `lct setup` picks a prebuilt llama.cpp by GPU: `nvidia-smi` → CUDA 12.8 + bundled runtime, else Vulkan, macOS Metal; into `<cache>/llama.cpp/build/bin`, then prints `--list-devices`. Only `--cmake-arg` builds. Live: Vulkan 3 s; CUDA path simulated (fake `nvidia-smi`), 30 s, libs resolve; no real NVIDIA test yet.
 - Checks: `pytest` 74/74, ruff clean, pyright clean.
 

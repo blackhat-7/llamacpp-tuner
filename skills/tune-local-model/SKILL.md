@@ -12,7 +12,10 @@ Optimize for required quality, speed at realistic depth, context and concurrency
 - **No long GPU runs without asking.** This host crashed under sustained load (PSU). Short loads and sub-minute tests are fine; ask before multi-minute prefills or sweeps. Estimate a run's length from a short prefill first.
 - Before any fit test: `lct ps`, `ss -ltnp`, and VRAM. A resident server leaves a second model ~50 MiB.
 - Keep 10+ GB RAM free when launching from an agent session; an OOM kill can take the session with it.
-- Stop llama-server with SIGINT (`lct down`); SIGTERM was ignored for 120 s+.
+- Stop llama-server with SIGINT (`lct down`); SIGTERM was ignored for 120 s+. After `ErrorDeviceLost` it can hang holding VRAM: `kill -9`. Killing a wrapper (`uv`, `lct serve`) can orphan its child; check `ps`.
+- `setsid` does not escape systemd's OOM group kill: a server OOM can take the agent session down.
+- Read the host reference before suggesting any lever. Do not repeat generic community claims it already disproves (f16 KV faster, ROCm 2× prefill, `-b 4096`).
+- Run short measurements yourself rather than asking the user to paste output; the user's past loop was paste command → ask for faster → paste result.
 
 ## 1. Fix the target
 
@@ -30,6 +33,8 @@ Weights + KV (attention layers × KV heads × head dim × 2 × bytes, per token)
 - `-ngl all` disables the auto-fitter; a tight config just OOMs or spills.
 - **Check spill per process**: `drm-memory-gtt` in `/proc/<llama-server pid>/fdinfo/*` is GPU memory living in system RAM. A spill of 1+ GB plus a deep prompt caused GPU watchdog resets (`vk::Queue::submit: ErrorDeviceLost`) twice.
 - Always pass `-np` explicitly (default is auto, e.g. 4 slots).
+- Size weights from the GGUF tensor list, not from model cards or forum posts. Other resident servers count against RAM as well as VRAM: an evicted expert set rereads from SSD.
+- Prompt-cache entries are big (~2 GB for 35k tokens on a 27B); `--cache-ram` holds only a few conversations and adds to RSS.
 
 ## 4. Baseline, then one change at a time
 
@@ -43,11 +48,13 @@ llama-bench -m M -p 0 -n 128 -d DEPTH -r 3 [ARGS] # decode at realistic depth, o
 Order of levers, biggest first (details and numbers in the reference):
 
 1. **Platform**: Resizable BAR on (16 → 67 t/s once); newest llama.cpp build (+5–16% prefill); backend A/B (Vulkan vs HIP differ per model: measure decode *and* prefill at depth).
-2. **Speculative decoding**: built-in MTP (`--spec-type draft-mtp --spec-draft-n-max 3–4`) is the largest decode win on models that ship it; verify acceptance in the server log. N-gram drafting helps only copy-heavy edits and can hurt when MTP already accepts ~all drafts — A/B it.
+2. **Speculative decoding**: built-in MTP (`--spec-type draft-mtp --spec-draft-n-max 3–4`) is the largest decode win on models that ship it; verify acceptance in the server log. N-gram drafting helps only copy-heavy edits: it hurt a 27B whose MTP already accepted ~all drafts, but helped a slow offloaded MoE (16 → 20 t/s) — A/B it.
 3. **KV type**: backend fast paths can require matching K/V types (Vulkan FA: both q8_0; q5_1 V or f16 was slower at depth).
-4. **Batches**: sweep `-b/-ub` pairs separately on a bounded prompt; stop at the plateau. Large ubatch helps prefill (MoE offload most) but grows the compute buffer and the longest GPU job — keep `-ub 512–1024` at long context on Vulkan.
+4. **Batches**: sweep `-b/-ub` pairs separately on a bounded prompt; stop at the plateau. `-ub` is silently capped at `-b` (default 2048), so raise both. Large ubatch helps prefill (MoE offload most) but grows the compute buffer and the longest GPU job — keep `-ub 512–1024` at long context on Vulkan.
 5. **Threads (CPU/offload only)**: pin to P-cores (`-t 12 -C 0xfff` on 6P+8E); E-cores hurt decode; `--poll 100` helped offload decode.
-6. **MoE offload**: `-ngl 999 -ncmoe N` (each layer ≈ 1.5 GB VRAM ↔ 1.6 GB RAM); `-lm none` needs `--no-host`; `-lm mmap` is much slower.
+6. **MoE offload**: `-ngl 999 -ncmoe N` (each layer ≈ 1.5 GB VRAM ↔ 1.6 GB RAM); `-lm none` needs `--no-host` (pinned host memory is capped at ~half of RAM); `-lm mmap` is much slower. A purpose-built engine (Strata) beat llama.cpp ~3× decode and ~40× prefill on one big MoE; check for one.
+
+The first request after a load is not a measurement: lazy-loaded tensors (`-lzm auto`) stream from disk.
 
 ## 5. Deployment checks in the real server
 
@@ -56,8 +63,16 @@ Order of levers, biggest first (details and numbers in the reference):
   - Hybrid (recurrent) models cannot trim state: reuse needs an exact prefix up to a checkpoint. `--cache-reuse` is auto-disabled for them and with a projector — drop it. `-cms 2048` bounds rollback after an interrupted reply.
   - `--cache-ram N` keeps prompts in RAM; too small → rereads, too big → OOM with large offloaded models.
   - **Two clients** (chat + classifier/titles): `-np 2 --kv-unified --no-cache-idle-slots`. Without the last flag, every new request clears idle slots and the chat rereads its whole prompt.
-  - Client-side prompt changes (dates, tool lists toggled) defeat caching; check the harness.
-- **Vision**: measure VRAM after the first image, not at startup.
+  - Client-side prompt changes (dates, tool lists toggled) defeat caching; check the harness. Background requests (titles, autoname) default to the session model in some harnesses and evict its cache.
+  - Cache save/restore lines only print at `-lv 4`.
+- **Vision**: measure VRAM after the first image, not at startup. Without `--mmproj`, image requests return HTTP 500 and the model learns from its history that it "cannot see"; keep the projector when swapping models behind a port a vision client uses.
+- **Client contract** (read the client's config, then check `/props` and `/slots`):
+  - Its context and compaction budget must sit below the server's per-slot context (OpenClaw budgets ≈ n_ctx − 20k; Pi compacts at ctx − 16k). An agent compacting every turn loops.
+  - Thinking needs `max_tokens` ≈ 32k; at 4k, half the turns ended mid-thought.
+  - Effort levels are template-specific: read `/props` → `chat_template`. Some templates only have on/off; some ignore `low` and think in full. `--reasoning-budget N` is the only hard cap; `reasoning_effort` just adds a sentence.
+  - Clients in containers or on other hosts need `--host 0.0.0.0`. `-a NAME` gives every model the same id.
+  - When a harness stalls, repeat the call against a cloud model before blaming the server.
+  - Test fallback chains (local → cloud) in both modes; a local-first fallback once broke every cloud session.
 - **Soak**: a few real multi-turn sessions; watch GTT spill, RAM, temperature and the kernel log (`journalctl -k | grep amdgpu`).
 
 ## 6. Report
