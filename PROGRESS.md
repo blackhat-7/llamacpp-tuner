@@ -3,7 +3,7 @@
 Handoff note. Rewritten at the end of every session, never appended to. Cap 40 lines.
 Next task: `PLAN.md`. Rules: `AGENTS.md`.
 
-**Last session:** 2026-10-10 (27B speed: research, then DFlash2 measured and adopted; `docs/qwen27b-speed-research.md`)
+**Last session:** 2026-10-11 (Flash-Next IQ3_S vs IQ3_XXS on real past tasks: a tie on quality, IQ3_XXS kept; harness in `tmp/ab-eval`)
 
 ## State
 
@@ -24,7 +24,7 @@ Next task: `PLAN.md`. Rules: `AGENTS.md`.
 
 - **A 5-token verify pass costs only 1.13× one decode step here (llama-bench, 24.3 vs 27.4 ms).** Speculation overhead is elsewhere: ~11 ms per DFlash2 cycle.
 - **Vulkan FA hides a scratch buffer.** With q8_0 K and V it dequantizes one layer's K+V to f16 (4 KiB per context token, ~1 GiB at 262k), not in the projected-VRAM line (`ggml-vulkan.cpp:8034`). Budget for it.
-- **TUI tests flake under load** (`test_enter_on_a_stack…`, `test_a_click_only…`; seen at load average 20). Rerun before blaming a change.
+- **TUI tests flake under load** (`test_enter_on_a_stack…`, `test_a_click_only…`, `test_enter_starts_and_stops…`; seen at load average 8–20). Rerun before blaming a change.
 - **Jeeves upstream does not run on ROCm.** `tmp/jeeves/src` is on branch `rocm-attention` of `blackhat-7/jeeves` (commit `267cff8`). Upstream takes PRs from collaborators only. `lct setup --backend jeeves --force` re-clones upstream and loses the fix.
 - **With `--kv-unified`, llama-server's default `--cache-idle-slots` clears idle slots on every new request.** Use `--no-cache-idle-slots` or two clients evict each other's cache.
 - **Check per-process spill, not just card VRAM.** `drm-memory-gtt` in `/proc/<llama-server pid>/fdinfo/*` is GPU memory living in system RAM. Large spill + deep prompt = GPU watchdog reset (`ErrorDeviceLost`). Check `lct ps` first: a second GPU model sees ~50 MiB free.
