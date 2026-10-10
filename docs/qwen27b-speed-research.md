@@ -3,6 +3,27 @@
 Research of 2026-10-10. Web sources, Strata's code and llama.cpp's source; nothing was run on the GPU.
 Numbers marked *est.* are arithmetic, not measurements. "Vendor" means the author's own claim.
 
+## Measured on this box (2026-10-10)
+
+Swift-Qwen3.8-27B Q4_K_S, Vulkan, `swift-qwen` flags, temp 1.0, 5 prompts × 2 seeds. Greedy output was identical
+in every config, so all are lossless.
+
+| Config | Prose | Code | Prose, thinking on | Code, thinking on |
+|---|---|---|---|---|
+| No speculation | 40.3 | 40.1 | — | — |
+| MTP n 4 (old profile) | 57.9 | 104.4 | 72.5 | 77.0 |
+| MTP n 2 | 61.6 | 84.1 | — | — |
+| DFlash2 n 4 | 63.3 | 115.8 | 83.3 | 87.2 |
+| **DFlash2 n 5 (adopted)** | 59.8 | 129.0 | 82.2 | 91.9 |
+| DFlash2 n 7 | 51.6 | 134.0 | — | — |
+| DSpark v2 n 4 | 42.8 | 84.3 | — | — |
+
+- No gain: llama.cpp master `aa94f208` vs `a894dae9`, PR #25666, `--spec-draft-p-min`, n-gram ahead of DFlash2.
+- Verify cost (llama-bench, batch of n tokens / 1 token): 2 → 1.04×, 4 → 1.14×, 5 → 1.13×, 8 → 1.31×, 16 → 3.88×.
+  So verification is cheap; a DFlash2 cycle spends ~11 ms more on drafting, sampling and state. That overhead,
+  not the verify kernel, is what a dedicated engine would have to cut (est. ~1.4–1.7× over today if it did).
+- DFlash2 costs ~1.1 GB more VRAM than MTP: `swift-qwen` dropped from 112k to 96k.
+
 ## Rule: quality must not drop
 
 Allowed: speculative decoding (the full model checks every token, so output quality is unchanged), faster kernels,

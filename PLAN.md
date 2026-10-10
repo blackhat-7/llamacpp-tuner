@@ -24,7 +24,8 @@ Each line carries its own done-check. A task too big for one session gets split 
 - [x] **Strata backend.** `--backend strata` starts a Strata run config (`strata-<model>.json`); profiles, `lct up/down/ps` and the TUI treat it like llama-server. Done: 68 tests, live `lct up/down strata-flash-next`.
 - [x] **Setup without a compiler.** `lct setup` downloads a prebuilt llama.cpp release (Vulkan; Metal on macOS) and checks it runs; source build only for `nvcc` or `--cmake-arg`. Done: 73 tests, fresh `LCT_HOME` install in 3 s finds the GPU, README install steps.
 - [x] **Pick the build by GPU.** `nvidia-smi` → prebuilt CUDA 12.8 + bundled runtime; else Vulkan; macOS Metal; `lct setup` lists the devices it found. Done: 74 tests, live Vulkan, simulated CUDA. A real NVIDIA run is still owed.
-- [ ] **MTP n-max sweep on prose.** `swift-qwen` with `--spec-draft-n-max` 2, 3, 4; short replies, `--metrics` for acceptance. Done when the best n is in the profile and `PROGRESS.md`. Why: `docs/qwen27b-speed-research.md` §1.
-- [ ] **Vulkan PR #25666 build.** Build it beside the current one; compare MTP acceptance and prose t/s. Done when the verdict is in `DECISIONS.md`.
+- [x] **MTP n-max sweep on prose.** `swift-qwen` with `--spec-draft-n-max` 2, 3, 4; short replies, `--metrics` for acceptance. Done when the best n is in the profile and `PROGRESS.md`. Done: n2 best on prose (61.6), n4 on code; DFlash2 beat both.
+- [x] **Vulkan PR #25666 build.** Build it beside the current one; compare MTP acceptance and prose t/s. Done: no gain on the 7900 XTX.
 - [ ] **Longest lossless context.** Q4_K_S + q8_0 KV, text-only, FA scratch budgeted (~170k est., `docs/qwen27b-speed-research.md` §4). Done when a deep prompt runs with no GTT spill and the ctx is in the profile.
-- [ ] **DFlash2 code profile.** `incoai/Qwen3.8-27B-DFlash2-GGUF` with `--spec-type draft-dflash`, n 4–5, vs MTP on code and prose. Done when both numbers are in `PROGRESS.md`.
+- [x] **DFlash2 code profile.** `incoai/Qwen3.8-27B-DFlash2-GGUF` with `--spec-type draft-dflash`, n 4–5, vs MTP on code and prose. Done: n5 adopted in `swift-qwen` at 96k.
+- [ ] **Profile the speculation cycle.** A 5-token verify costs 1.13× one step, but a DFlash2 cycle adds ~11 ms more (drafter, sampling, DeltaNet state). Done when that 11 ms is broken down per part, to decide if an engine or llama.cpp patch is worth it.

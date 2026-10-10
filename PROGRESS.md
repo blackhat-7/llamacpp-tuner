@@ -3,7 +3,7 @@
 Handoff note. Rewritten at the end of every session, never appended to. Cap 40 lines.
 Next task: `PLAN.md`. Rules: `AGENTS.md`.
 
-**Last session:** 2026-10-10 (speed and context research for the 27B: `docs/qwen27b-speed-research.md`)
+**Last session:** 2026-10-10 (27B speed: research, then DFlash2 measured and adopted; `docs/qwen27b-speed-research.md`)
 
 ## State
 
@@ -12,7 +12,7 @@ Next task: `PLAN.md`. Rules: `AGENTS.md`.
 - Stack `local-swarm` = `swarm` + `side` + `embed`; only one of the two stacks can run (both use :6868). Stack `local` in `tmp/aliases.toml` = `swift-qwen` (GPU, :6868) + `side` (Qwen3.6-35B-A3B UD-IQ4_NL on CPU, :6869, served as model `side`) + `embed` (Qwen3-Embedding-0.6B Q8_0 on CPU, :6870).
 - Stack `birbot` = profile `birbot-a3b` (for `../birbot`): Qwen3.6-35B-A3B UD-IQ4_NL + mmproj-F16, `-np 2`, `--ctx 294912` = 144k each, :6868, model id `local`. After an image: 23.1 GB VRAM, 342 MB GTT, ~1.4 GB card free. Drop to `--ctx 196608` if deep prompts spill.
 - Measured `side` on CPU: loads in 10 s, 20.5 GiB RAM, decode ~15 t/s, prefill ~91 t/s (3k prompt 33 s cold, 4 tokens when cached), a title in under 1 s.
-- `swift-qwen`: 112k, two slots, `-ub 512`, 4 GiB Vulkan suballocation blocks (`--env`). 1.7 GB VRAM free at start; decode ~119 t/s code, ~57 prose. Deep-prompt (>100k) prefill not re-measured yet. Pi's auto-mode classifier uses its second slot (~2.3 s a pass; 10–25 s on `side`).
+- `swift-qwen`: DFlash2 drafter (`incoai/Qwen3.8-27B-DFlash2-GGUF` Q4_K_M, `--spec-type draft-dflash --spec-draft-n-max 5`), 96k, two slots, `-ub 512`, 4 GiB Vulkan blocks. Thinking on: 82 t/s prose / 92 code (MTP n4 was 72.5 / 77). After an image 0.85 GB free; ~0.35 GB at full depth (est.). Managed llama.cpp is now `aa94f208`.
 - Consumers live in the `ai-harnesses` repo: `pi --local`, `claude-local` Haiku → side, code-review-graph embeddings → :6870.
 - Profile `jeeves` (PostHog/jeeves, `--backend jeeves`, fp8, 4096 ctx, 2 rows, :6871): 15 GB VRAM. 3 questions: 70 s thinking, 0.9 s without (Jeeves master + ROCm fix; the pre-#7 commit took 32 s). Cannot share the GPU with `swift-qwen`.
 - Profile `swarm` (Qwen3.6-35B-A3B UD-IQ4_NL on GPU, `-np 5`, `--ctx 327680` = 64k per agent, MTP, :6868 like `swift-qwen` so `pi --local` finds it) for parallel Pi agents. Loads: 23.0 GB VRAM, 171 MB GTT. One short reply: 183 t/s. 5-way speed unmeasured. Cannot share the GPU with `swift-qwen`.
@@ -22,8 +22,8 @@ Next task: `PLAN.md`. Rules: `AGENTS.md`.
 
 ## Gotchas
 
+- **A 5-token verify pass costs only 1.13× one decode step here (llama-bench, 24.3 vs 27.4 ms).** Speculation overhead is elsewhere: ~11 ms per DFlash2 cycle.
 - **Vulkan FA hides a scratch buffer.** With q8_0 K and V it dequantizes one layer's K+V to f16 (4 KiB per context token, ~1 GiB at 262k), not in the projected-VRAM line (`ggml-vulkan.cpp:8034`). Budget for it.
-
 - **TUI tests flake under load** (`test_enter_on_a_stack…`, `test_a_click_only…`; seen at load average 20). Rerun before blaming a change.
 - **Jeeves upstream does not run on ROCm.** `tmp/jeeves/src` is on branch `rocm-attention` of `blackhat-7/jeeves` (commit `267cff8`). Upstream takes PRs from collaborators only. `lct setup --backend jeeves --force` re-clones upstream and loses the fix.
 - **With `--kv-unified`, llama-server's default `--cache-idle-slots` clears idle slots on every new request.** Use `--no-cache-idle-slots` or two clients evict each other's cache.
@@ -33,9 +33,8 @@ Next task: `PLAN.md`. Rules: `AGENTS.md`.
 - **sysfs `mem_info_vram_used` under-reports at startup** (lazy commit). Trust llama.cpp's `projected to use N MiB` line or the sum of its `buffer size` lines.
 - **MTP draft KV cache defaults to f16** unless `-ctkd q8_0 -ctvd q8_0` is passed.
 - **A plain SIGTERM to `llama-server` did not stop it within 120 s; SIGINT did.** `lct down` sends SIGINT to the group.
-- **The projector loads lazily.** It adds up to ~1.16 GB when the first image arrives, not at startup.
+- **The projector takes ~1.1 GB at startup and ~0.3 GB more on the first image** (build `aa94f208`; older builds loaded it lazily).
 - **Slow downloads: first check for a VPN.** `HF_XET_FIXED_DOWNLOAD_CONCURRENCY=16` measured 13 MB/s on this Wi-Fi.
 - **`lct setup --force` without `--cmake-arg` replaces this box's source build with the prebuilt one.** Rebuild a pinned source build with `--cmake-arg=-DGGML_VULKAN=ON`.
 - **Textual:** `OptionList` needs `text-wrap: nowrap`; never name an `App` method `run`; `_on_click` runs for every class in the MRO; workers are cancelled before `lct tui`'s `finally`.
-- **Aliases `flash-next` and `flash-next-mtp` point at the deleted Q4_K_XL** (removed for Strata's IQ3_S). They show as missing.
 - **Quantizer model cards describe quantization, not the model.** `repo_details` loads the base model's card first.
