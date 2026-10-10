@@ -3,7 +3,7 @@
 Handoff note. Rewritten at the end of every session, never appended to. Cap 40 lines.
 Next task: `PLAN.md`. Rules: `AGENTS.md`.
 
-**Last session:** 2026-10-08 (skills updated from past sessions)
+**Last session:** 2026-10-10 (speed and context research for the 27B: `docs/qwen27b-speed-research.md`)
 
 ## State
 
@@ -22,10 +22,12 @@ Next task: `PLAN.md`. Rules: `AGENTS.md`.
 
 ## Gotchas
 
+- **Vulkan FA hides a scratch buffer.** With q8_0 K and V it dequantizes one layer's K+V to f16 (4 KiB per context token, ~1 GiB at 262k), not in the projected-VRAM line (`ggml-vulkan.cpp:8034`). Budget for it.
+
 - **TUI tests flake under load** (`test_enter_on_a_stack…`, `test_a_click_only…`; seen at load average 20). Rerun before blaming a change.
 - **Jeeves upstream does not run on ROCm.** `tmp/jeeves/src` is on branch `rocm-attention` of `blackhat-7/jeeves` (commit `267cff8`). Upstream takes PRs from collaborators only. `lct setup --backend jeeves --force` re-clones upstream and loses the fix.
 - **With `--kv-unified`, llama-server's default `--cache-idle-slots` clears idle slots on every new request.** Use `--no-cache-idle-slots` or two clients evict each other's cache.
-- **Check per-process spill, not just card VRAM.** `drm-memory-gtt` in `/proc/<llama-server pid>/fdinfo/*` is GPU memory living in system RAM. Large spill + deep prompt = GPU watchdog reset (`ErrorDeviceLost`).
+- **Check per-process spill, not just card VRAM.** `drm-memory-gtt` in `/proc/<llama-server pid>/fdinfo/*` is GPU memory living in system RAM. Large spill + deep prompt = GPU watchdog reset (`ErrorDeviceLost`). Check `lct ps` first: a second GPU model sees ~50 MiB free.
 - **One GPU slot: any background request evicts the chat's prompt cache.** A 957-token title request forced a 22 s re-read of an 18k prompt. Keep background jobs on `side`.
 - **RAM is BIOS-limited to DDR5-4800;** the kit is rated 5200 (XMP off). CPU decode is bandwidth-bound (~57 GB/s measured).
 - **sysfs `mem_info_vram_used` under-reports at startup** (lazy commit). Trust llama.cpp's `projected to use N MiB` line or the sum of its `buffer size` lines.
@@ -33,7 +35,6 @@ Next task: `PLAN.md`. Rules: `AGENTS.md`.
 - **A plain SIGTERM to `llama-server` did not stop it within 120 s; SIGINT did.** `lct down` sends SIGINT to the group.
 - **The projector loads lazily.** It adds up to ~1.16 GB when the first image arrives, not at startup.
 - **Slow downloads: first check for a VPN.** `HF_XET_FIXED_DOWNLOAD_CONCURRENCY=16` measured 13 MB/s on this Wi-Fi.
-- **Check `lct ps` and VRAM before any GPU fit test.** A second GPU model sees ~50 MiB free.
 - **`lct setup --force` without `--cmake-arg` replaces this box's source build with the prebuilt one.** Rebuild a pinned source build with `--cmake-arg=-DGGML_VULKAN=ON`.
 - **Textual:** `OptionList` needs `text-wrap: nowrap`; never name an `App` method `run`; `_on_click` runs for every class in the MRO; workers are cancelled before `lct tui`'s `finally`.
 - **Aliases `flash-next` and `flash-next-mtp` point at the deleted Q4_K_XL** (removed for Strata's IQ3_S). They show as missing.
