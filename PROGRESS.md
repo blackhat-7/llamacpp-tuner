@@ -3,19 +3,19 @@
 Handoff note. Rewritten at the end of every session, never appended to. Cap 40 lines.
 Next task: `PLAN.md`. Rules: `AGENTS.md`.
 
-**Last session:** 2026-10-13 (Strata decode 2x work, paused mid-way: Swift expert profile, 0.1.43 switches and 13 workers measured; six engine levers in flight; resume from `tmp/strata-opt/RESUME.md`)
+**Last session:** 2026-10-13 (Strata 0.1.43 + Swift expert profile + 13 workers + `STRATA_ADAPT_LAG=2` adopted: live code 92 -> 110 t/s, edit 78 -> 96, prose 76 -> 81; engine 2x work paused, resume from `tmp/strata-opt/RESUME.md`)
 
 ## State
 
 - `lct up/down/ps` run several servers detached. Stacks are a `[stacks]` table in `aliases.toml`. State is `servers/<name>.json` + `.log` in the cache dir.
 - Stack `local` in `tmp/aliases.toml` = `swift-qwen` (GPU, :6868) + `side` (Qwen3.6-35B-A3B UD-IQ4_NL on CPU, :6869) + `embed` (Qwen3-Embedding-0.6B, :6870). `local-swarm` = `swarm` + `side` + `embed`; only one of the two can run.
 - `swift-qwen`: Swift-Qwen3.8-27B Q4_K_S + DFlash2 n5, 96k, two slots: 82 t/s prose / 92 code (thinking on). Managed llama.cpp `aa94f208`.
-- Profile `strata-swift-flash-next` (`--backend strata`): Swift 1.5 Flash-Next IQ3_XXS on Strata, 262k, :6868, in no stack. **Now points at the tuned config** (2026-10-12, user approved); reserve still 4000. Skill reference `host-7900xtx.md` updated with the tuned config, IQ3_S sizes, the power limit and the GLM-5.3-Flash estimate.
-- **Tuned config:** `~/Documents/projects/Strata/strata-swift-iq3_xxs-tuned.json` adds `--pcie-frac 0.35 --pcie-mode dma --ple-io ram --pool-workers 6`, the hipBLASLt 100202 table, fused prompt kernels, coupled drafts, and the patched ROCr in `lib_dirs`. A/B: 35k prompt 854 → 1,848 t/s; decode +3–8% (+13–15% with `--vram-reserve-mib 1500`, the user's call: the desktop runs on this GPU).
+- Profile `strata-swift-flash-next` (`--backend strata`, stack `local-flash`): Swift 1.5 Flash-Next IQ3_XXS on Strata 0.1.43, 262k, :6868, config `strata-swift-iq3_xxs-tuned.json` (reserve 4000).
+- Tuned config adds `--pcie-frac 0.35 --pcie-mode dma --ple-io ram`, the Swift expert profile `~/Documents/projects/Strata-data/profiles/swift-1.5-iq3_xxs.bin`, the hipBLASLt 100202 table, fused prompt kernels, coupled drafts, `STRATA_ADAPT_LAG=2`, the env node cuts and the patched ROCr. Prompts 2.2x (35k: 854 -> 1,848 t/s).
 - Patched ROCr: `~/rocm/rocr-7.2.4-fix` (one line in `amd_blit_sdma.h`); patch, reproducer, rebuild script and an upstream issue draft in `tmp/strata-tuning/rocr-fix/`. Not filed yet.
 - ROCm 7.14.1 SDK (TheRock) in `~/rocm/therock-7.14.1` with `rocprofv3`; Strata build `build-rocm714` (prompt −21%, unused).
 - Profiles `swarm`, `birbot-a3b`, `jeeves`, `side` unchanged; see `skills/tune-local-model/references/host-7900xtx.md`.
-- Decode work (lossless, measured): Swift expert profile code 75.9 -> 103.9 t/s cold; 0.1.43 fusion switches +4%; 13 workers +10% code / +18% edit under the 75 W cap (CPU max 83 C). Server mode now ~113 code / 99 edit / 83 prose t/s.
+- Decode now (live, greedy / temp 1.0): code 109.6 / 99.2, edit 96.1 / 92.8, prose 81.1 / 78.4 t/s (was 92.0 / 85.2, 78.4 / 79.3, 76.0 / 71.6). CPU max 83 C at 13 workers under the 75 W cap.
 - Checks: `pytest` 74/74, ruff clean, pyright clean.
 
 ## Gotchas

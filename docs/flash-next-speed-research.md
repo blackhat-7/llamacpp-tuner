@@ -128,6 +128,33 @@ Ranked by expected gain *est.*; each needs bitwise parity checks.
   on 7.3 busy cores; `--pool-workers 9`: 119.2 on 10.1. A shorter spin (`STRATA_POOL_SPIN_US=200`) costs −22%.
   Use 6 workers for unattended runs.
 
+## Round 2 (2026-10-13): decode
+
+Four lossless changes, now in `strata-swift-iq3_xxs-tuned.json` (backup of the earlier file:
+`~/Documents/projects/Strata-data/strata-swift-iq3_xxs-tuned.json.before-2026-10-13`):
+
+| Change | Why | Measured |
+|---|---|---|
+| Strata 0.1.43 (`./setup.py --update` after a fast-forward to `7695859a`) | adds gfx12 node cuts that gfx1100 can force on; fixes an RX 7000 crash on a text prompt after an image (#1712) | same tokens as 0.1.42 |
+| env `STRATA_FUSE_WAIT=1 STRATA_FUSE_HITS=1 STRATA_QFUSE_HC=1 STRATA_GR_NORM_FAST=1` | fewer graph nodes per layer | code +4%, bit-exact |
+| `--expert-profile ~/Documents/projects/Strata-data/profiles/swift-1.5-iq3_xxs.bin` | the shipped ranking is the base model's: it held 51% of Swift's routed experts | 18 Swift routing traces (`tmp/strata-opt/corpus`), `tools/make_profile_mix.py`: held-out hits 51 -> 68% (code); code 75.9 -> 103.9 t/s cold |
+| default 13 pool workers (was 6) | the 75/125 W CPU cap now limits heat; 6 workers left the CPU tier slow | code +10%, edit +18%; CPU max 83 C over a minute of decode |
+| env `STRATA_ADAPT_LAG=2` | the adaptive tier's swap copies stalled every 4th window; with the new profile prose fell to 65 t/s | prose 67 -> 81 t/s greedy; code and edit up too |
+
+Live server after a fresh start (`tmp/strata-tuning/bench.py`, 400-token replies, after one warm-up round), against
+the same prompts on the original config:
+
+| Prompt | Original: greedy / temp 1.0 | Now: greedy / temp 1.0 |
+|---|---|---|
+| code | 92.0 / 85.2 | 109.6 / 99.2 (+19% / +16%) |
+| edit | 78.4 / 79.3 | 96.1 / 92.8 (+23% / +17%) |
+| prose | 76.0 / 71.6 | 81.1 / 78.4 (+7% / +9%) |
+
+Engine work toward 2x is paused mid-way: six levers (dense GEMVs, small serial kernels, hyper-connection reads,
+CPU pool parking, MTP draft chain, long-context top-k) in worktrees `~/Documents/projects/Strata-wt/*`; the router top-10
+rewrite is done and bit-exact. Harness, references and resume steps: `tmp/strata-opt/RESUME.md`; analysis:
+`tmp/strata-opt/audits/` (both gitignored).
+
 ## Headline
 
 Interleaved A/B, 2 rounds, a fresh server per arm (`tmp/strata-tuning/final_ab.sh`): 12 replies at temp 1.0,
