@@ -3,7 +3,7 @@
 Handoff note. Rewritten at the end of every session, never appended to. Cap 40 lines.
 Next task: `PLAN.md`. Rules: `AGENTS.md`.
 
-**Last session:** 2026-10-12 (better model? none fits; Strata tuned for this box; the "~1 in 90" Strata crash traced to a ROCm bug and patched; `docs/flash-next-speed-research.md`)
+**Last session:** 2026-10-13 (Strata decode 2x work, paused mid-way: Swift expert profile, 0.1.43 switches and 13 workers measured; six engine levers in flight; resume from `tmp/strata-opt/RESUME.md`)
 
 ## State
 
@@ -15,7 +15,7 @@ Next task: `PLAN.md`. Rules: `AGENTS.md`.
 - Patched ROCr: `~/rocm/rocr-7.2.4-fix` (one line in `amd_blit_sdma.h`); patch, reproducer, rebuild script and an upstream issue draft in `tmp/strata-tuning/rocr-fix/`. Not filed yet.
 - ROCm 7.14.1 SDK (TheRock) in `~/rocm/therock-7.14.1` with `rocprofv3`; Strata build `build-rocm714` (prompt −21%, unused).
 - Profiles `swarm`, `birbot-a3b`, `jeeves`, `side` unchanged; see `skills/tune-local-model/references/host-7900xtx.md`.
-- The 8-task replay was stopped by its 97 °C guard (CPU 99 °C). Fix: system-manager service `cpuPowerLimit` (PL1 75 W, PL2 125 W) in `~/dotfiles/nix/linux/default.nix`; active after `just switch` there.
+- Decode work (lossless, measured): Swift expert profile code 75.9 -> 103.9 t/s cold; 0.1.43 fusion switches +4%; 13 workers +10% code / +18% edit under the 75 W cap (CPU max 83 C). Server mode now ~113 code / 99 edit / 83 prose t/s.
 - Checks: `pytest` 74/74, ruff clean, pyright clean.
 
 ## Gotchas
