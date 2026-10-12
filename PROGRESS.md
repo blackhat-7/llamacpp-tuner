@@ -10,12 +10,12 @@ Next task: `PLAN.md`. Rules: `AGENTS.md`.
 - `lct up/down/ps` run several servers detached. Stacks are a `[stacks]` table in `aliases.toml`. State is `servers/<name>.json` + `.log` in the cache dir.
 - Stack `local` in `tmp/aliases.toml` = `swift-qwen` (GPU, :6868) + `side` (Qwen3.6-35B-A3B UD-IQ4_NL on CPU, :6869) + `embed` (Qwen3-Embedding-0.6B, :6870). `local-swarm` = `swarm` + `side` + `embed`; only one of the two can run.
 - `swift-qwen`: Swift-Qwen3.8-27B Q4_K_S + DFlash2 n5, 96k, two slots: 82 t/s prose / 92 code (thinking on). Managed llama.cpp `aa94f208`.
-- Profile `strata-swift-flash-next` (`--backend strata`): Swift 1.5 Flash-Next IQ3_XXS on Strata, 262k, :6868, in no stack. Still points at the untouched `strata-swift-iq3_xxs.json`.
-- **Tuned config, not yet adopted:** `~/Documents/projects/Strata/strata-swift-iq3_xxs-tuned.json` adds `--pcie-frac 0.35 --pcie-mode dma --ple-io ram --pool-workers 6`, the hipBLASLt 100202 table, fused prompt kernels, coupled drafts, and the patched ROCr in `lib_dirs`. A/B: 35k prompt 854 → 1,848 t/s; decode +3–8% (+13–15% with `--vram-reserve-mib 1500`, the user's call: the desktop runs on this GPU).
+- Profile `strata-swift-flash-next` (`--backend strata`): Swift 1.5 Flash-Next IQ3_XXS on Strata, 262k, :6868, in no stack. **Now points at the tuned config** (2026-10-12, user approved); reserve still 4000.
+- **Tuned config:** `~/Documents/projects/Strata/strata-swift-iq3_xxs-tuned.json` adds `--pcie-frac 0.35 --pcie-mode dma --ple-io ram --pool-workers 6`, the hipBLASLt 100202 table, fused prompt kernels, coupled drafts, and the patched ROCr in `lib_dirs`. A/B: 35k prompt 854 → 1,848 t/s; decode +3–8% (+13–15% with `--vram-reserve-mib 1500`, the user's call: the desktop runs on this GPU).
 - Patched ROCr: `~/rocm/rocr-7.2.4-fix` (one line in `amd_blit_sdma.h`); patch, reproducer, rebuild script and an upstream issue draft in `tmp/strata-tuning/rocr-fix/`. Not filed yet.
 - ROCm 7.14.1 SDK (TheRock) in `~/rocm/therock-7.14.1` with `rocprofv3`; Strata build `build-rocm714` (prompt −21%, unused).
 - Profiles `swarm`, `birbot-a3b`, `jeeves`, `side` unchanged; see `skills/tune-local-model/references/host-7900xtx.md`.
-- The 8-task replay of the tuned config was stopped by its 97 °C guard (CPU at 99 °C during task 2): no result.
+- The 8-task replay was stopped by its 97 °C guard (CPU 99 °C). User chose a lower CPU power limit; `tmp/strata-tuning/cpu-power-limit.conf` (PL1 75 W, PL2 125 W) waits for `sudo` to install.
 - Checks: `pytest` 74/74, ruff clean, pyright clean.
 
 ## Gotchas
