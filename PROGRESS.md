@@ -3,38 +3,36 @@
 Handoff note. Rewritten at the end of every session, never appended to. Cap 40 lines.
 Next task: `PLAN.md`. Rules: `AGENTS.md`.
 
-**Last session:** 2026-10-11 (Flash-Next IQ3_S vs IQ3_XXS on real past tasks: a tie on quality, IQ3_XXS kept; harness in `tmp/ab-eval`)
+**Last session:** 2026-10-12 (better model? none fits; Strata tuned for this box; the "~1 in 90" Strata crash traced to a ROCm bug and patched; `docs/flash-next-speed-research.md`)
 
 ## State
 
-- `lct up/down/ps` run several servers detached. Stacks are a `[stacks]` table in `aliases.toml`. State is `servers/<name>.json` + `.log` in the cache dir; the old `server.json` is gone.
-- The TUI tracks many servers: stacks first (`enter` toggles the whole stack), each profile marked ◌ loading / ● ready with its RAM. Server log lines start with the profile name.
-- Stack `local-swarm` = `swarm` + `side` + `embed`; only one of the two stacks can run (both use :6868). Stack `local` in `tmp/aliases.toml` = `swift-qwen` (GPU, :6868) + `side` (Qwen3.6-35B-A3B UD-IQ4_NL on CPU, :6869, served as model `side`) + `embed` (Qwen3-Embedding-0.6B Q8_0 on CPU, :6870).
-- Stack `birbot` = profile `birbot-a3b` (for `../birbot`): Qwen3.6-35B-A3B UD-IQ4_NL + mmproj-F16, `-np 2`, `--ctx 294912` = 144k each, :6868, model id `local`. After an image: 23.1 GB VRAM, 342 MB GTT, ~1.4 GB card free. Drop to `--ctx 196608` if deep prompts spill.
-- Measured `side` on CPU: loads in 10 s, 20.5 GiB RAM, decode ~15 t/s, prefill ~91 t/s (3k prompt 33 s cold, 4 tokens when cached), a title in under 1 s.
-- `swift-qwen`: DFlash2 drafter (`incoai/Qwen3.8-27B-DFlash2-GGUF` Q4_K_M, `--spec-type draft-dflash --spec-draft-n-max 5`), 96k, two slots, `-ub 512`, 4 GiB Vulkan blocks. Thinking on: 82 t/s prose / 92 code (MTP n4 was 72.5 / 77). After an image 0.85 GB free; ~0.35 GB at full depth (est.). Managed llama.cpp is now `aa94f208`.
-- Consumers live in the `ai-harnesses` repo: `pi --local`, `claude-local` Haiku → side, code-review-graph embeddings → :6870.
-- Profile `jeeves` (PostHog/jeeves, `--backend jeeves`, fp8, 4096 ctx, 2 rows, :6871): 15 GB VRAM. 3 questions: 70 s thinking, 0.9 s without (Jeeves master + ROCm fix; the pre-#7 commit took 32 s). Cannot share the GPU with `swift-qwen`.
-- Profile `swarm` (Qwen3.6-35B-A3B UD-IQ4_NL on GPU, `-np 5`, `--ctx 327680` = 64k per agent, MTP, :6868 like `swift-qwen` so `pi --local` finds it) for parallel Pi agents. Loads: 23.0 GB VRAM, 171 MB GTT. One short reply: 183 t/s. 5-way speed unmeasured. Cannot share the GPU with `swift-qwen`.
-- Profile `strata-swift-flash-next` (`--backend strata`): Strata engine in `~/Documents/projects/Strata`, Swift 1.5 Flash-Next IQ3_XXS, 262k, :6868, in no stack. 45 GiB RAM, 20 GiB VRAM. Rerunning Strata's `setup.sh` resets `--vram-reserve-mib` and sampling. Cannot share the GPU with `swift-qwen`.
-- `lct setup` picks a prebuilt llama.cpp by GPU: `nvidia-smi` → CUDA 12.8 + bundled runtime, else Vulkan, macOS Metal; into `<cache>/llama.cpp/build/bin`, then prints `--list-devices`. Only `--cmake-arg` builds. Live: Vulkan 3 s; CUDA path simulated (fake `nvidia-smi`), 30 s, libs resolve; no real NVIDIA test yet.
+- `lct up/down/ps` run several servers detached. Stacks are a `[stacks]` table in `aliases.toml`. State is `servers/<name>.json` + `.log` in the cache dir.
+- Stack `local` in `tmp/aliases.toml` = `swift-qwen` (GPU, :6868) + `side` (Qwen3.6-35B-A3B UD-IQ4_NL on CPU, :6869) + `embed` (Qwen3-Embedding-0.6B, :6870). `local-swarm` = `swarm` + `side` + `embed`; only one of the two can run.
+- `swift-qwen`: Swift-Qwen3.8-27B Q4_K_S + DFlash2 n5, 96k, two slots: 82 t/s prose / 92 code (thinking on). Managed llama.cpp `aa94f208`.
+- Profile `strata-swift-flash-next` (`--backend strata`): Swift 1.5 Flash-Next IQ3_XXS on Strata, 262k, :6868, in no stack. Still points at the untouched `strata-swift-iq3_xxs.json`.
+- **Tuned config, not yet adopted:** `~/Documents/projects/Strata/strata-swift-iq3_xxs-tuned.json` adds `--pcie-frac 0.35 --pcie-mode dma --ple-io ram --pool-workers 6`, the hipBLASLt 100202 table, fused prompt kernels, coupled drafts, and the patched ROCr in `lib_dirs`. A/B: 35k prompt 854 → 1,848 t/s; decode +3–8% (+13–15% with `--vram-reserve-mib 1500`, the user's call: the desktop runs on this GPU).
+- Patched ROCr: `~/rocm/rocr-7.2.4-fix` (one line in `amd_blit_sdma.h`); patch, reproducer, rebuild script and an upstream issue draft in `tmp/strata-tuning/rocr-fix/`. Not filed yet.
+- ROCm 7.14.1 SDK (TheRock) in `~/rocm/therock-7.14.1` with `rocprofv3`; Strata build `build-rocm714` (prompt −21%, unused).
+- Profiles `swarm`, `birbot-a3b`, `jeeves`, `side` unchanged; see `skills/tune-local-model/references/host-7900xtx.md`.
+- The 8-task replay of the tuned config was stopped by its 97 °C guard (CPU at 99 °C during task 2): no result.
 - Checks: `pytest` 74/74, ruff clean, pyright clean.
 
 ## Gotchas
 
-- **A 5-token verify pass costs only 1.13× one decode step here (llama-bench, 24.3 vs 27.4 ms).** Speculation overhead is elsewhere: ~11 ms per DFlash2 cycle.
-- **Vulkan FA hides a scratch buffer.** With q8_0 K and V it dequantizes one layer's K+V to f16 (4 KiB per context token, ~1 GiB at 262k), not in the projected-VRAM line (`ggml-vulkan.cpp:8034`). Budget for it.
-- **TUI tests flake under load** (`test_enter_on_a_stack…`, `test_a_click_only…`, `test_enter_starts_and_stops…`; seen at load average 8–20). Rerun before blaming a change.
-- **Jeeves upstream does not run on ROCm.** `tmp/jeeves/src` is on branch `rocm-attention` of `blackhat-7/jeeves` (commit `267cff8`). Upstream takes PRs from collaborators only. `lct setup --backend jeeves --force` re-clones upstream and loses the fix.
-- **With `--kv-unified`, llama-server's default `--cache-idle-slots` clears idle slots on every new request.** Use `--no-cache-idle-slots` or two clients evict each other's cache.
-- **Check per-process spill, not just card VRAM.** `drm-memory-gtt` in `/proc/<llama-server pid>/fdinfo/*` is GPU memory living in system RAM. Large spill + deep prompt = GPU watchdog reset (`ErrorDeviceLost`). Check `lct ps` first: a second GPU model sees ~50 MiB free.
-- **One GPU slot: any background request evicts the chat's prompt cache.** A 957-token title request forced a 22 s re-read of an 18k prompt. Keep background jobs on `side`.
-- **RAM is BIOS-limited to DDR5-4800;** the kit is rated 5200 (XMP off). CPU decode is bandwidth-bound (~57 GB/s measured).
-- **sysfs `mem_info_vram_used` under-reports at startup** (lazy commit). Trust llama.cpp's `projected to use N MiB` line or the sum of its `buffer size` lines.
-- **MTP draft KV cache defaults to f16** unless `-ctkd q8_0 -ctvd q8_0` is passed.
-- **A plain SIGTERM to `llama-server` did not stop it within 120 s; SIGINT did.** `lct down` sends SIGINT to the group.
-- **The projector takes ~1.1 GB at startup and ~0.3 GB more on the first image** (build `aa94f208`; older builds loaded it lazily).
-- **Slow downloads: first check for a VPN.** `HF_XET_FIXED_DOWNLOAD_CONCURRENCY=16` measured 13 MB/s on this Wi-Fi.
-- **`lct setup --force` without `--cmake-arg` replaces this box's source build with the prebuilt one.** Rebuild a pinned source build with `--cmake-arg=-DGGML_VULKAN=ON`.
-- **Textual:** `OptionList` needs `text-wrap: nowrap`; never name an `App` method `run`; `_on_click` runs for every class in the MRO; workers are cancelled before `lct tui`'s `finally`.
-- **Quantizer model cards describe quantization, not the model.** `repo_details` loads the base model's card first.
+- **hsa-rocr 7.2.4 aborts copy-heavy apps:** `BlitSdma::PendingBytes` over-reads by one slot; Arch's `-D_GLIBCXX_ASSERTIONS` turns it into `vector<unsigned long>::operator[]` aborts. **Rebuild `tmp/strata-tuning/rocr-fix/build.sh` after any ROCm update**, or drop the path from `lib_dirs`.
+- **CPU heat:** Strata's pool workers spin through decode (13 workers = 14 busy cores). With an agent's test suite beside it the CPU hit 99 °C in ~2 min, even at 6 workers. Long unattended runs need a power limit or better cooling.
+- **Strata reads the n-gram table from the SSD every token** unless `--ple-io ram`: weekly `fstrim` or builds can halve decode.
+- **Strata noise:** ±10% start to start. Screen kernel switches in generate mode (`--stats`, ±1.5%), not server A/Bs.
+- **`pkill -f PATTERN` kills the calling shell** when the pattern is in its own command line (exit 144). Anchor patterns with `^`.
+- **Strata's server ignores SIGINT while busy;** `lct down` still works (lct's wrapper sends SIGTERM).
+- **A 5-token verify pass costs only 1.13× one decode step** on the 27B; DFlash2's overhead (~11 ms/cycle) is elsewhere.
+- **Vulkan FA hides a scratch buffer** (4 KiB per context token with q8_0 K and V, not in the projected line).
+- **TUI tests flake under load** (load average 8–20). Rerun before blaming a change.
+- **Jeeves upstream does not run on ROCm;** `tmp/jeeves/src` is on `blackhat-7/jeeves` branch `rocm-attention`.
+- **With `--kv-unified`, use `--no-cache-idle-slots`** or two clients evict each other's cache.
+- **Check per-process GTT spill** (`drm-memory-gtt` in `/proc/<pid>/fdinfo`); spill + deep prompt = GPU reset.
+- **One GPU slot: background requests evict the chat's prompt cache.** Keep them on `side`.
+- **RAM runs at DDR5-4800** (rated 5200, XMP off); CPU decode is bandwidth-bound (~57 GB/s).
+- **`lct setup --force` without `--cmake-arg` replaces a source build** with the prebuilt one.
+- **Textual:** `OptionList` needs `text-wrap: nowrap`; never name an `App` method `run`.
