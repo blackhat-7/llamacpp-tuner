@@ -15,7 +15,7 @@ Next task: `PLAN.md`. Rules: `AGENTS.md`.
 - Patched ROCr: `~/rocm/rocr-7.2.4-fix` (one line in `amd_blit_sdma.h`); patch, reproducer, rebuild script and an upstream issue draft in `tmp/strata-tuning/rocr-fix/`. Not filed yet.
 - ROCm 7.14.1 SDK (TheRock) in `~/rocm/therock-7.14.1` with `rocprofv3`; Strata build `build-rocm714` (prompt −21%, unused).
 - Profiles `swarm`, `birbot-a3b`, `jeeves`, `side` unchanged; see `skills/tune-local-model/references/host-7900xtx.md`.
-- The 8-task replay was stopped by its 97 °C guard (CPU 99 °C). User chose a lower CPU power limit; `tmp/strata-tuning/cpu-power-limit.conf` (PL1 75 W, PL2 125 W) waits for `sudo` to install.
+- The 8-task replay was stopped by its 97 °C guard (CPU 99 °C). Fix: system-manager service `cpuPowerLimit` (PL1 75 W, PL2 125 W) in `~/dotfiles/nix/linux/default.nix`; active after `just switch` there.
 - Checks: `pytest` 74/74, ruff clean, pyright clean.
 
 ## Gotchas
