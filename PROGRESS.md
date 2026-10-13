@@ -3,7 +3,7 @@
 Handoff note. Rewritten at the end of every session, never appended to. Cap 40 lines.
 Next task: `PLAN.md`. Rules: `AGENTS.md`.
 
-**Last session:** 2026-10-13 (Strata 0.1.43 + Swift expert profile + 13 workers + `STRATA_ADAPT_LAG=2` adopted: live code 92 -> 110 t/s, edit 78 -> 96, prose 76 -> 81; engine 2x work paused, resume from `tmp/strata-opt/RESUME.md`)
+**Last session:** 2026-10-14 (engine 2x round 3, stopped at the 90% usage cap: six levers on branches in `~/Documents/projects/Strata-wt/`, per-measurement logs in `tmp/strata-opt/progress/`, resume from `tmp/strata-opt/RESUME.md`)
 
 ## State
 
