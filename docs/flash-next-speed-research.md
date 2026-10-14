@@ -227,6 +227,27 @@ a start: **code 138.3, prose 100.8, edit 121.5 t/s** (were ~123 / ~85 / ~106). 1
   72.8 -> 111 t/s); each start now begins from what the last one learned. `lct down` signals the whole process group,
   so the engine never runs its own save-on-exit; the 5-minute save covers it.
 
+## RTX 5090 side by side (2026-10-14 night)
+
+A friend ran `bench/strata-compare/run.py` (same inputs, the engine's own profilers) on an RTX 5090 + i9-14900KS,
+64 GB DDR5-4200, Strata 0.1.44.1, `--pcie-frac 0.90`, the shipped expert profile. Results: lct branch
+`strata-5090-compare`. Generate mode, greedy, 600-token fixed continuations:
+
+| | RTX 5090 (its config) | RTX 5090 + our profile/vocab/flags | RX 7900 XTX (ours) |
+|---|---|---|---|
+| Code | 116-126 t/s | 160-168 | 133 |
+| Edit | 81-85 | 113-122 | 117 |
+| Prose | 138-140 | 108-114 | 94 |
+| 15K / 35K prompt | 4,372-4,580 / 5,048 | 4,076 / 4,820 | ~2,850 / ~2,730 warm |
+
+- Its "R4 expert-cache hits" of 90-95% count the PCIe-fetched experts as hits (90% of misses go over PCIe 5 there);
+  `fetch_blobs_kernel` is 38% of its GPU time. At `--pcie-frac 0.35` it decodes code at 99 t/s: its CPU pool reads
+  only ~18 GB/s (23 workers, DDR5-4200); ours reads 42 GB/s.
+- Per round, its GPU work is 7.3 ms against our 12.8 (about the 1.87x bandwidth ratio), and its draft 1.1 against
+  2.3 ms. Its prompts are 1.6x ours. The 190 t/s in the friend's screenshot came from another harness (a warm server).
+- Our Swift profile gave the 5090 +37-45% code and +33-40% edit but -17% prose: the profile trades code against prose
+  (here too: shipped code 92 / prose 85, Swift 131 / 92 t/s). A code/prose-balanced profile is being tested.
+
 ## Headline
 
 Interleaved A/B, 2 rounds, a fresh server per arm (`tmp/strata-tuning/final_ab.sh`): 12 replies at temp 1.0,
