@@ -215,6 +215,11 @@ a start: **code 138.3, prose 100.8, edit 121.5 t/s** (were ~123 / ~85 / ~106). 1
   Docker 124). Games or heavy GPU apps beside Strata need the reserve back up (`--vram-reserve-mib` in the config).
 - **The CPU expert pool** is still 35-53% of each decode round. It already uses AVX-VNNI and is compute-bound under the
   75 W cap (it reads 42 GB/s; the same 14 cores stream 67 GB/s).
+- **The learned expert profile is on** (`"expert_profile_save"` in both configs ->
+  `Strata-data/profiles/swift-1.5-iq3_xxs-learned.bin`, saved at the first request 5+ minutes after the last save). A session's hit rate
+  climbs from ~73-76% at the first requests to ~87% as the adaptive tier learns (a repeated prompt: 88.6 -> 95.5%,
+  72.8 -> 111 t/s); each start now begins from what the last one learned. `lct down` signals the whole process group,
+  so the engine never runs its own save-on-exit; the 5-minute save covers it.
 
 ## Headline
 
