@@ -174,7 +174,9 @@ to turn it off, and gives bit-identical verify windows (`--spec-follow` + `--win
 
 Combined vs stock 0.1.43 (generate, greedy, 600 tokens, 2 interleaved rounds): code 106.9 -> 124.3 t/s (+16%), prose
 75.8 -> 86.9 (+15%), edit 99.0 -> 104.7 (+6%). Live server, warm (greedy): code ~123, prose ~85, edit ~106 t/s; the first
-requests after a start run ~10% lower while the adaptive tier settles. Against the original config of 2026-10-12
+requests after a start run ~10% lower while the adaptive tier settles.
+At a 205k-token context (generate, MTP drafts, 600 tokens): 78.7 -> 92.9 t/s (+18%), GPU time per round 16.4 -> 12.9 ms,
+windows bit-identical. Against the original config of 2026-10-12
 (code 92.0, prose 76.0, edit 78.4): +34%, +11%, +35%.
 
 ## Headline

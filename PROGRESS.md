@@ -15,7 +15,7 @@ Next task: `PLAN.md`. Rules: `AGENTS.md`.
 - Patched ROCr: `~/rocm/rocr-7.2.4-fix` (one line in `amd_blit_sdma.h`); patch, reproducer, rebuild script and an upstream issue draft in `tmp/strata-tuning/rocr-fix/`. Not filed yet.
 - ROCm 7.14.1 SDK (TheRock) in `~/rocm/therock-7.14.1` with `rocprofv3`; Strata build `build-rocm714` (prompt −21%, unused).
 - Profiles `swarm`, `birbot-a3b`, `jeeves`, `side` unchanged; see `skills/tune-local-model/references/host-7900xtx.md`.
-- Decode now (live server, warm, greedy): code ~123, prose ~85, edit ~106 t/s (2026-10-12 original: 92 / 76 / 78). Engine source: branch `opt/combined` in `~/Documents/projects/Strata-opt` (local only).
+- Decode now (live server, warm, greedy): code ~123, prose ~85, edit ~106 t/s; 205k context 92.9 t/s (stock 78.7) (2026-10-12 original: 92 / 76 / 78). Engine source: branch `opt/combined` in `~/Documents/projects/Strata-opt` (local only).
 - Checks: `pytest` 74/74, ruff clean, pyright clean.
 
 ## Gotchas
