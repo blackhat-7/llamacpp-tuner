@@ -10,7 +10,7 @@ Next task: `PLAN.md`. Rules: `AGENTS.md`.
 - `lct up/down/ps` run several servers detached. Stacks are a `[stacks]` table in `aliases.toml`. State is `servers/<name>.json` + `.log` in the cache dir.
 - Stack `local` in `tmp/aliases.toml` = `swift-qwen` (GPU, :6868) + `side` (Qwen3.6-35B-A3B UD-IQ4_NL on CPU, :6869) + `embed` (Qwen3-Embedding-0.6B, :6870). `local-swarm` = `swarm` + `side` + `embed`; only one of the two can run.
 - `swift-qwen`: Swift-Qwen3.8-27B Q4_K_S + DFlash2 n5, 96k, two slots: 82 t/s prose / 92 code (thinking on). Managed llama.cpp `aa94f208`.
-- Profile `strata-swift-flash-next` (`--backend strata`, stack `local-flash`): Swift 1.5 Flash-Next IQ3_XXS on Strata 0.1.43, 262k, :6868, config `strata-swift-iq3_xxs-tuned.json` (reserve 4000).
+- Profile `strata-swift-flash-next` (`--backend strata`, stack `local-flash`): Swift 1.5 Flash-Next IQ3_XXS on Strata 0.1.43, 262k, :6868, config `strata-swift-iq3_xxs-tuned.json` (reserve 4000). Strata's own `strata-swift-iq3_xxs.json` (what `./setup.sh` starts) now has the same settings (backup in `Strata-data/`).
 - Tuned config adds `--pcie-frac 0.35 --pcie-mode dma --ple-io ram`, the Swift expert profile `~/Documents/projects/Strata-data/profiles/swift-1.5-iq3_xxs.bin`, the hipBLASLt 100202 table, fused prompt kernels, coupled drafts, `STRATA_ADAPT_LAG=2`, the env node cuts and the patched ROCr. Prompts 2.2x (35k: 854 -> 1,848 t/s).
 - Patched ROCr: `~/rocm/rocr-7.2.4-fix` (one line in `amd_blit_sdma.h`); patch, reproducer, rebuild script and an upstream issue draft in `tmp/strata-tuning/rocr-fix/`. Not filed yet.
 - ROCm 7.14.1 SDK (TheRock) in `~/rocm/therock-7.14.1` with `rocprofv3`; Strata build `build-rocm714` (prompt −21%, unused).
