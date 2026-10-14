@@ -3,7 +3,7 @@
 Handoff note. Rewritten at the end of every session, never appended to. Cap 40 lines.
 Next task: `PLAN.md`. Rules: `AGENTS.md`.
 
-**Last session:** 2026-10-14 (engine 2x round 3, stopped at the 90% usage cap: six levers on branches in `~/Documents/projects/Strata-wt/`, per-measurement logs in `tmp/strata-opt/progress/`, resume from `tmp/strata-opt/RESUME.md`)
+**Last session:** 2026-10-14 (engine round 3 merged: Strata 0.1.43 + six bit-exact gfx1100 decode changes, installed as `~/Documents/projects/Strata-data/engines/strata-0.1.43-gfx1100opt-caac96fe`; live warm greedy code ~123, prose ~85, edit ~106 t/s)
 
 ## State
 
@@ -15,7 +15,7 @@ Next task: `PLAN.md`. Rules: `AGENTS.md`.
 - Patched ROCr: `~/rocm/rocr-7.2.4-fix` (one line in `amd_blit_sdma.h`); patch, reproducer, rebuild script and an upstream issue draft in `tmp/strata-tuning/rocr-fix/`. Not filed yet.
 - ROCm 7.14.1 SDK (TheRock) in `~/rocm/therock-7.14.1` with `rocprofv3`; Strata build `build-rocm714` (prompt −21%, unused).
 - Profiles `swarm`, `birbot-a3b`, `jeeves`, `side` unchanged; see `skills/tune-local-model/references/host-7900xtx.md`.
-- Decode now (live, greedy / temp 1.0): code 109.6 / 99.2, edit 96.1 / 92.8, prose 81.1 / 78.4 t/s (was 92.0 / 85.2, 78.4 / 79.3, 76.0 / 71.6). CPU max 83 C at 13 workers under the 75 W cap.
+- Decode now (live server, warm, greedy): code ~123, prose ~85, edit ~106 t/s (2026-10-12 original: 92 / 76 / 78). Engine source: branch `opt/combined` in `~/Documents/projects/Strata-opt` (local only).
 - Checks: `pytest` 74/74, ruff clean, pyright clean.
 
 ## Gotchas

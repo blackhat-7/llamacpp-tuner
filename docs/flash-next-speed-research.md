@@ -155,6 +155,28 @@ CPU pool parking, MTP draft chain, long-context top-k) in worktrees `~/Documents
 rewrite is done and bit-exact. Harness, references and resume steps: `tmp/strata-opt/RESUME.md`; analysis:
 `tmp/strata-opt/audits/` (both gitignored).
 
+## Round 3 (2026-10-14): engine changes, all bit-exact
+
+Six levers were built in parallel worktrees (`~/Documents/projects/Strata-wt/*`), merged into branch `opt/combined` of
+`~/Documents/projects/Strata-opt` (commit `caac96fe`, on top of upstream 0.1.43) and installed as
+`~/Documents/projects/Strata-data/engines/strata-0.1.43-gfx1100opt-caac96fe` (the run config's `exe`; the stock engine
+in `~/Documents/projects/Strata/engine/` is untouched). Every change is on by default on gfx1100 only, has an env switch
+to turn it off, and gives bit-identical verify windows (`--spec-follow` + `--window-hashes`, `tmp/strata-opt/`).
+
+| Lever | What changed | Measured alone |
+|---|---|---|
+| small kernels | router top-10 one wave per token (DPP), router GEMV + top-10 + doorbell in one launch, GDN a/b loads first, multi-block argmax | code +2.5%, edit +1.3% |
+| dense GEMVs | gfx1100 kernels for 1-4 columns (row loads first, plain q8_1 columns), HIP port of the interleaved GEMV | GPU wait -0.4 to -0.6 ms/round (-4%) |
+| HC read | down projection with pipelined loads and LDS-only barriers | code +6.5%, edit +8.9% |
+| CPU pool | parking in C0.2 (`umwait`) instead of spinning; guided task split | same speed, ~20 W less, max 82 C (was 86) |
+| MTP draft | fewer draft kernels, fused norm+rope, skip the draft before lookup windows | draft -0.15 to -1.1 ms/round |
+| long context | register top-k and DPP scorer for QSA decode | 200k: 78.6 -> 82.2 t/s (+4.6%) |
+
+Combined vs stock 0.1.43 (generate, greedy, 600 tokens, 2 interleaved rounds): code 106.9 -> 124.3 t/s (+16%), prose
+75.8 -> 86.9 (+15%), edit 99.0 -> 104.7 (+6%). Live server, warm (greedy): code ~123, prose ~85, edit ~106 t/s; the first
+requests after a start run ~10% lower while the adaptive tier settles. Against the original config of 2026-10-12
+(code 92.0, prose 76.0, edit 78.4): +34%, +11%, +35%.
+
 ## Headline
 
 Interleaved A/B, 2 rounds, a fresh server per arm (`tmp/strata-tuning/final_ab.sh`): 12 replies at temp 1.0,
