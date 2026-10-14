@@ -179,6 +179,43 @@ At a 205k-token context (generate, MTP drafts, 600 tokens): 78.7 -> 92.9 t/s (+1
 windows bit-identical. Against the original config of 2026-10-12
 (code 92.0, prose 76.0, edit 78.4): +34%, +11%, +35%.
 
+## Round 4 (2026-10-14 evening): prompts +45%, decode +12-19%, the slow prompts fixed
+
+Prompted by an RTX 5090 result (190 t/s code decode, 6,090 t/s on a 15K prompt, same model and quant; Strata's
+published 5090 reports agree). The 5090 leads mostly on hardware (a faster chip per kernel, 2.5 vs 0.55 us per graph
+node, 7x the int8 matrix rate), but four of its advantages were config or code we could take. Scripts and logs:
+`tmp/strata-opt/` (screen5.sh, confirm5.sh, quality5.sh, pcie_sweep.sh, spec_sweep.sh, test6.sh, apply_round4.py).
+
+**Installed:** engine `Strata-data/engines/strata-0.1.43-gfx1100opt-eb17930a` (round 3 + the PLE fix) and the settings
+below in both run configs (backups `Strata-data/*.before-round4-2026-10-14`). Server mode, greedy, 600 tokens, right after
+a start: **code 138.3, prose 100.8, edit 121.5 t/s** (were ~123 / ~85 / ~106). 10,021 experts cached (was 8,711).
+
+| Change | Where | Measured (generate, greedy, 2 interleaved rounds unless noted) |
+|---|---|---|
+| Prompt attention and block scorer on matrix cores (`STRATA_HIP_WMMA=1`, `STRATA_SELECT_WMMA=1`; the gfx11 kernels ship in 0.1.43, the docs say gfx12 only), `STRATA_HC_UPMIX=1`, the exact GDN / padding switches, `--prefill auto:16384` | prompt | 15K 1,961 -> 2,847 t/s, 35K 1,870 -> 2,732 (+45%); decode after it -1% |
+| `--vram-reserve-mib 2000` (was 4000) | decode | code +4%, edit +6%, prose +5%; at 35K context +13% |
+| Agent draft vocabulary (`--mtp-draft-vocab Strata-data/draft_vocab_agent.bin`) | decode | +3% more on all three (draft 2.8 -> 2.46 ms a round) |
+| `--mtp-window 8192` | decode | 35K context 97.2 -> 99.5 t/s (one run; draft 3.03 -> 2.18 ms a round) |
+| A prompt chunk's PLE table rows read on 16 threads with pread (engine) | prompt | table evicted: 15K prompt 634 -> 1,639 t/s; resident: unchanged, bit-identical |
+
+- **The slow prompts** (about half of the fresh 10-13K prompts read at ~830 t/s): the 27 GB PLE table is not locked
+  (`ulimit -l` is 8 MB), so the page cache can drop it under memory pressure (the `side` model, other files). One
+  thread then read a chunk's 131k rows one SSD read at a time (15.8 s for a 15K prompt). Decode pays too: 5-7 ms a
+  round while its rows are evicted. A clean cold start keeps the table: the expert load's read-once pages go first.
+- **Quality:** a 256-token continuation teacher-forced after the 35K prompt: the prompt stack flips 1 of 95 window
+  predictions and the outputs are identical, the same as the reserve change alone (1 of 94). The exact switches are
+  bit-identical. All decode changes are lossless (cache size and drafts only).
+- **Measured and dropped:** `--pcie-frac` 0.25 / 0.30 / 0.45 (0.35 stays best), `--spec-min-p` 0.4-0.7 (flat),
+  `--lookup-chain 3`, `--mtp-q4` (noise), `STRATA_WMMA_GEMM` (-3%), `STRATA_PA_FAST` (+3%, FP16 attention: not taken),
+  `STRATA_HC_Q8` (this GGUF has no Q8_0 HC weights), `MADV_RANDOM` on the table (pages reclaimed first, decode slower),
+  64 table threads (no gain over 16), dropping the expert load's page-cache copy (no gain once `MADV_RANDOM` was
+  gone), reserve 1500 (leaves the desktop 0.3 GB).
+- **VRAM:** Strata allocates ~1.2 GB after sizing its cache, so the desktop's headroom is the reserve minus 1.2 GB:
+  0.86 GB measured at 2000. The desktop on both monitors used 0.9 GB steady (Hyprland 325 MiB, quickshell 151,
+  Docker 124). Games or heavy GPU apps beside Strata need the reserve back up (`--vram-reserve-mib` in the config).
+- **The CPU expert pool** is still 35-53% of each decode round. It already uses AVX-VNNI and is compute-bound under the
+  75 W cap (it reads 42 GB/s; the same 14 cores stream 67 GB/s).
+
 ## Headline
 
 Interleaved A/B, 2 rounds, a fresh server per arm (`tmp/strata-tuning/final_ab.sh`): 12 replies at temp 1.0,
