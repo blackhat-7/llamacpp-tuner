@@ -3,7 +3,7 @@
 Handoff note. Rewritten at the end of every session, never appended to. Cap 40 lines.
 Next task: `PLAN.md`. Rules: `AGENTS.md`.
 
-**Last session:** 2026-10-14 evening (Strata round 4: matrix-core prompt path + 16K chunks, a PLE table fix in the engine `strata-0.1.43-gfx1100opt-eb17930a`, reserve 2000, agent draft vocabulary, `--mtp-window 8192`; live greedy code 138, prose 101, edit 122 t/s)
+**Last session:** 2026-10-14 night (Strata round 4: matrix-core prompt path + 16K chunks, PLE table fixes in the engine `strata-0.1.43-gfx1100opt-6ecfbdb4` (pread chunk reads, Linux row prefetch), reserve 2000, agent draft vocabulary, `--mtp-window 8192`; live greedy code 138, prose 101, edit 122 t/s)
 
 ## State
 
@@ -11,11 +11,11 @@ Next task: `PLAN.md`. Rules: `AGENTS.md`.
 - Stack `local` in `tmp/aliases.toml` = `swift-qwen` (GPU, :6868) + `side` (Qwen3.6-35B-A3B UD-IQ4_NL on CPU, :6869) + `embed` (Qwen3-Embedding-0.6B, :6870). `local-swarm` = `swarm` + `side` + `embed`; only one of the two can run.
 - `swift-qwen`: Swift-Qwen3.8-27B Q4_K_S + DFlash2 n5, 96k, two slots: 82 t/s prose / 92 code (thinking on). Managed llama.cpp `aa94f208`.
 - Profile `strata-swift-flash-next` (`--backend strata`, stack `local-flash`, running): Swift 1.5 Flash-Next IQ3_XXS on Strata 0.1.43, 262k, :6868, config `strata-swift-iq3_xxs-tuned.json` (reserve 2000). Strata's own `strata-swift-iq3_xxs.json` (what `./setup.sh` starts) has the same settings (backups `Strata-data/*.before-round4-2026-10-14`).
-- The config adds `--pcie-frac 0.35 --pcie-mode dma --ple-io ram --prefill auto:16384 --mtp-window 8192`, the Swift expert profile, the agent draft vocabulary (`Strata-data/draft_vocab_agent.bin`), the hipBLASLt 100202 table, fused and matrix-core prompt kernels (`STRATA_HIP_WMMA/SELECT_WMMA/HC_UPMIX` + exact GDN switches), coupled drafts, `STRATA_ADAPT_LAG=2`, the env node cuts and the patched ROCr. 35k prompt: 854 -> ~2,730 t/s. The learned expert profile is saved (at the first request 5+ min after the last save) to `Strata-data/profiles/swift-1.5-iq3_xxs-learned.bin` and loaded at start.
+- The config adds `--pcie-frac 0.35 --pcie-mode dma --ple-io mmap --prefill auto:16384 --mtp-window 8192`, the Swift expert profile, the agent draft vocabulary (`Strata-data/draft_vocab_agent.bin`), the hipBLASLt 100202 table, fused and matrix-core prompt kernels (`STRATA_HIP_WMMA/SELECT_WMMA/HC_UPMIX` + exact GDN switches), coupled drafts, `STRATA_ADAPT_LAG=2`, the env node cuts and the patched ROCr. 35k prompt: 854 -> ~2,730 t/s. The learned expert profile is saved (at the first request 5+ min after the last save) to `Strata-data/profiles/swift-1.5-iq3_xxs-learned.bin` and loaded at start.
 - Patched ROCr: `~/rocm/rocr-7.2.4-fix` (one line in `amd_blit_sdma.h`); patch, reproducer, rebuild script and an upstream issue draft in `tmp/strata-tuning/rocr-fix/`. Not filed yet.
 - ROCm 7.14.1 SDK (TheRock) in `~/rocm/therock-7.14.1` with `rocprofv3`; Strata build `build-rocm714` (prompt −21%, unused).
 - Profiles `swarm`, `birbot-a3b`, `jeeves`, `side` unchanged; see `skills/tune-local-model/references/host-7900xtx.md`.
-- Decode now (server, greedy, 600 tokens): code 138, prose 101, edit 122 t/s (2026-10-12 original: 92 / 76 / 78). Engine source: branch `opt/combined` in `~/Documents/projects/Strata-opt` (local only). Round 4 notes: `docs/flash-next-speed-research.md`.
+- Decode now (server, greedy, 600 tokens): code 138, prose 101, edit 122 t/s alone; 131 / 96 / 118 with `side` + `embed` up (2026-10-12 original: 92 / 76 / 78). Engine source: branch `opt/combined` in `~/Documents/projects/Strata-opt` (local only). Round 4 notes: `docs/flash-next-speed-research.md`.
 - Checks: `pytest` 74/74, ruff clean, pyright clean.
 
 ## Gotchas
@@ -24,7 +24,7 @@ Next task: `PLAN.md`. Rules: `AGENTS.md`.
 - **VRAM reserve 2000 leaves the desktop ~0.86 GB:** Strata allocates ~1.2 GB more after sizing its cache. Raise `--vram-reserve-mib` before games or heavy GPU apps run beside it.
 - **hsa-rocr 7.2.4 aborts copy-heavy apps:** `BlitSdma::PendingBytes` over-reads by one slot; Arch's `-D_GLIBCXX_ASSERTIONS` turns it into `vector<unsigned long>::operator[]` aborts. **Rebuild `tmp/strata-tuning/rocr-fix/build.sh` after any ROCm update**, or drop the path from `lib_dirs`.
 - **CPU heat:** Strata's pool workers spin through decode (13 workers = 14 busy cores). With an agent's test suite beside it the CPU hit 99 °C in ~2 min, even at 6 workers. Long unattended runs need a power limit or better cooling.
-- **Strata's 27 GB n-gram (PLE) table is unlocked** (`ulimit -l` 8 MB) and gets evicted under memory pressure; then decode pays 5-7 ms a round. `--ple-io ram` keeps it in the page cache; never `MADV_RANDOM` it (pages go first).
+- **Strata's 27 GB n-gram (PLE) table does not fit beside `side`** (unlocked, `ulimit -l` 8 MB): engine `6ecfbdb4` prefetches each token's rows (`MADV_WILLNEED`) and the config uses `--ple-io mmap`. Never `MADV_RANDOM` it (pages go first).
 - **Strata noise:** ±10% start to start. Screen kernel switches in generate mode (`--stats`, ±1.5%), not server A/Bs.
 - **`pkill -f PATTERN` kills the calling shell** when the pattern is in its own command line (exit 144). Anchor patterns with `^`.
 - **Strata's server ignores SIGINT while busy;** `lct down` still works (lct's wrapper sends SIGTERM).

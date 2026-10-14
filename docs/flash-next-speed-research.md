@@ -215,6 +215,12 @@ a start: **code 138.3, prose 100.8, edit 121.5 t/s** (were ~123 / ~85 / ~106). 1
   Docker 124). Games or heavy GPU apps beside Strata need the reserve back up (`--vram-reserve-mib` in the config).
 - **The CPU expert pool** is still 35-53% of each decode round. It already uses AVX-VNNI and is compute-bound under the
   75 W cap (it reads 42 GB/s; the same 14 cores stream 67 GB/s).
+- **With the whole stack up (`side` holds 18 GB), the PLE table does not fit in RAM** and decode lost up to 80% on
+  fresh text (prose 21-52 t/s on first passes). Engine `6ecfbdb4` adds the Linux analog of Strata's Windows
+  `PrefetchVirtualMemory`: `MADV_WILLNEED` on each token's rows when the verify window and the draft layer stage them.
+  With `--ple-io mmap` (no 27 GB touch at every start), server mode, 4 samples each: code 107.7 -> 131.1 t/s, prose
+  60.0 -> 95.9, edit 111.4 -> 117.6; the worst first pass went 21 -> 80 t/s (prose). `--ple-io direct` (Strata's
+  default) was no better: SSD reads p50 434 us, p99 66 ms.
 - **The learned expert profile is on** (`"expert_profile_save"` in both configs ->
   `Strata-data/profiles/swift-1.5-iq3_xxs-learned.bin`, saved at the first request 5+ minutes after the last save). A session's hit rate
   climbs from ~73-76% at the first requests to ~87% as the adaptive tier learns (a repeated prompt: 88.6 -> 95.5%,
