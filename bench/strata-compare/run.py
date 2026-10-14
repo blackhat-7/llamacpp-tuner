@@ -47,6 +47,18 @@ RUNS = [
     ("noskip_code", "code.ids", "code.follow", 600, {"STRATA_ROUTE_TAIL_SKIP": "0"}),
     ("noskip_prose", "prose.ids", "prose.follow", 600, {"STRATA_ROUTE_TAIL_SKIP": "0"}),
 ]
+# with Nsight Systems installed: one code decode traced per kernel (the graphs' nodes included); only the per-kernel
+# table is kept, the trace file is large
+NSYS_RUN = ("nsys_code", "code.ids", "code.follow", 300, {})
+NSYS_ARGS = [
+    "profile",
+    "--trace=cuda",
+    "--cuda-graph-trace=node",
+    "--sample=none",
+    "--cpuctxsw=none",
+    "--stats=true",
+    "--force-overwrite=true",
+]
 
 # lines worth reading first, in order
 KEY = re.compile(
@@ -111,6 +123,7 @@ def run_one(
     extra_env: dict,
     out: Path,
     timeout: int,
+    wrap: list[str] | None = None,
 ) -> tuple[int, float]:
     exe = cfg["exe"]
     args = [a for a in cfg.get("args", []) if a != "--serve"]
@@ -140,13 +153,14 @@ def run_one(
     cwd = cfg.get("cwd") or None
     log = out / f"{name}.log"
     t0 = time.time()
+    command = (wrap or []) + [exe] + args + run_args
     with open(log, "w") as f:
-        f.write("command: " + json.dumps([exe] + args + run_args) + "\n")
+        f.write("command: " + json.dumps(command) + "\n")
         f.write("extra env: " + json.dumps(extra_env) + "\n")
         f.flush()
         try:
             code = subprocess.run(
-                [exe] + args + run_args,
+                command,
                 cwd=cwd,
                 env=env,
                 stdout=f,
@@ -168,6 +182,13 @@ def summary(out: Path) -> str:
         for line in log.read_text(errors="replace").splitlines():
             if KEY.search(line) and len(line) < 4000:
                 lines.append(line.rstrip())
+    nsys = out / f"{NSYS_RUN[0]}.log"
+    if nsys.exists():
+        text = nsys.read_text(errors="replace").splitlines()
+        start = next((i for i, x in enumerate(text) if "cuda_gpu_kern_sum" in x), None)
+        if start is not None:
+            lines.append(f"===== {NSYS_RUN[0]} (per-kernel GPU time)")
+            lines += [x.rstrip() for x in text[start : start + 120]]
     return "\n".join(lines) + "\n"
 
 
@@ -225,6 +246,20 @@ def main() -> int:
                 "  this engine does not know one of the flags (see the log); continuing",
                 flush=True,
             )
+    name, ids, follow, max_new, extra = NSYS_RUN
+    nsys = shutil.which("nsys")
+    if only is None or name in only:
+        if nsys is None:
+            print(f"{name} skipped: nsys (NVIDIA Nsight Systems) is not installed")
+        else:
+            print(f"{name} ...", end=" ", flush=True)
+            wrap = [nsys, *NSYS_ARGS, "-o", str(out / name)]
+            code, secs = run_one(
+                cfg, name, ids, follow, max_new, extra, out, a.timeout, wrap
+            )
+            for big in (out / f"{name}.nsys-rep", out / f"{name}.sqlite"):
+                big.unlink(missing_ok=True)
+            print(f"exit {code}, {secs:.0f} s", flush=True)
     (out / "summary.txt").write_text(summary(out))
     print(f"\nDone: {out}\nPlease commit that folder and push it to this branch.")
     return 0

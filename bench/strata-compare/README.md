@@ -24,7 +24,9 @@ Please do this, then push. Change nothing else in the repository.
 
    To repeat some runs: add `--only speed_code,prof_code` (same `--out`).
 
-   It takes about 10-20 minutes: 9 runs, each loading the model again. Each prints its speed when done.
+   It takes about 10-20 minutes: 9 runs (10 with `nsys`), each loading the model again. Each prints its speed when
+   done. **If NVIDIA Nsight Systems (`nsys`) can be installed, please install it first**: its per-kernel table is the
+   most useful part for us.
    - A run that fails with `unknown argument` means the engine is older than the script expects. Note which flag in
      `notes.md`, and keep the other runs.
    - On Windows use `python` and backslashes; the script handles `lib_dirs` and `.exe` engines.
@@ -45,5 +47,6 @@ Please do this, then push. Change nothing else in the repository.
 | `prof_code`, `prof_prose` | The same with `STRATA_VERIFY_PROFILE=1` and `STRATA_DECODE_TIMING=1`: GPU time per stage, the waits, CPU pool time, hit rates, tokens per round (slower: the profiler adds time) |
 | `prompt_15k`, `prompt_35k` | Prompt speed with `STRATA_PREFILL_TIMING=1`: time per prompt stage and expert streaming |
 | `noskip_code`, `noskip_prose` | Decode with `STRATA_ROUTE_TAIL_SKIP=0`, NVIDIA's lossy default turned off |
+| `nsys_code` (only with Nsight Systems installed) | One code decode traced per kernel (`nsys --cuda-graph-trace=node`); the per-kernel table is kept, the trace file deleted |
 
 `summary.txt` collects the key lines of every log; `system.json` has the hardware, software and the config used.
