@@ -20,6 +20,7 @@ Next task: `PLAN.md`. Rules: `AGENTS.md`.
 
 ## Gotchas
 
+- **The custom Strata engine (`Strata-data/engines/strata-0.1.43-gfx1100opt-*`):** roll back by pointing `exe` in `strata-swift-iq3_xxs-tuned.json` at `Strata/engine/strata`; `STRATA_GFX1100_DEFAULTS=0` turns off only 7 of its 14 changes. After any ROCm upgrade rerun its parity tests (`tmp/strata-opt/RESUME.md`) before trusting bit-exactness.
 - **hsa-rocr 7.2.4 aborts copy-heavy apps:** `BlitSdma::PendingBytes` over-reads by one slot; Arch's `-D_GLIBCXX_ASSERTIONS` turns it into `vector<unsigned long>::operator[]` aborts. **Rebuild `tmp/strata-tuning/rocr-fix/build.sh` after any ROCm update**, or drop the path from `lib_dirs`.
 - **CPU heat:** Strata's pool workers spin through decode (13 workers = 14 busy cores). With an agent's test suite beside it the CPU hit 99 °C in ~2 min, even at 6 workers. Long unattended runs need a power limit or better cooling.
 - **Strata reads the n-gram table from the SSD every token** unless `--ple-io ram`: weekly `fstrim` or builds can halve decode.
