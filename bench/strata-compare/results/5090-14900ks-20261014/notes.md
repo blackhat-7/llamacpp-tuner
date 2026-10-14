@@ -12,7 +12,7 @@
 ## Machine
 - OS: NixOS 26.11, Linux 6.18.55.
 - CPU: Intel Core i9-14900KS (no AVX-512).
-- RAM: 62.5 GiB usable (64 GB). Speed not read (dmidecode needs root).
+- RAM: 62.5 GiB usable (64 GB), 4 modules, configured speed 4200 MT/s (dmidecode).
 - GPU: RTX 5090 32 GB, driver 610.43.02, power limit 450 W, PCIe gen 5 x16 max.
 - Nsight Systems 2025.1.3.140 (from nixpkgs, `cudaPackages.nsight_systems`).
 
