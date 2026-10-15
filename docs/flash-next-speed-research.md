@@ -262,7 +262,7 @@ interleaved A/B). Image requests work (a rendered invoice was read exactly); 0 a
 | i-quant signs with `v_perm_b32` (IQ2/IQ3 signs, IQ4 table lookups) | engine, bit-exact | expert kernels -12 to -16% (real weights, 10 layers, T=1-4); GPU rings -0.3 to -0.6 ms a round |
 | Draft stop on the cumulative acceptance estimate: `STRATA_SPEC_CUM=0.35`, `STRATA_SPEC_CUM_ACC=0.12,0.26,0.43,0.51,0.59,0.66,0.79,0.96` (with `--spec 4`) | engine + env, drafts only | with the sign change: generate code +3.8-4.6%, edit +3.7%, prose +1-2%; server at temp 1.0, medians of 4: code +3.7%, edit +5.3%, prose +2.1% |
 | Batched commit graph (upstream 6f3e3810; `STRATA_COMMIT_BATCH=0` turns it off) | engine, bit-exact | draft -0.35 ms a round: code +1.3%, edit +1.6%, prose +2.5% (one pair each) |
-| `STRATA_PREFILL_CPU_SHARE=auto`, `STRATA_PREFILL_CPU_SHARE_MAX=4096` | env, rounding-level | fresh 0.8-3.6K prompts -19 to -34%; agent turns with 0.9-4K new tokens -11 to -19% by median (8 vs 8 sessions); 12K+ reads unchanged. A 3-vs-2 replay on the new engine showed no clear gain, so it is provisional |
+| `STRATA_PREFILL_CPU_SHARE=auto`, `STRATA_PREFILL_CPU_SHARE_MAX=4096` | env, rounding-level | fresh 0.8-3.6K prompts -19 to -34%; agent turns with 0.9-4K new tokens -11 to -19% by median (8 vs 8 sessions); 12K+ reads unchanged. Live, stack up, on/off/on, medians of 3 fresh prompts: -27% at 0.9K tokens, -20% at 1.8K, -13% at 2.5K, -4% at 3.4K |
 
 - **Exactness.** The two engine changes keep every verify window bit-identical (code, edit, prose; gen.sh's env and
   the production env), and `hip_iq_signs`, `gdn_parity` and `qsa_parity` pass. The draft stop changes window shapes,
