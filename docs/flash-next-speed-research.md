@@ -248,6 +248,47 @@ A friend ran `bench/strata-compare/run.py` (same inputs, the engine's own profil
 - Our Swift profile gave the 5090 +37-45% code and +33-40% edit but -17% prose: the profile trades code against prose
   (here too: shipped code 92 / prose 85, Swift 131 / 92 t/s). A code/prose-balanced profile is being tested.
 
+## Rounds 5-6 (2026-10-15): decode +3-5%, the idle CPU pool helps short prompts, PM4 resets the GPU
+
+**Installed:** engine `Strata-data/engines/strata-0.1.43-gfx1100opt-ce0f1ae8` (branch `opt6/integrate2` in
+`~/Documents/projects/Strata-wt/r5-iq3-sign`, local only) and four env lines in both run configs (backups
+`Strata-data/*.before-r6-2026-10-15`, written by `tmp/strata-opt/apply_round6.py`). Notes and logs:
+`tmp/strata-opt/progress/r6-*.md`, `r6b-*.md`. Live after the install, whole stack up (`side` + `embed`), greedy,
+600 tokens, 2 each: **code 144.8, prose 107.1, edit 122.9 t/s** (round 4 with the stack up: 131 / 96 / 118; not an
+interleaved A/B). Image requests work (a rendered invoice was read exactly); 0 amdgpu kernel lines.
+
+| Change | Kind | Measured |
+|---|---|---|
+| i-quant signs with `v_perm_b32` (IQ2/IQ3 signs, IQ4 table lookups) | engine, bit-exact | expert kernels -12 to -16% (real weights, 10 layers, T=1-4); GPU rings -0.3 to -0.6 ms a round |
+| Draft stop on the cumulative acceptance estimate: `STRATA_SPEC_CUM=0.35`, `STRATA_SPEC_CUM_ACC=0.12,0.26,0.43,0.51,0.59,0.66,0.79,0.96` (with `--spec 4`) | engine + env, drafts only | with the sign change: generate code +3.8-4.6%, edit +3.7%, prose +1-2%; server at temp 1.0, medians of 4: code +3.7%, edit +5.3%, prose +2.1% |
+| Batched commit graph (upstream 6f3e3810; `STRATA_COMMIT_BATCH=0` turns it off) | engine, bit-exact | draft -0.35 ms a round: code +1.3%, edit +1.6%, prose +2.5% (one pair each) |
+| `STRATA_PREFILL_CPU_SHARE=auto`, `STRATA_PREFILL_CPU_SHARE_MAX=4096` | env, rounding-level | fresh 0.8-3.6K prompts -19 to -34%; agent turns with 0.9-4K new tokens -11 to -19% by median (8 vs 8 sessions); 12K+ reads unchanged. A 3-vs-2 replay on the new engine showed no clear gain, so it is provisional |
+
+- **Exactness.** The two engine changes keep every verify window bit-identical (code, edit, prose; gen.sh's env and
+  the production env), and `hip_iq_signs`, `gdn_parity` and `qsa_parity` pass. The draft stop changes window shapes,
+  so greedy picks flip at near-ties (code 0-1 of 602, prose 10-11 of 600), the same class as a `--spec-min-p`
+  change. The CPU share computes rarely routed experts in the CPU's activation format (flips: code 3/603, edit
+  0/602, prose 11/601; upstream reports first-token KL 0.006 nats), and with `auto` a reply can differ from run to
+  run. Set `STRATA_PREFILL_CPU_SHARE=0` for exactness checks.
+- **Soak:** 25 min (210 mixed requests) on the candidate, plus 7 min (60) with the batched commit: 0 failures, 0
+  amdgpu kernel lines, CPU max 83 C.
+- **PM4 graph replay** (a ROCm CLR port that replays HIP graphs as PM4 command buffers, `~/rocm/clr-pm4-snap2` +
+  `DEBUG_HIP_GRAPH_PM4=1`): code +10%, edit +6%, bit-identical, but **3 GPU page faults in ~14 runs** (address 0x0,
+  scalar data). Each one hung the MES and ended in a full GPU reset with VRAM lost; the second crashed Hyprland.
+  Suspect: the encoder skips SET_SH_REG writes it thinks are unchanged inside a command buffer. Not usable without a
+  fix and a soak, and any test can reset the desktop GPU.
+- **Rejected:** faster CPU expert kernels (pool -8-11% a round, decode -1%: the pool and the PCIe DMA read DDR5
+  together, ~70 of 76.8 GB/s, so a faster pool makes the DMA slower; with `--pcie-frac 0` they give edit +8.7%);
+  reading the next layer's CPU experts into L3 during the GPU pre path (+1% even with an oracle);
+  `STRATA_SPEC_CUM_ADAPT`; `--spec 5`/`6`; a two-stage verify head (+0.7%, approximates the non-top logits);
+  `--prompt-cache-tail` (a no-op with 16K chunks); `STRATA_CACHE_MESSAGE_BOUNDARY` (+0.4-0.6 s per short tool result
+  past 8K in an appending agent loop); the upstream 0.1.44.1 merge (exact, speed-neutral).
+- **Where a code round goes now** (stock libs, 24.4 ms; `STRATA_TIMELINE` on branch `opt6/timeline`): GPU pre path
+  9.7 ms (hc reads 3.5, GDN 3.3, QSA 1.9, router 0.8; 2.5-4x their bandwidth floors), expert phase 8.9 ms (CPU pool,
+  cache hits and PCIe DMA in parallel), head and tail 1.8, draft 2.1. The GPU is busy ~85% and loses ~2.3 ms to
+  dispatch gaps (what PM4 removed). Next levers: fewer dispatches by fusion, faster pre-path kernels, and the draft
+  step (0.56 ms against a ~0.17 ms floor; drafts only, so its rounding is free).
+
 ## Headline
 
 Interleaved A/B, 2 rounds, a fresh server per arm (`tmp/strata-tuning/final_ab.sh`): 12 replies at temp 1.0,
