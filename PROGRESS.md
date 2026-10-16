@@ -3,7 +3,7 @@
 Handoff note. Rewritten at the end of every session, never appended to. Cap 40 lines.
 Next task: `PLAN.md`. Rules: `AGENTS.md`.
 
-**Last session:** 2026-10-16 (Strata round 7: engine `strata-0.1.43-gfx1100opt-210ebbdd` (one-kernel hyper-connection read, fewer graph nodes, attention and GEMV kernels, prompt attention v2) + Basalt's MTP dense with our re-rounded Q2_0 experts; live with the whole stack up: code 161-166, prose 123-127, edit 137 t/s, main model still bit-exact)
+**Last session:** 2026-10-16 (Strata round 7: engine `strata-0.1.43-gfx1100opt-210ebbdd` (one-kernel hyper-connection read, fewer graph nodes, attention and GEMV kernels, prompt attention v2) + Basalt's MTP dense with our re-rounded Q2_0 experts; live with the whole stack up: code 161-166, prose 123-127, edit 137 t/s, main model still bit-exact; round 8's expert-path node folds measured ~0 net and stay off)
 
 ## State
 

@@ -331,6 +331,16 @@ replay runs with `side` busy; 0 amdgpu kernel lines.
   1.0, the main model's hidden states from `STRATA_PREFILL_DUMP_R_ALL`, a PyTorch copy of the MTP layer checked against
   the engine's draft logits, KL training on the dense part (~108M params). Needs the GPU alone for 4-9 h. Drafts only.
 
+**Round 8 (same morning, 1 hour): nothing installed.**
+- Three more folds on the expert path (branch `opt8/launch` in `~/Documents/projects/Strata-wt/r8-launch`; env
+  `STRATA_GU_SWIGLU`, `STRATA_DOWN_WAITB`, `STRATA_DOWN_WAITA`, all off by default): 4-token window 1,193 -> 1,001 nodes,
+  windows and argmaxes bit-identical, but code +1%, prose -2.3 to +0.3%, edit -2.9 to +0.5%. The folded nodes run while
+  the GPU waits for the CPU experts anyway. Node cuts pay only on the critical path: 9 per GDN layer (combine, two HC
+  reads, qkv, conv, z, step norm, out, router tail) and 21 per QSA layer; those need gr_one-style in-kernel waits.
+- A leaner gr_one (fewer up-role registers, deeper weight prefetch, split streams): no variant beat round 7's.
+- `STRATA_MMVQ_IL_ROWS` (a round-7 suggestion) does nothing on HIP: the interleaved GEMV path is CUDA-only, and
+  gfx1100's own dispatch already picks the faster kernel per shape (`r4_from` in `native_mmvq.cu`).
+
 ## Headline
 
 Interleaved A/B, 2 rounds, a fresh server per arm (`tmp/strata-tuning/final_ab.sh`): 12 replies at temp 1.0,
