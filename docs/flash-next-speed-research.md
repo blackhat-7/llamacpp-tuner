@@ -297,12 +297,15 @@ drafter directory `Strata-data/mtp/rt-basalt-q2b` in both run configs (backups `
 written by `tmp/strata-opt/apply_round7.py`). Notes and logs: `tmp/strata-opt/progress/r7-*.md`. Live after the
 install, whole stack up, greedy, 600 tokens, 2 each: **code 161.3 / 165.5, prose 126.8 / 123.1, edit 136.7 / 136.5
 t/s** (round 6 live: 145 / 107 / 123; not an interleaved A/B). Image answers are word for word round 6's; the agent
-replay runs with `side` busy; 0 amdgpu kernel lines.
+replay runs with `side` busy; 0 amdgpu kernel lines. Re-measured later the same morning after a restart: code 158 / 165,
+prose 124 / 114, edit 140 / 143 t/s. Fresh prompt reads (live, second run of each size): 0.85K tokens 0.87 s, 1.6K
+1.20 s, 3.2K 1.83 s, 12K 4.1 s, 34K 11.6 s (~2,900 t/s); about round 6's (0.86 / 1.26 / 1.93 / 4.6 / 11.8-12.8 s). First
+reads of each size are 10-40% slower while the PLE table's pages cache.
 
 | Change | Kind | Measured |
 |---|---|---|
 | Hyper-connection read as one kernel ("gr_one", on by default; `STRATA_GR_ONE=0` = three kernels) | engine, bit-exact | read 1.16-1.40x faster at 1-6 tokens; GPU rings -0.5 to -0.6 ms a round; decode +1.5-2.5% |
-| Fewer graph nodes per verify window: `STRATA_SH_GATE_TAIL`, `_COMBINE_MAPPED`, `_QSA_GATE_Q8`, `_VERIFY_QDEDUP`, `_QFUSE`, `_DF_PLE`, `_MAPPED_FAST`, `_T1_FUSE`, `_QSA_FOLD`, `_ROUTER_TAIL_ROWS=4` | engine + env, bit-exact | 4-token window 1,674 -> 1,392 nodes; rings -0.9 ms a round; code +5% |
+| Fewer graph nodes per verify window: `STRATA_SH_GATE_TAIL`, `_COMBINE_MAPPED`, `_QSA_GATE_Q8`, `_VERIFY_QDEDUP`, `_QFUSE`, `_DF_PLE`, `_MAPPED_FAST`, `_T1_FUSE`, `_QSA_FOLD`, `_ROUTER_TAIL_ROWS=4` | engine + env, bit-exact | 4-token window 1,674 -> 1,193 nodes; rings -0.9 ms a round; code +5% |
 | QSA decode attention: the chunk kernel of upstream PR #540 on gfx1100 too, merge over live chunks only (on for HIP) | engine, bit-exact | attention 0.59 -> 0.37 ms a window; code +3.4% (ABBA) |
 | gfx1100 dense GEMVs, four rows a wave, at 5-6 tokens (`STRATA_MMVQ_R4=0` turns them off) | engine, bit-exact | 5-6 token qkv 76-87 -> 29-34 us; edit +6% in one binary (half from more 6-token windows) |
 | Draft step: no residual copy (`STRATA_MTP_NO_RCOPY`), final mixer as the fused read (`STRATA_MTP_MIX_FUSED`) | engine + env; bit-exact / drafts only | draft 1.92 -> 1.78 ms a round |
