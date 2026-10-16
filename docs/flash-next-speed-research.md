@@ -289,6 +289,48 @@ interleaved A/B). Image requests work (a rendered invoice was read exactly); 0 a
   dispatch gaps (what PM4 removed). Next levers: fewer dispatches by fusion, faster pre-path kernels, and the draft
   step (0.56 ms against a ~0.17 ms floor; drafts only, so its rounding is free).
 
+## Round 7 (2026-10-16): decode +10-18%, the main model still bit-exact
+
+**Installed:** engine `Strata-data/engines/strata-0.1.43-gfx1100opt-210ebbdd` (branch `opt7/integrate` in
+`~/Documents/projects/Strata-wt/r5-upstream`, local only, built with `build.sh`'s default options), 12 env lines and the
+drafter directory `Strata-data/mtp/rt-basalt-q2b` in both run configs (backups `Strata-data/*.before-r7-2026-10-16`,
+written by `tmp/strata-opt/apply_round7.py`). Notes and logs: `tmp/strata-opt/progress/r7-*.md`. Live after the
+install, whole stack up, greedy, 600 tokens, 2 each: **code 161.3 / 165.5, prose 126.8 / 123.1, edit 136.7 / 136.5
+t/s** (round 6 live: 145 / 107 / 123; not an interleaved A/B). Image answers are word for word round 6's; the agent
+replay runs with `side` busy; 0 amdgpu kernel lines.
+
+| Change | Kind | Measured |
+|---|---|---|
+| Hyper-connection read as one kernel ("gr_one", on by default; `STRATA_GR_ONE=0` = three kernels) | engine, bit-exact | read 1.16-1.40x faster at 1-6 tokens; GPU rings -0.5 to -0.6 ms a round; decode +1.5-2.5% |
+| Fewer graph nodes per verify window: `STRATA_SH_GATE_TAIL`, `_COMBINE_MAPPED`, `_QSA_GATE_Q8`, `_VERIFY_QDEDUP`, `_QFUSE`, `_DF_PLE`, `_MAPPED_FAST`, `_T1_FUSE`, `_QSA_FOLD`, `_ROUTER_TAIL_ROWS=4` | engine + env, bit-exact | 4-token window 1,674 -> 1,392 nodes; rings -0.9 ms a round; code +5% |
+| QSA decode attention: the chunk kernel of upstream PR #540 on gfx1100 too, merge over live chunks only (on for HIP) | engine, bit-exact | attention 0.59 -> 0.37 ms a window; code +3.4% (ABBA) |
+| gfx1100 dense GEMVs, four rows a wave, at 5-6 tokens (`STRATA_MMVQ_R4=0` turns them off) | engine, bit-exact | 5-6 token qkv 76-87 -> 29-34 us; edit +6% in one binary (half from more 6-token windows) |
+| Draft step: no residual copy (`STRATA_MTP_NO_RCOPY`), final mixer as the fused read (`STRATA_MTP_MIX_FUSED`) | engine + env; bit-exact / drafts only | draft 1.92 -> 1.78 ms a round |
+| Drafter: Basalt's self-distilled MTP dense + our Q2_0 MTP experts re-rounded with a signed least-squares scale | config, drafts only | prose tokens a round 2.02 -> 2.17, code 3.15 -> 3.24; 35K acceptance 0.80 -> 0.87 |
+| QSA prompt attention v2 (WMMA; `STRATA_PA_V2=0` = the old kernel) | engine, bit-exact | 603 -> 466 ms per 15K prompt (-2.7% of its GPU time) |
+
+- **Combined A/B** (generate in follow mode, so both arms read the same text; A C C A, 600 tokens): code 136.7 / 140.4
+  -> 152.8 / 153.4 t/s (+10.5%), edit 120.7 / 118.7 -> 136.1 / 136.3 (+14%), prose 98.4 -> 114.9 / 114.7 (+17%).
+- **Exactness.** With fixed drafts (`--suffix-draft 0`) every verify window and every emitted argmax equals the
+  installed engine on code, edit and prose; 200 free-running tokens after a 35K prompt are identical; the kernel parity
+  tests pass. The new drafter changes which tokens are verified together, so greedy picks flip at near-ties: code 2,
+  edit 0, prose 12 of 600 (round 6's draft stop: prose 9-11). Rounding-level, like round 6.
+- **Soak:** 15 min, 139 mixed requests (32K reads, cancelled streams, two at once, thinking on, temp 1.0): 0 failures,
+  0 amdgpu lines, CPU max 79 C, GPU 80 C.
+- **gr_one blocks wait on each other inside one kernel**, only on blocks dispatched before them. A wait gives up after
+  ~1M polls (~0.5 s); the engine then prints ERR and exits after that request. Never seen. `STRATA_GR_ONE=0` removes
+  the wait for ~2% of decode.
+- **Left out:** `STRATA_HEAD_MIX_MULTI` and `STRATA_HEAD_Q8` (they move the main model's head mix onto the fused read,
+  not bitwise on HIP, for 0.04 ms a round). `STRATA_VERIFY_PROFILE`, `_VERIFY_DEVICE_PLAN`, `_DOORBELL_STORE` and
+  `_LFUSE` turn the new paths off; keep them out of the config.
+- **Rejected:** prefetching predicted expert misses to VRAM (look-ahead recall 0.58; decode -2 to -4.5%), expert
+  kernels with weights staged in LDS (1.3-1.45x slower), prompt attention v3 (slower than v2), `STRATA_GDN_SPLIT`
+  (recurrence 0.48 -> 0.79 ms), a 4-wide GDN state kernel (the 2 MB state is cold each round), `STRATA_MTP_NORM_Q8`
+  (no gain), `STRATA_SPEC_COUPLED_DT=0.7` (sampled prose 99 -> 89 t/s).
+- **Next:** fit the MTP dense to Swift IQ3_XXS ourselves (Basalt fitted it to base Qwen). Server transcripts at temp
+  1.0, the main model's hidden states from `STRATA_PREFILL_DUMP_R_ALL`, a PyTorch copy of the MTP layer checked against
+  the engine's draft logits, KL training on the dense part (~108M params). Needs the GPU alone for 4-9 h. Drafts only.
+
 ## Headline
 
 Interleaved A/B, 2 rounds, a fresh server per arm (`tmp/strata-tuning/final_ab.sh`): 12 replies at temp 1.0,
