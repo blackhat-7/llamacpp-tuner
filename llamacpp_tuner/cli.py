@@ -233,6 +233,11 @@ def pull(
     multiple=True,
     help="NAME=VALUE added to the server's environment; repeatable",
 )
+@click.option(
+    "--server",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    help="llama-server binary to run instead of the installed one",
+)
 @BACKEND
 def serve(
     model: str,
@@ -246,6 +251,7 @@ def serve(
     no_mmproj_offload: bool,
     extra_args: str,
     env: tuple[str, ...],
+    server: Path | None,
     backend: str,
 ) -> None:
     """Run llama-server, overriding only explicitly supplied settings.
@@ -261,6 +267,10 @@ def serve(
         raise click.UsageError("--mmproj and --no-mmproj cannot be combined.")
     if bad := [item for item in env if "=" not in item]:
         raise click.UsageError(f"--env needs NAME=VALUE, got: {', '.join(bad)}")
+    if server and backend != "llama":
+        raise click.UsageError(
+            "--server picks a llama-server binary; use it with llama.cpp."
+        )
 
     environment = dict(item.split("=", 1) for item in env)
 
@@ -311,7 +321,7 @@ def serve(
             if no_mmproj_offload:
                 server_args.append("--no-mmproj-offload")
         server_args.extend(shlex.split(extra_args))
-        run_server(server_args, env=environment)
+        run_server(server_args, env=environment, binary=server)
     except click.ClickException:
         raise
     except (FileNotFoundError, ValueError) as error:

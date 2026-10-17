@@ -78,6 +78,7 @@ qwen = """owner/model-GGUF --quant Q6_K --ctx 32768 \
 ```
 
 Use `--env NAME=VALUE` (repeatable) for backend variables such as `GGML_VK_SUBALLOCATION_BLOCK_SIZE`; they go into llama-server's environment.
+Use `--server PATH` to run a different llama-server build for one profile, for example a pull-request branch that adds a model.
 
 `lct serve qwen` then expands to those arguments. Options typed after the alias replace the alias's value for that option; `--extra-args` is replaced as a whole.
 

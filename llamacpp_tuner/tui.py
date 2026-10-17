@@ -94,6 +94,7 @@ ContentSwitcher { height: 1fr; }
 .heading { color: $accent; text-style: bold; margin-bottom: 1; }
 .gap { margin-top: 1; }
 OptionList { border: none; background: transparent; padding: 0; height: auto; max-height: 16; text-wrap: nowrap; text-overflow: ellipsis; }
+#profiles, #settings { max-height: 100%; }
 OptionList:focus { border: none; background-tint: transparent; }
 OptionList > .option-list--option-highlighted { background: transparent; text-style: none; }
 OptionList:focus > .option-list--option-highlighted { background: $selection; color: $foreground; }
@@ -266,6 +267,7 @@ def profile(args: str) -> dict:
     model_tokens += ["--backend", p["backend"]] if p["backend"] != "llama" else []
     model_tokens += ["--file", p["filename"]] if p["filename"] else []
     model_tokens += ["--quant", p["quant"]] if p["quant"] else []
+    model_tokens += ["--server", str(p["server"])] if p["server"] else []
     mmproj_tokens = ["--mmproj", str(p["mmproj"])] if p["mmproj"] else []
     mmproj_tokens += ["--no-mmproj"] if p["no_mmproj"] else []
     mmproj_tokens += ["--no-mmproj-offload"] if p["no_mmproj_offload"] else []

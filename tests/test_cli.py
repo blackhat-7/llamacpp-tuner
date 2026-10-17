@@ -91,6 +91,23 @@ def test_serve_preserves_llama_defaults():
     ]
 
 
+def test_serve_runs_the_named_server_binary(tmp_path):
+    binary = tmp_path / "llama-server"
+    binary.write_text("")
+    with (
+        patch("llamacpp_tuner.cli.resolve_model", return_value=Path("m.gguf")),
+        patch("llamacpp_tuner.cli.run_server") as run_server,
+    ):
+        result = CliRunner().invoke(main, ["serve", "m.gguf", "--server", str(binary)])
+        rejected = CliRunner().invoke(
+            main, ["serve", "c.json", "--backend", "strata", "--server", str(binary)]
+        )
+
+    assert result.exit_code == 0
+    assert run_server.call_args.kwargs["binary"] == binary
+    assert rejected.exit_code != 0
+
+
 def test_serve_adds_only_explicit_common_args():
     with (
         patch(

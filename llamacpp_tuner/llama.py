@@ -176,9 +176,11 @@ def install_llama(force: bool = False, extra_cmake_args: Sequence[str] = ()) -> 
     return download_release()
 
 
-def run_server(args: list[str], env: dict[str, str] | None = None) -> None:
+def run_server(
+    args: list[str], env: dict[str, str] | None = None, binary: Path | None = None
+) -> None:
     """Run llama-server in the foreground; env adds variables to its environment."""
-    binary = get_llama_binary()
+    binary = binary or get_llama_binary()
     if not binary:
         raise FileNotFoundError(
             "llama-server not found. Install it or run 'lct setup'."

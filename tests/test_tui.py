@@ -107,6 +107,18 @@ def test_profile_row_shows_parallel_slots(workspace):
     asyncio.run(run())
 
 
+def test_profile_list_fills_the_panel(workspace):
+    write_aliases({f"p{i}": f"{workspace} --ctx 4096" for i in range(40)})
+
+    async def run() -> None:
+        app = LctApp()
+        async with app.run_test(size=(100, 50)):
+            panel = app.query_one("#profiles-column")
+            assert app.query_one("#profiles").size.height == panel.content_size.height
+
+    asyncio.run(run())
+
+
 def test_tab_moves_between_panes_and_pages_switch_after_search(workspace):
     async def run() -> None:
         app = LctApp()
