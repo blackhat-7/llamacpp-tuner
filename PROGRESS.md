@@ -27,6 +27,7 @@ Next task: `PLAN.md`. Rules: `AGENTS.md`.
 - **CPU heat:** Strata's pool workers spin through decode (13 workers = 14 busy cores). With an agent's test suite beside it the CPU hit 99 °C in ~2 min, even at 6 workers. Long unattended runs need a power limit or better cooling.
 - **Strata's 27 GB n-gram (PLE) table does not fit beside `side`** (unlocked, `ulimit -l` 8 MB): engine `6ecfbdb4` prefetches each token's rows (`MADV_WILLNEED`) and the config uses `--ple-io mmap`. Never `MADV_RANDOM` it (pages go first).
 - **Strata noise:** server t/s swings 8-16% between identical runs. Screen kernel switches in generate mode (`--stats`, ±1.5%); compare drafters or draft stops on the follow texts priced at one ms-by-window-size table (`tmp/strata-opt/r7d_std.py`, `r9d.sh`), not by t/s.
+- **Downloads cap at ~19 MiB/s (~160 Mbit/s), the internet plan:** the PC is on Wi-Fi (`wlan0`, 1170 Mbit/s link); `enp7s0` is a shared link (10.42.0.1) to another machine, not an uplink. More connections or another server add nothing.
 - **`pkill -f PATTERN` kills the calling shell** when the pattern is in its own command line (exit 144). Anchor patterns with `^`.
 - **Never run Strata with the PM4 graph replay libs** (`~/rocm/clr-pm4-snap2`, `DEBUG_HIP_GRAPH_PM4`): 3 GPU page faults in ~14 runs, each a full GPU reset; one crashed Hyprland (now in safe mode until the user restarts it).
 - **`STRATA_PREFILL_CPU_SHARE=auto` makes Strata replies differ run to run** (timing-based split). Set it to 0 for any exactness check.

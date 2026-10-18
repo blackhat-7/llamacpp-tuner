@@ -1,10 +1,15 @@
 """Discover and download GGUF files from Hugging Face."""
 
+import os
 import re
 from pathlib import Path, PurePosixPath
 from urllib.parse import quote
 
-from huggingface_hub import (
+# Models are tens of GB, so use every connection and core hf_xet can, unless the user chose otherwise;
+# it changes nothing on a line that one default download already fills.
+os.environ.setdefault("HF_XET_HIGH_PERFORMANCE", "1")
+
+from huggingface_hub import (  # noqa: E402  (hf_xet reads the variable above when it starts)
     HfApi,
     ModelCard,
     ModelInfo,
