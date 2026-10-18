@@ -32,7 +32,6 @@ Next task: `PLAN.md`. Rules: `AGENTS.md`.
 - **Never run Strata with the PM4 graph replay libs** (`~/rocm/clr-pm4-snap2`, `DEBUG_HIP_GRAPH_PM4`): 3 GPU page faults in ~14 runs, each a full GPU reset; one crashed Hyprland (now in safe mode until the user restarts it).
 - **`STRATA_PREFILL_CPU_SHARE=auto` makes Strata replies differ run to run** (timing-based split). Set it to 0 for any exactness check.
 - **Vulkan FA hides a scratch buffer** (4 KiB per context token with q8_0 K and V, not in the projected line).
-- **Jeeves upstream does not run on ROCm;** `tmp/jeeves/src` is on `blackhat-7/jeeves` branch `rocm-attention`.
 - **With `--kv-unified`, use `--no-cache-idle-slots`** or two clients evict each other's cache.
 - **Check per-process GTT spill** (`drm-memory-gtt` in `/proc/<pid>/fdinfo`); spill + deep prompt = GPU reset.
 - **One GPU slot: background requests evict the chat's prompt cache.** Keep them on `side`.
