@@ -344,6 +344,26 @@ reads of each size are 10-40% slower while the PLE table's pages cache.
 - `STRATA_MMVQ_IL_ROWS` (a round-7 suggestion) does nothing on HIP: the interleaved GEMV path is CUDA-only, and
   gfx1100's own dispatch already picks the faster kernel per shape (`r4_from` in `native_mmvq.cu`).
 
+## Round 9 (2026-10-17/18): a self-distilled drafter, temp-1 decode ~+3%
+
+- **Launch cuts** on the critical path (`STRATA_QSA_NR3`, `STRATA_Z_CONVAB`, branch `opt9/critical`): bit-exact,
+  GPU -0.17-0.20 ms a round (~0.8%), within noise. Not installed.
+- **Drafter fit** (`tmp/strata-opt/mtpfit/`): 714 transcripts sampled at the user's settings (temp 1.0, top_p 0.95,
+  top_k 20); the main model's final residual dumped at every position (16 GiB); a PyTorch copy of the draft layer
+  (vs the engine: top-1 0.93, logit cosine 0.998); KL + total-variation training of the dense part (88M params,
+  experts frozen) toward Swift. Grouped expert matmuls made a training run 2× faster (~8 min).
+- **Offline, 69 held-out transcripts:** drafts held per round greedy 2.223 -> 2.303, temp-1 2.188 -> 2.254 (+3%).
+  A higher learning rate, trainable expert scales, or TV weight 2 with 3 epochs added at most 0.4%.
+- **The draft stop had to be refit.** The trained drafter is less overconfident, so Basalt's table with min-p 0.5
+  offered it fewer drafts. Its own table (mean of its greedy and coupled calibrations) with `--spec-min-p 0.3`: on
+  the follow texts, priced at one ms-by-window-size table, code -0.4%, prose +1.7%, edit -0.1%; temp-1 serve A/B
+  (tokens and drafts per round priced the same way) +3%. Installed as `Strata-data/mtp/rt-sd2-swift`.
+- **Ceiling:** replaying the stop rule, even a perfect stop (knowing which drafts hold) gives only +9.5% with the old
+  drafter and +11-13% with the new one; five-token windows never pay. The drafter is spent. The next lever is the
+  dense layers' GPU time, ~2.5× their bandwidth floor.
+- **Live after install** (whole stack): code 163-170, prose 125-128, edit 138-143 t/s; prompt reads 12.5K tokens
+  in 4.3-4.8 s. That is inside the earlier band: server t/s swings 8-16% between identical runs on this box.
+
 ## Headline
 
 Interleaved A/B, 2 rounds, a fresh server per arm (`tmp/strata-tuning/final_ab.sh`): 12 replies at temp 1.0,
