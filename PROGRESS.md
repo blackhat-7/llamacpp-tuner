@@ -3,14 +3,14 @@
 Handoff note. Rewritten at the end of every session, never appended to. Cap 40 lines.
 Next task: `PLAN.md`. Rules: `AGENTS.md`.
 
-**Last session:** 2026-10-19 (switched Flash-Next to huihui-ai's uncensored Swift 1.5 IQ3_XXS: refuses 0/10 borderline prompts vs 10/10, same decode and prompt speed, thinks longer on some; `lct pull` uses hf_xet high-performance mode)
+**Last session:** 2026-10-22 (Flash-Next serves two requests at once: `"parallel": 2` in its Strata config)
 
 ## State
 
 - `lct up/down/ps` run several servers detached. Stacks are a `[stacks]` table in `aliases.toml`. State is `servers/<name>.json` + `.log` in the cache dir.
 - Stack `local` in `tmp/aliases.toml` = `swift-qwen` (GPU, :6868) + `side` (Qwen3.6-35B-A3B UD-IQ4_NL on CPU, :6869) + `embed` (Qwen3-Embedding-0.6B, :6870). `local-swarm` = `swarm` + `side` + `embed`; only one of the two can run.
 - `swift-qwen`: Swift-Qwen3.8-27B Q4_K_S + DFlash2 n5, 96k, two slots: 82 t/s prose / 92 code (thinking on). Managed llama.cpp `aa94f208`.
-- Profile `strata-swift-flash-next` (`--backend strata`, stack `local-flash`): **uncensored** Swift 1.5 Flash-Next IQ3_XXS (huihui-ai abliterated v2 `swift-IQ3_XXS`, pack `Strata-data/packs/swift-abl-iq3_xxs`) on Strata 0.1.43, 262k, :6868, config `strata-swift-iq3_xxs-tuned.json` (reserve 2000). Strata's own `strata-swift-iq3_xxs.json` has the same settings. Rollback to censored Swift: `Strata-data/*.before-abl-2026-10-18` (older `*.before-r9-2026-10-18`); the old GGUF and pack are still on disk.
+- Profile `strata-swift-flash-next` (`--backend strata`, stack `local-flash`): **uncensored** Swift 1.5 Flash-Next IQ3_XXS (huihui-ai abliterated v2 `swift-IQ3_XXS`, pack `Strata-data/packs/swift-abl-iq3_xxs`) on Strata 0.1.43, 262k, :6868, config `strata-swift-iq3_xxs-tuned.json` (reserve 2000, `"parallel": 2`; rollback `Strata-data/*.before-parallel-2026-10-22`). Strata's own `strata-swift-iq3_xxs.json` has the same settings. Rollback to censored Swift: `Strata-data/*.before-abl-2026-10-18` (older `*.before-r9-2026-10-18`); the old GGUF and pack are still on disk.
 - The config adds `--pcie-frac 0.35 --pcie-mode dma --ple-io mmap --prefill auto:16384 --mtp-window 8192`, the Swift expert profile, the agent draft vocabulary (`Strata-data/draft_vocab_agent.bin`), the hipBLASLt 100202 table, fused and matrix-core prompt kernels (`STRATA_HIP_WMMA/SELECT_WMMA/HC_UPMIX` + exact GDN switches), coupled drafts, `STRATA_ADAPT_LAG=2`, the env node cuts, the draft stop (`STRATA_SPEC_CUM=0.35` + `STRATA_SPEC_CUM_ACC` measured for the drafter, `--spec-min-p 0.3`), `STRATA_PREFILL_CPU_SHARE=auto` (`_MAX=4096`), round 7's 12 node-cut / draft-step switches, the drafter `--mtp Strata-data/mtp/rt-sd2-swift` (Basalt's dense self-distilled to Swift, `tmp/strata-opt/mtpfit/`) and the patched ROCr. The learned expert profile is saved (at the first request 5+ min after the last save) to `Strata-data/profiles/swift-1.5-iq3_xxs-learned.bin` and loaded at start.
 - Patched ROCr: `~/rocm/rocr-7.2.4-fix` (one line in `amd_blit_sdma.h`); patch, reproducer, rebuild script and an upstream issue draft in `tmp/strata-tuning/rocr-fix/`. Not filed yet.
 - ROCm 7.14.1 SDK (TheRock) in `~/rocm/therock-7.14.1` with `rocprofv3`; Strata build `build-rocm714` (prompt −21%, unused).
@@ -28,13 +28,13 @@ Next task: `PLAN.md`. Rules: `AGENTS.md`.
 - **Strata's 27 GB n-gram (PLE) table does not fit beside `side`** (unlocked, `ulimit -l` 8 MB): engine `6ecfbdb4` prefetches each token's rows (`MADV_WILLNEED`) and the config uses `--ple-io mmap`. Never `MADV_RANDOM` it (pages go first).
 - **Strata noise:** server t/s swings 8-16% between identical runs. Screen kernel switches in generate mode (`--stats`, ±1.5%); compare drafters or draft stops on the follow texts priced at one ms-by-window-size table (`tmp/strata-opt/r7d_std.py`, `r9d.sh`), not by t/s.
 - **Downloads cap at ~19 MiB/s (~160 Mbit/s), the internet plan:** the PC is on Wi-Fi (`wlan0`, 1170 Mbit/s link); `enp7s0` is a shared link (10.42.0.1) to another machine, not an uplink. More connections or another server add nothing.
+- **Two requests at once on Flash-Next run ~50 t/s each (92 total, vs 133 one after the other)**; a request alone loses ~3% (the slots take 1.9 GB of expert cache). `--batch-mtp`: 61 each, but alone -10%.
+- **An empty `servers/<name>.json` (left by a freeze) crashes `lct ps/up`**: delete it.
 - **`pkill -f PATTERN` kills the calling shell** when the pattern is in its own command line (exit 144). Anchor patterns with `^`.
 - **Never run Strata with the PM4 graph replay libs** (`~/rocm/clr-pm4-snap2`, `DEBUG_HIP_GRAPH_PM4`): 3 GPU page faults in ~14 runs, each a full GPU reset; one crashed Hyprland (now in safe mode until the user restarts it).
 - **`STRATA_PREFILL_CPU_SHARE=auto` makes Strata replies differ run to run** (timing-based split). Set it to 0 for any exactness check.
-- **Vulkan FA hides a scratch buffer** (4 KiB per context token with q8_0 K and V, not in the projected line).
 - **With `--kv-unified`, use `--no-cache-idle-slots`** or two clients evict each other's cache.
 - **Check per-process GTT spill** (`drm-memory-gtt` in `/proc/<pid>/fdinfo`); spill + deep prompt = GPU reset.
 - **One GPU slot: background requests evict the chat's prompt cache.** Keep them on `side`.
-- **RAM runs at DDR5-4800** (rated 5200, XMP off). 14 cores stream 67 GB/s; Strata's CPU expert pool reads 42 GB/s (compute-bound under the 75 W cap), so XMP would add little.
 - **`lct setup --force` without `--cmake-arg` replaces a source build** with the prebuilt one.
 - **Textual:** `OptionList` needs `text-wrap: nowrap`; never name an `App` method `run`. The global `max-height: 16` is lifted for `#profiles`/`#settings` only.
