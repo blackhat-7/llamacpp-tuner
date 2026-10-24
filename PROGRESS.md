@@ -3,14 +3,14 @@
 Handoff note. Rewritten at the end of every session, never appended to. Cap 40 lines.
 Next task: `PLAN.md`. Rules: `AGENTS.md`.
 
-**Last session:** 2026-10-22 (Flash-Next serves two requests at once: `"parallel": 2` in its Strata config)
+**Last session:** 2026-10-25 (Flash-Next: `"parallel": 2` (two requests at once) and a 16K thinking cap, `"reasoning_budget_tokens": 16384`)
 
 ## State
 
 - `lct up/down/ps` run several servers detached. Stacks are a `[stacks]` table in `aliases.toml`. State is `servers/<name>.json` + `.log` in the cache dir.
 - Stack `local` in `tmp/aliases.toml` = `swift-qwen` (GPU, :6868) + `side` (Qwen3.6-35B-A3B UD-IQ4_NL on CPU, :6869) + `embed` (Qwen3-Embedding-0.6B, :6870). `local-swarm` = `swarm` + `side` + `embed`; only one of the two can run.
 - `swift-qwen`: Swift-Qwen3.8-27B Q4_K_S + DFlash2 n5, 96k, two slots: 82 t/s prose / 92 code (thinking on). Managed llama.cpp `aa94f208`.
-- Profile `strata-swift-flash-next` (`--backend strata`, stack `local-flash`): **uncensored** Swift 1.5 Flash-Next IQ3_XXS (huihui-ai abliterated v2 `swift-IQ3_XXS`, pack `Strata-data/packs/swift-abl-iq3_xxs`) on Strata 0.1.43, 262k, :6868, config `strata-swift-iq3_xxs-tuned.json` (reserve 2000, `"parallel": 2`; rollback `Strata-data/*.before-parallel-2026-10-22`). Strata's own `strata-swift-iq3_xxs.json` has the same settings. Rollback to censored Swift: `Strata-data/*.before-abl-2026-10-18` (older `*.before-r9-2026-10-18`); the old GGUF and pack are still on disk.
+- Profile `strata-swift-flash-next` (`--backend strata`, stack `local-flash`): **uncensored** Swift 1.5 Flash-Next IQ3_XXS (huihui-ai abliterated v2 `swift-IQ3_XXS`, pack `Strata-data/packs/swift-abl-iq3_xxs`) on Strata 0.1.43, 262k, :6868, config `strata-swift-iq3_xxs-tuned.json` (reserve 2000, `"parallel": 2`, `"reasoning_budget_tokens": 16384`; rollbacks `Strata-data/*.before-parallel-2026-10-22`, `*.before-budget-2026-10-25`). Strata's own `strata-swift-iq3_xxs.json` has the same settings. Rollback to censored Swift: `Strata-data/*.before-abl-2026-10-18` (older `*.before-r9-2026-10-18`); the old GGUF and pack are still on disk.
 - The config adds `--pcie-frac 0.35 --pcie-mode dma --ple-io mmap --prefill auto:16384 --mtp-window 8192`, the Swift expert profile, the agent draft vocabulary (`Strata-data/draft_vocab_agent.bin`), the hipBLASLt 100202 table, fused and matrix-core prompt kernels (`STRATA_HIP_WMMA/SELECT_WMMA/HC_UPMIX` + exact GDN switches), coupled drafts, `STRATA_ADAPT_LAG=2`, the env node cuts, the draft stop (`STRATA_SPEC_CUM=0.35` + `STRATA_SPEC_CUM_ACC` measured for the drafter, `--spec-min-p 0.3`), `STRATA_PREFILL_CPU_SHARE=auto` (`_MAX=4096`), round 7's 12 node-cut / draft-step switches, the drafter `--mtp Strata-data/mtp/rt-sd2-swift` (Basalt's dense self-distilled to Swift, `tmp/strata-opt/mtpfit/`) and the patched ROCr. The learned expert profile is saved (at the first request 5+ min after the last save) to `Strata-data/profiles/swift-1.5-iq3_xxs-learned.bin` and loaded at start.
 - Patched ROCr: `~/rocm/rocr-7.2.4-fix` (one line in `amd_blit_sdma.h`); patch, reproducer, rebuild script and an upstream issue draft in `tmp/strata-tuning/rocr-fix/`. Not filed yet.
 - ROCm 7.14.1 SDK (TheRock) in `~/rocm/therock-7.14.1` with `rocprofv3`; Strata build `build-rocm714` (prompt −21%, unused).
