@@ -69,11 +69,13 @@ The first request after a load is not a measurement: lazy-loaded tensors (`-lzm 
 - **Client contract** (read the client's config, then check `/props` and `/slots`):
   - Its context and compaction budget must sit below the server's per-slot context (OpenClaw budgets ≈ n_ctx − 20k; Pi compacts at ctx − 16k). An agent compacting every turn loops.
   - Thinking needs `max_tokens` ≈ 32k; at 4k, half the turns ended mid-thought.
+  - Claude Code's auto-mode safety checks and helper calls (titles, summaries) send no `thinking` and a small `max_tokens`. A server that thinks anyway gives no verdict, and every tool call waits for retries and a timeout. On Strata set `"anthropic_thinking": "on_request"`.
   - Effort levels are template-specific: read `/props` → `chat_template`. Some templates only have on/off; some ignore `low` and think in full. `--reasoning-budget N` is the only hard cap; `reasoning_effort` just adds a sentence.
   - Clients in containers or on other hosts need `--host 0.0.0.0`. `-a NAME` gives every model the same id.
   - When a harness stalls, repeat the call against a cloud model before blaming the server.
   - Test fallback chains (local → cloud) in both modes; a local-first fallback once broke every cloud session.
 - **Soak**: a few real multi-turn sessions; watch GTT spill, RAM, temperature and the kernel log (`journalctl -k | grep amdgpu`).
+- **Where agent time goes** (Strata + Claude Code): `python3 bench/agent_time.py <strata config>` splits each engine run into the agent's writing, reading, cold re-reads and the client's other calls. Fix the biggest share first; it was not decode speed.
 
 ## 6. Report
 
