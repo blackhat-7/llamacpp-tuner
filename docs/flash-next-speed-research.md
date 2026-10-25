@@ -364,6 +364,45 @@ reads of each size are 10-40% slower while the PLE table's pages cache.
 - **Live after install** (whole stack): code 163-170, prose 125-128, edit 138-143 t/s; prompt reads 12.5K tokens
   in 4.3-4.8 s. That is inside the earlier band: server t/s swings 8-16% between identical runs on this box.
 
+## Upstream, Basalt and r/LocalLLaMA review (2026-10-26): only 1-6% items left
+
+Read-only review (code, logs, notes; nothing measured on the GPU). Gains are bounded by the round-6 decode profile
+and the prompt-stage costs above.
+
+- **Upstream Strata** is at v0.2.6 (4b9e05a2), 2,337 commits past our base v0.1.43; 37 of the 56 files we patch
+  changed, so moving is a port, not a rebase. No 7900 XTX result in upstream `bench/results` beats ours (best 62-97
+  t/s decode, up to 2,190 t/s prompt). Reported risks: #4081 (0.1.49.2 on gfx1100 parks but never restores), a 0.2.0
+  beta at 155 -> 95 t/s on two 4090s.
+- **Basalt** (github.com/jesdga95/basalt) is a hard fork of Strata from 2026-10-04, NVIDIA Blackwell only. Its HF
+  drafter is the file we already use. The 99.5% cache hits in the r/LocalLLaMA RTX 5080 post come from opencode's
+  append-only prompts; Basalt's cache code is Strata's.
+- **Why a 5080 reads prompts at 5,000+ t/s:** ~3.7x our int8 rate for the expert GEMMs (30% of our prompt time),
+  PCIe 5.0, and our hipBLASLt at ~40% of peak under the 291 W cap.
+
+| Candidate | Source | Gain for us (estimate) | Work | Exactness |
+|---|---|---|---|---|
+| `--spec 8 --mtp-max-t 4`: 8-wide windows for appends of 64 tokens or fewer | Basalt default | -25 to -40% read time on those appends | config, recheck decode | window-composition class |
+| `STRATA_PF_F16=1` | upstream edf61f18 and 5 more | prompt +3-6% | applies cleanly | first-token KL 0.0085 vs 0.0068 now |
+| Top-k scan, `TOPK_REG_MIN_BLOCKS=4096` | upstream 6ef23b89, b6ccf873 | prompt +1-3% at 16-150K | applies cleanly | exact |
+| Chunked GDN prompt recurrence in FP32 on HIP (`STRATA_GDN_CHUNKED` does not build for HIP; Basalt's is BF16) | Basalt 1d1159aa | prompt +3-5% (ceiling 7.7%) | 3-5 days | rounding |
+| GDN layer middle as one persistent launch | Basalt mid chain | decode +2.5-5% (ceiling 7%) | 7-12 days | exact |
+| Next layer's weights read into the 96 MB Infinity Cache while the combine waits | Basalt abccf9af | decode +1.5-5% | 2-4 days, microbench first | exact |
+| One launch per window for two requests; `--adapt-async 1` | upstream f629fb04 and 3 more, 1aa0abf6 | +1.5-6%, only with two at once | cherry-picks | exact / rounding |
+
+- **Correctness:** upstream 3f2db5e2 fixes CPU experts computed from a stale activation when `STRATA_ADAPT_LAG` > 1
+  (we run 2). Our gfx1100 router tail (`STRATA_ROUTER_TAIL`, on by default, with `STRATA_T1_FUSE=1`) publishes
+  every window's activations, so the skipped-publish path should not run. Unproven: an exact LAG 1 vs 2 A/B settles it.
+- **Lossy, left out:** int8 hyper-connection reads (Basalt HC8, `STRATA_HC_Q8`), `STRATA_ROUTE_TAIL_SKIP`, FP16
+  prompt attention, relaxed drafting.
+- **`"parallel": 2` slows a lone request.** The engine runs `--batch 2`, which arms no prefill CPU share
+  (`share_pool = o.batch <= 0`, generate.cpp:6925; the share measured -11 to -24% read time on 0.7-4K appends in
+  round 6). Batch paths are not lagged (generate.cpp:1336). The slots take 1.9 GiB from the expert cache, and decode
+  is -3%. Two at once run ~50 t/s each, 92 total, against 133 one after the other.
+- **Agent cache misses:** on 10-23 the 4 GiB / 3-slot cache evicted 236 times and skipped 135 parks; the 16 GiB /
+  6 slots of 10-25 have skipped none so far. Another 49 mid-session re-reads (6.3M tokens) came from claude-local's
+  shim moving Claude Code 2.1.309's in-conversation system messages to the top of the prompt. Fixed in ai-harnesses
+  0b83eef: the turn after a `cd` reads 58 tokens instead of 8,077.
+
 ## Headline
 
 Interleaved A/B, 2 rounds, a fresh server per arm (`tmp/strata-tuning/final_ab.sh`): 12 replies at temp 1.0,
