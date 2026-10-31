@@ -403,6 +403,53 @@ and the prompt-stage costs above.
   shim moving Claude Code 2.1.309's in-conversation system messages to the top of the prompt. Fixed in ai-harnesses
   0b83eef: the turn after a `cd` reads 58 tokens instead of 8,077.
 
+## Round 10 (2026-10-31): DFlash2, upstream v0.2.9, Basalt, Reddit, a fresh GPU profile
+
+Trigger: r/LocalLLaMA 1xjlgm4 ("upgrade Flash Next to DFlash2, +17%", an M5 Max in llama.cpp). The user's bar: only
+levers worth 10-20%, counted as agent work per hour (parallel agents, long chats kept cached), not only one request's
+t/s. Measured on the GPU: DFlash2's acceptance on our model, the PCIe split at 32K and 200K, a rocprofv3 profile. The
+rest is read from code, logs and posts. Notes: `tmp/strata-opt/progress/r10-*.md`.
+
+**No lossless engine change worth 10% is ready to install.** The levers that can reach it are multi-day work:
+
+| Lever | Ceiling | Basis | Work |
+|---|---|---|---|
+| Matrix-core (WMMA) math for 3-6 token verify windows: dense GEMVs, HC reads | code +11% (T4 at T1-2 speed) to +16% (memory floor), prose +5-7%; deeper drafts would then pay | dense GEMVs 1.09x their bandwidth floor at T1-2, 1.64x at T4, 2.03x at T6; HC reads 1.36-2.36x; the extra is per-token decode math, not memory | 1-2 weeks; an integer version stays bit-exact |
+| Next layer's weights into the 96 MB Infinity Cache while the GPU waits on CPU/PCIe | ~+8% code, ~+10% prose | waits cover ~65% of a GDN layer's 68 MB pre-path weights; round 7 saw qkv 37% faster from cache, assumed for all kernels | 1 h microbench, then 2-4 days |
+| Basalt's disk tier for the conversation cache (`--conversation-cache-disk-mib`) | 1x -> 2x+ work rate once 4-5 long chats overflow RAM; 0-3% with one agent | a 200K chat is 4.4 GB, 3 fit in 16 GiB; 60 GB of disk holds 13-18 (shared prefixes stored once); restore ~3-4 s vs 60-80 s re-read | 5-8 days, ~2,300 lines; `/home` 88% full, DRAM-less QLC NVMe shared with the PLE table |
+| Upstream sibling borrow (c9e571e0, 2b296987): a new subagent reuses a parked chat's prefix without evicting it | +2-8% (est.) | sibling subagents share system prompt and tools | ~1 day; first check that their first ~50K tokens match |
+
+- **DFlash2** (incoai/Qwen3.8-Flash-Next-DFlash2 Q8_0, llama.cpp v0.8.0 HIP, greedy, thinking off). Acceptance by
+  position 1-7, given the earlier ones held: code .87 .94 .82 .74 .77 .73 .83 (llama.cpp's MTP .91 .91 .90 .87 .77),
+  prose .67 .69 .55 .62 .68 .57 .69 (MTP .69 .65 .68 .65 .65), edit .94 .85 .84 .82 .76 .73 .70 (MTP ~.76), 35K
+  .66 .68 .55 .59. Draft step 5.2 ms in llama.cpp (our MTP 2.7-3.2). Priced with our round costs at a 2.5 ms step:
+  code +2%, prose +4%, edit -9% (against MTP plus suffix drafts), 32K -6%. A window above 4 tokens costs +5.5 ms per
+  token here, so deep drafts cannot pay. Upstream has it opt-in (7f97c35a, CLI only) and measured it slower on an
+  R9700. Not ported (8-12 days).
+- **PCIe split for missing experts** (`--pcie-frac`; upstream 8d56d417 moved gfx12 to 0.15). Interleaved, greedy,
+  600 tokens: 32K 0.35 106.4, 0.25 106.6, 0.15 103.9 t/s; 200K 0.35 110.4, 0.15 98.8 (-10.5%; the CPU pool grows
+  9.1 -> 11 ms a round). 0.35 stays.
+- **Profile** (TheRock's rocprofv3 1.3.2 attaches to the 7.2.4 runtime, +1.45 us per dispatch, subtracted). A code T4
+  window: HC reads 2.98 ms, dense GEMVs 3.47, router 0.69, GDN 0.56, QSA 0.72, head 0.81, waits ~3.0, idle gaps 2.8
+  (13%; 28% before round 7). Removing the CPU/PCIe waits outright is +17% code, +30% prose, but that needs the experts
+  in VRAM. A persistent critical-path kernel would recover ~1.3 ms (+6.5%). The CPU experts already use AVX-VNNI.
+- **Upstream v0.2.7-v0.2.9** (733 commits): gfx12 and Strix Halo work only. Best bundle for us: `STRATA_PF_F16` +
+  `STRATA_GDN_CHUNKED` (the gfx11 WMMA version exists upstream; the 10-26 row was wrong), ~+8% prompt reading, ~3% of
+  agent time. The other 10-26 rows were estimates and shrink: `--spec 8` <=0.2%, top-k scan <=1%, GDN mid chain ~1.5%,
+  MALL read-ahead as a wait filler <2%, two-at-once items 0 at `parallel 1`. Basalt's 124 new commits: nothing portable.
+- **Batch:** two requests at once lose here (92 t/s total vs 133 one after the other; 122 with `--batch-mtp`).
+  Upstream's batch wins need all experts resident or two GPUs.
+- **Reddit (10-15 to 10-31):** this box is the fastest single-7900 XTX Flash-Next result found. Radiance is RDNA4-only
+  and lossy (W4A8), QEngine CUDA-only and lossy, Betelgeuse a low-RAM llama.cpp fork; `--adapt-async 1` measured
+  0.99-1.00x in round 5.
+- **Agent work rate:** auto mode's safety checks took 18-29% of the local model's busy time. With `LOCAL_HELPER_MODEL`
+  claude-local now sends them to Claude Haiku (ai-harnesses 5dbb263), checked end to end against a stand-in server.
+- **Thinking effort** (4 prompts x 2 rounds, `output_config.effort` as Claude Code sends it; Strata maps max and high
+  to xhigh): max 551 s in total, medium 96 s (5.7x). Max hit the 16K thinking cap twice on a two-tailnet ssh/curl
+  question (137-140 s) and was right as often as medium there (1 of 2). Answers were equally correct on code, debugging
+  and the ssh question; max was better on an open-ended scheduling plan and wrote slightly cleaner code. Notes:
+  `tmp/strata-opt/progress/r10-effort.md`.
+
 ## Headline
 
 Interleaved A/B, 2 rounds, a fresh server per arm (`tmp/strata-tuning/final_ab.sh`): 12 replies at temp 1.0,
