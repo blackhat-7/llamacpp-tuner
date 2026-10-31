@@ -3,7 +3,7 @@
 Handoff note. Rewritten at the end of every session, never appended to. Cap 40 lines.
 Next task: `PLAN.md`. Rules: `AGENTS.md`.
 
-**Last session:** 2026-10-31 (round 10: DFlash2 measured on our model and dropped; upstream v0.2.9, Basalt and r/LocalLLaMA read; a fresh GPU profile; `--pcie-frac` 0.35 confirmed at 200K; claude-local sends auto mode's safety checks to Haiku in helper mode; thinking max vs medium: medium 5.7x faster on 4 prompts, max better on open-ended planning. Levers still worth 10% are multi-day, see the research doc's round 10. Server left down, as found). Before: 2026-10-28 (`"parallel": 1` + 10 cache slots).
+**Last session:** 2026-10-31 (round 10: DFlash2 measured on our model and dropped; upstream v0.2.9, Basalt and r/LocalLLaMA read; a fresh GPU profile; `--pcie-frac` 0.35 confirmed at 200K; claude-local sends auto mode's safety checks to Haiku in helper mode; thinking max vs medium: medium 5.7x faster on 4 prompts, max better on open-ended planning. Matrix-core GEMVs (2-2.7x slower at 3-6 tokens) and Infinity Cache prefetch (+3-5%) measured and dropped; the disk tier for the conversation cache is half built, resume from its notes. Server left down, as found). Before: 2026-10-28 (`"parallel": 1` + 10 cache slots).
 
 ## State
 
@@ -17,7 +17,7 @@ Next task: `PLAN.md`. Rules: `AGENTS.md`.
 - Patched ROCr: `~/rocm/rocr-7.2.4-fix` (one line in `amd_blit_sdma.h`); patch, reproducer, rebuild script and an upstream issue draft in `tmp/strata-tuning/rocr-fix/`. Not filed yet. ROCm 7.14.1 SDK with `rocprofv3`: `~/rocm/therock-7.14.1` (Strata build `build-rocm714`, prompt −21%, unused).
 - H2O-Lightning-4B (decision model, `/v1/systemone`, :6872) needs llama.cpp PR #30361: `tmp/llama.cpp-h2o/build-hip`, passed with `--server`. Profile `h2o-lightning` (GPU, ~7 GB VRAM), only with Strata down. The Claude skill `classify` (dotfiles) uses Flash-Next by default, H2O on the GPU for big bulk jobs.
 - Profiles `swarm`, `birbot-a3b`, `side` unchanged (`jeeves` retired 2026-10-17); see `skills/tune-local-model/references/host-7900xtx.md`.
-- Speed now (server, 2026-10-18). Decode, greedy, 600 tokens: code 163-170, prose 125-128, edit 138-143 t/s (2026-10-13 start: 92 / 76 / 78). Prompt reads ~2,700 t/s at 12.5K; agent sessions average ~2,300. Engine source: branch `opt7/integrate` in `~/Documents/projects/Strata-wt/r5-upstream` (local only). Notes: `docs/flash-next-speed-research.md` (its round 10, 2026-10-31, ranks the levers still worth 10%: matrix-core verify windows, Infinity Cache prefetch, a disk tier for the conversation cache; all multi-day), `tmp/strata-opt/RESUME.md`, `tmp/strata-opt/progress/r10-*.md`.
+- Speed now (server, 2026-10-18). Decode, greedy, 600 tokens: code 163-170, prose 125-128, edit 138-143 t/s (2026-10-13 start: 92 / 76 / 78). Prompt reads ~2,700 t/s at 12.5K; agent sessions average ~2,300. Engine source: branch `opt7/integrate` in `~/Documents/projects/Strata-wt/r5-upstream` (local only). Notes: `docs/flash-next-speed-research.md` (round 10, 2026-10-31: matrix-core GEMVs and Infinity Cache prefetch measured and dropped; the one lever left worth 10% is a disk tier for the conversation cache, in progress on branch `opt10/disk-tier` in `Strata-wt/r10-disktier`, notes `tmp/strata-opt/progress/r10-disktier.md`), `tmp/strata-opt/RESUME.md`, `tmp/strata-opt/progress/r10-*.md`.
 - Checks: `pytest` 76/76, ruff clean, pyright clean.
 
 ## Gotchas

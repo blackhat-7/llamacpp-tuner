@@ -410,14 +410,15 @@ levers worth 10-20%, counted as agent work per hour (parallel agents, long chats
 t/s. Measured on the GPU: DFlash2's acceptance on our model, the PCIe split at 32K and 200K, a rocprofv3 profile. The
 rest is read from code, logs and posts. Notes: `tmp/strata-opt/progress/r10-*.md`.
 
-**No lossless engine change worth 10% is ready to install.** The levers that can reach it are multi-day work:
+**No lossless engine change worth 10% to one request is left.** Two decode levers that looked like 10% were
+measured and dropped the same night; the remaining big lever is for several agents at once:
 
-| Lever | Ceiling | Basis | Work |
-|---|---|---|---|
-| Matrix-core (WMMA) math for 3-6 token verify windows: dense GEMVs, HC reads | code +11% (T4 at T1-2 speed) to +16% (memory floor), prose +5-7%; deeper drafts would then pay | dense GEMVs 1.09x their bandwidth floor at T1-2, 1.64x at T4, 2.03x at T6; HC reads 1.36-2.36x; the extra is per-token decode math, not memory | 1-2 weeks; an integer version stays bit-exact |
-| Next layer's weights into the 96 MB Infinity Cache while the GPU waits on CPU/PCIe | ~+8% code, ~+10% prose | waits cover ~65% of a GDN layer's 68 MB pre-path weights; round 7 saw qkv 37% faster from cache, assumed for all kernels | 1 h microbench, then 2-4 days |
-| Basalt's disk tier for the conversation cache (`--conversation-cache-disk-mib`) | 1x -> 2x+ work rate once 4-5 long chats overflow RAM; 0-3% with one agent | a 200K chat is 4.4 GB, 3 fit in 16 GiB; 60 GB of disk holds 13-18 (shared prefixes stored once); restore ~3-4 s vs 60-80 s re-read | 5-8 days, ~2,300 lines; `/home` 88% full, DRAM-less QLC NVMe shared with the PLE table |
-| Upstream sibling borrow (c9e571e0, 2b296987): a new subagent reuses a parked chat's prefix without evicting it | +2-8% (est.) | sibling subagents share system prompt and tools | ~1 day; first check that their first ~50K tokens match |
+| Lever | Result | Basis |
+|---|---|---|
+| Matrix-core (WMMA) math for 3-6 token verify windows | no-go: an exact iu8 WMMA IQ4_XS GEMV is 2-2.7x slower at T3-6 (qkv T4 19.6 -> 51.6 us); it wins only at T7-8 | one `v_wmma_i32_16x16x16_iu8` takes ~30 cycles and does not overlap vector work, dot4 takes 2; a GEMV fills T of 16 columns, so break-even is T=7.5. The real dense ceiling is +5.5% (all kernels at T2 efficiency); the rest of the profile's +11-16% was HC reads, head and router |
+| Next layer's weights into the 96 MB Infinity Cache during CPU/PCIe waits | no-go: realistic +3-5%, ceiling ~7% | warm vs cold on the engine's kernels: -44% at T1 but -23% at T4 (math-bound); a prefetch beside running kernels slows them 10-49%, so it pays only in true idle; 68 MB warms in 78 us |
+| Disk tier for the conversation cache (own block store: content-addressed 2,048-token K/V blocks, a manifest per chat, background writer, LRU byte budget) | 1x -> 2x+ work rate once 4-5 long chats overflow RAM; chats survive restarts | a 200K chat is 4.4 GB, 3 fit in 16 GiB; restore ~3-4 s vs 60-80 s re-read. In progress: branch `opt10/disk-tier`, `tmp/strata-opt/progress/r10-disktier.md` |
+| Upstream sibling borrow (c9e571e0, 2b296987): a new subagent reuses a parked chat's prefix without evicting it | +2-8% (est.) | after the disk tier; first check that sibling prompts share their first ~50K tokens |
 
 - **DFlash2** (incoai/Qwen3.8-Flash-Next-DFlash2 Q8_0, llama.cpp v0.8.0 HIP, greedy, thinking off). Acceptance by
   position 1-7, given the earlier ones held: code .87 .94 .82 .74 .77 .73 .83 (llama.cpp's MTP .91 .91 .90 .87 .77),
