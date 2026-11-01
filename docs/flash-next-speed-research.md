@@ -451,6 +451,38 @@ measured and dropped the same night; the remaining big lever is for several agen
   and the ssh question; max was better on an open-ended scheduling plan and wrote slightly cleaner code. Notes:
   `tmp/strata-opt/progress/r10-effort.md`.
 
+## Round 11 (2026-11-01/02): upstream v0.2.9 with our patches, and three installs
+
+Notes: `tmp/strata-opt/progress/r11-*.md`. All installs have a config backup `Strata-data/*.before-<name>-2026-11-0x`.
+
+- **Port to v0.2.9** (branch `opt11/port`). Stock v0.2.9 decodes 20-26% slower here (code 118 vs 156, prose 84 vs 112,
+  205K 82 vs 110 t/s; it has default switch tables only for gfx12 and Strix Halo). All 14 of our levers were ported
+  (the batched commit was already upstream); the result is bit-exact to stock v0.2.9 and decodes as fast as the old
+  engine. Config notes: reserve 1744 keeps the old cache size; `--pool-workers 13` (v0.2.9 defaults to 9, -5-12% in
+  serve mode); `"presence_penalty": 0` (v0.2.9's server adds the model card's 1.5 otherwise).
+- **Prompt reads** (other gfx1100 forks report 3,400-3,500 t/s). Their edge is mostly RAM: their 92-128 GB boxes keep
+  the 27 GB n-gram table cached, while ours is read cold from the QLC SSD (2-5 s a cold read). One 32K chunk was
+  0.86-1.17x here and failed KL on one prompt. Installed instead: equal-size 16K chunks (`STRATA_PREFILL_EQUAL=1`):
+  reads over 16K 8% faster (18K +20%, 35K +7%), KL <= 0.0077. `STRATA_GDN_CHUNKED` and `STRATA_PF_F16` failed KL
+  (up to 0.13).
+- **Disk tier for the conversation cache** (branch `opt11/disk-tier`, own block store: content-addressed 2,048-token
+  K/V blobs and a manifest per chat; writes only while the engine is idle, because SSD writes stall the n-gram reads):
+  34-64K chats restore in 2.5-3.3 s instead of 12-22 s, a 200K chat in 3.9 s instead of 70 s, token-identical to RAM
+  restores, also after a restart. Budget 32 GiB.
+- **Decode bundle** (branch `opt11/decode`): round 9's launch cuts (+0.5-1.1%) and next-layer weight prefetch during
+  GPU waits for CPU experts (`STRATA_WAIT_PF=1`, 32 blocks x 8 loads): code 160.6 -> 165.9, prose 115.0 -> 122.4, edit
+  138.5 -> 144.7, 200K 108.3 -> 111.8 t/s, bit-exact. Dropped: a Q6_K instruction cut (the kernels are bandwidth and
+  launch bound, not instruction bound), the GDN commit beside the draft (both use the full bandwidth).
+- **Host stalls:** decode windows read ~50 of 64 n-gram rows from the SSD; other programs' writes (file indexer,
+  browser) stall them 50-110 ms. 3 of 15 timing runs were lost to them. Fix outside the engine: no heavy writers on that
+  drive, or the `kyber` I/O scheduler (`tmp/strata-opt/progress/r11-plus.md`).
+- **Agent side:** claude-local sends WebSearch to the helper at low effort (max effort made each search 70-145 s;
+  research subagents spent 82% of their time waiting on searches).
+- **27B elpis** (Qwen3.8-27B EXL3 + DFlash2 on exllamav3-rocm): on the same bench Flash-Next beats its published 7900
+  XTX numbers in 6 of 8 rows and ties 2; prefill ~1,100 vs ~2,900 t/s; no Anthropic API. Not used.
+- **Left, all small or risky:** merging the GDN state pass into the next window (~+0.6%), prefetch extras (0.1-0.2%
+  each), a persistent pre-expert kernel (+5-6%, risky: in-kernel waits; a hung GPU resets the desktop).
+
 ## Headline
 
 Interleaved A/B, 2 rounds, a fresh server per arm (`tmp/strata-tuning/final_ab.sh`): 12 replies at temp 1.0,
