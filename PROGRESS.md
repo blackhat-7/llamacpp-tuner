@@ -3,7 +3,7 @@
 Handoff note. Rewritten at the end of every session, never appended to. Cap 40 lines.
 Next task: `PLAN.md`. Rules: `AGENTS.md`.
 
-**Last session:** 2026-11-02 (round 11: Flash-Next on upstream Strata v0.2.9 with our 14 gfx1100 speedups ported, plus three installs: equal-size prompt chunks (reads over 16K 8% faster), a disk tier for the conversation cache (a 200K chat restores in 3.9 s instead of a 70 s re-read) and a decode bundle (launch cuts + next-layer prefetch in GPU waits: code +3.3%, prose +6.4%, edit +4.4%, 200K +4.6%, bit-exact). Dropped after measuring: the 27B elpis recipe, the forks' one-big-chunk reads, GDN_CHUNKED/PF_F16 (KL up to 0.13), Q6_K and GDN-commit tweaks. Notes: research doc round 11). Before: 2026-10-31 (round 10).
+**Last session:** 2026-11-02 (round 11: Flash-Next on upstream Strata v0.2.9 with our 14 gfx1100 speedups ported, plus three installs: equal-size prompt chunks (reads over 16K 8% faster), a disk tier for the conversation cache (a 200K chat restores in 3.9 s instead of a 70 s re-read) and a decode bundle (launch cuts + next-layer prefetch in GPU waits: code +3.3%, prose +6.4%, edit +4.4%, 200K +4.6%, bit-exact). Dropped after measuring: the 27B elpis recipe, the forks' one-big-chunk reads, GDN_CHUNKED/PF_F16 (KL up to 0.13), Q6_K and GDN-commit tweaks. Notes: research doc round 11, which also lists the open leads; next tasks in `PLAN.md`). Before: 2026-10-31 (round 10).
 
 ## State
 
@@ -22,14 +22,14 @@ Next task: `PLAN.md`. Rules: `AGENTS.md`.
 
 ## Gotchas
 
-- **The custom Strata engine (`Strata-data/engines/strata-0.2.9-gfx1100opt-ee326c93`):** roll back with the `*.before-v029-2026-11-01` config and `git -C ~/Documents/projects/Strata checkout main` (old engine `strata-0.1.43-gfx1100opt-210ebbdd`). Compare engines with a pinned `--expert-cache` (auto moves rows with free VRAM and flips argmaxes). After any ROCm upgrade rerun its parity tests (`tmp/strata-opt/RESUME.md`) and check the startup line still ends `1-6 tokens in one kernel`.
-- **VRAM reserve 2000 leaves the desktop ~0.86 GB:** Strata allocates ~1.2 GB more after sizing its cache. Raise `--vram-reserve-mib` before games or heavy GPU apps run beside it.
+- **The custom Strata engine (`Strata-data/engines/strata-0.2.9-gfx1100opt-b3dcc3d4`):** roll back one step at a time with the `Strata-data/*.before-<name>-2026-11-0x` configs (decode, disktier, prefill, v029); before v0.2.9 also `git -C ~/Documents/projects/Strata checkout main`. A new engine binary or STRATA_* setting makes the disk tier drop its stored chats. Compare engines with a pinned `--expert-cache` (auto moves rows with free VRAM and flips argmaxes). After any ROCm upgrade rerun its parity tests (`tmp/strata-opt/RESUME.md`) and check the startup line still ends `1-6 tokens in one kernel`.
+- **VRAM reserve 1744 leaves the desktop ~0.86 GB** (v0.2.9 holds back 256 MiB more than 0.1.43 did at 2000): Strata allocates ~1.2 GB more after sizing its cache. Raise `--vram-reserve-mib` before games or heavy GPU apps run beside it.
 - **hsa-rocr 7.2.4 aborts copy-heavy apps:** `BlitSdma::PendingBytes` over-reads by one slot; Arch's `-D_GLIBCXX_ASSERTIONS` makes it fatal. **Rebuild `tmp/strata-tuning/rocr-fix/build.sh` after any ROCm update**, or drop the path from `lib_dirs`.
 - **CPU heat:** Strata's pool workers spin through decode (13 workers = 14 busy cores). With an agent's test suite beside it the CPU hit 99 °C in ~2 min. Long unattended runs need a power limit or better cooling.
 - **Strata's 27 GB n-gram (PLE) table shares RAM with the conversation cache** (up to 16 GiB; ~28 GB free with Flash-Next up): `--ple-io mmap` + engine `6ecfbdb4`'s row prefetch (`MADV_WILLNEED`). Never `MADV_RANDOM` it (pages go first).
 - **Strata noise:** server t/s swings 8-16% between identical runs. Screen kernel switches in generate mode (`--stats`, ±1.5%); compare drafters on the follow texts priced at one ms-by-window-size table (`tmp/strata-opt/r7d_std.py`, `r9d.sh`), not by t/s.
 - **Downloads cap at ~19 MiB/s, the internet plan** (Wi-Fi `wlan0`; `enp7s0` is a shared link to another machine, not an uplink).
-- **`"parallel": 2` (engine `--batch 2`, off since 2026-10-28) slows a lone request and can overwrite a cached chat:** no prefill CPU share (generate.cpp:6925; -11 to -24% on 0.7-4K appends), batch paths not lagged, 1.9 GiB less expert cache, decode -3%. Two at once run ~50 t/s each (92 total, vs 133 one after the other). `--batch-mtp`: 61 each, but alone -10%.
+- **Other programs writing to the SSD stall decode 50-110 ms:** each window reads ~50 of 64 n-gram rows from the QLC drive (the vicinae indexer, the browser, agents' builds). Discard runs with `--stats` host > 1 ms; fixes in `tmp/strata-opt/progress/r11-plus.md` (`kyber`, quieter writers). `"parallel": 2` stays off (DECISIONS 2026-10-28).
 - **An empty `servers/<name>.json` (left by a freeze) crashes `lct ps/up`**: delete it.
 - **`pkill -f PATTERN` kills the calling shell** when the pattern is in its own command line (exit 144). Use `pgrep -f "name[.]py"`.
 - **Never run Strata with the PM4 graph replay libs** (`~/rocm/clr-pm4-snap2`, `DEBUG_HIP_GRAPH_PM4`): each GPU page fault reset the whole GPU; one crashed Hyprland.

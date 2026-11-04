@@ -5,7 +5,14 @@ system ROCm 7.2.4, Strata 0.1.42 (local HIP build, `~/Documents/projects/Strata`
 Qwen3.8-Flash-Next GSQ-RCO IQ3_XXS. Web claims come from a 105-agent research run with 3-vote verification;
 "vendor" marks a model maker's own number, *est.* marks arithmetic. Scripts: `tmp/strata-tuning/` (gitignored).
 
-## Answer
+## Now (2026-11-02)
+
+- Engine `Strata-data/engines/strata-0.2.9-gfx1100opt-b3dcc3d4`: upstream Strata v0.2.9 with our gfx1100 patches,
+  a disk tier for the conversation cache and the round 11 decode bundle. Decode code 166, prose 122, edit 145 t/s,
+  112 after a 200K prompt; prompt reads ~2,900 t/s at 51K. Details and open leads: round 11 below.
+- The sections below are in date order; earlier numbers are as measured then.
+
+## Answer (2026-10-12)
 
 - **No better model fits.** Nothing verified beats Flash-Next for long agentic coding and fits 24 GB VRAM +
   ~80 GB RAM at 3 bits or more. The closest, GLM-5.3-Flash, needs ~120 GB and leads by only ~2 points.
@@ -359,12 +366,12 @@ reads of each size are 10-40% slower while the PLE table's pages cache.
   the follow texts, priced at one ms-by-window-size table, code -0.4%, prose +1.7%, edit -0.1%; temp-1 serve A/B
   (tokens and drafts per round priced the same way) +3%. Installed as `Strata-data/mtp/rt-sd2-swift`.
 - **Ceiling:** replaying the stop rule, even a perfect stop (knowing which drafts hold) gives only +9.5% with the old
-  drafter and +11-13% with the new one; five-token windows never pay. The drafter is spent. The next lever is the
+  drafter and +11-13% with the new one; five-token windows did not pay at round 9's costs. Further fitting gave at most +0.4%. The next lever then was the
   dense layers' GPU time, ~2.5× their bandwidth floor.
 - **Live after install** (whole stack): code 163-170, prose 125-128, edit 138-143 t/s; prompt reads 12.5K tokens
   in 4.3-4.8 s. That is inside the earlier band: server t/s swings 8-16% between identical runs on this box.
 
-## Upstream, Basalt and r/LocalLLaMA review (2026-10-26): only 1-6% items left
+## Upstream, Basalt and r/LocalLLaMA review (2026-10-26): items found were worth 1-6% each
 
 Read-only review (code, logs, notes; nothing measured on the GPU). Gains are bounded by the round-6 decode profile
 and the prompt-stage costs above.
@@ -410,15 +417,14 @@ levers worth 10-20%, counted as agent work per hour (parallel agents, long chats
 t/s. Measured on the GPU: DFlash2's acceptance on our model, the PCIe split at 32K and 200K, a rocprofv3 profile. The
 rest is read from code, logs and posts. Notes: `tmp/strata-opt/progress/r10-*.md`.
 
-**No lossless engine change worth 10% to one request is left.** Two decode levers that looked like 10% were
-measured and dropped the same night; the remaining big lever is for several agents at once:
+**No decode candidate measured this round reached 10% alone.** Results as of round 10, with what round 11 later did:
 
 | Lever | Result | Basis |
 |---|---|---|
 | Matrix-core (WMMA) math for 3-6 token verify windows | no-go: an exact iu8 WMMA IQ4_XS GEMV is 2-2.7x slower at T3-6 (qkv T4 19.6 -> 51.6 us); it wins only at T7-8 | one `v_wmma_i32_16x16x16_iu8` takes ~30 cycles and does not overlap vector work, dot4 takes 2; a GEMV fills T of 16 columns, so break-even is T=7.5. The real dense ceiling is +5.5% (all kernels at T2 efficiency); the rest of the profile's +11-16% was HC reads, head and router |
-| Next layer's weights into the 96 MB Infinity Cache during CPU/PCIe waits | no-go: realistic +3-5%, ceiling ~7% | warm vs cold on the engine's kernels: -44% at T1 but -23% at T4 (math-bound); a prefetch beside running kernels slows them 10-49%, so it pays only in true idle; 68 MB warms in 78 us |
-| Disk tier for the conversation cache (own block store: content-addressed 2,048-token K/V blocks, a manifest per chat, background writer, LRU byte budget) | 1x -> 2x+ work rate once 4-5 long chats overflow RAM; chats survive restarts | a 200K chat is 4.4 GB, 3 fit in 16 GiB; restore ~3-4 s vs 60-80 s re-read. In progress: branch `opt10/disk-tier`, `tmp/strata-opt/progress/r10-disktier.md` |
-| Upstream sibling borrow (c9e571e0, 2b296987): a new subagent reuses a parked chat's prefix without evicting it | +2-8% (est.) | after the disk tier; first check that sibling prompts share their first ~50K tokens |
+| Next layer's weights into the 96 MB Infinity Cache during CPU/PCIe waits | realistic +3-5%, ceiling ~7%; built in round 11 as `STRATA_WAIT_PF` (+3.0-5.5%, installed) | warm vs cold on the engine's kernels: -44% at T1 but -23% at T4 (math-bound); a prefetch beside running kernels slows them 10-49%, so it pays only in true idle; 68 MB warms in 78 us |
+| Disk tier for the conversation cache (own block store: content-addressed 2,048-token K/V blocks, a manifest per chat, background writer, LRU byte budget) | 1x -> 2x+ work rate once 4-5 long chats overflow RAM; chats survive restarts | a 200K chat is 4.4 GB, 3 fit in 16 GiB; restore ~3-4 s vs 60-80 s re-read. Installed in round 11 (branch `opt11/disk-tier`) |
+| Upstream sibling borrow (c9e571e0, 2b296987): a new subagent reuses a parked chat's prefix without evicting it | +2-8% (est.) | in upstream v0.2.9, so installed with the round 11 port; not measured on agent sessions yet |
 
 - **DFlash2** (incoai/Qwen3.8-Flash-Next-DFlash2 Q8_0, llama.cpp v0.8.0 HIP, greedy, thinking off). Acceptance by
   position 1-7, given the earlier ones held: code .87 .94 .82 .74 .77 .73 .83 (llama.cpp's MTP .91 .91 .90 .87 .77),
@@ -453,35 +459,116 @@ measured and dropped the same night; the remaining big lever is for several agen
 
 ## Round 11 (2026-11-01/02): upstream v0.2.9 with our patches, and three installs
 
-Notes: `tmp/strata-opt/progress/r11-*.md`. All installs have a config backup `Strata-data/*.before-<name>-2026-11-0x`.
+The user's bar: levers worth 10%+ alone or together, counted as agent work per hour (several agents, long chats kept
+cached). Notes: `tmp/strata-opt/progress/r11-*.md`. Every install has a config backup
+`Strata-data/strata-swift-iq3_xxs-tuned.json.before-<name>-2026-11-0x`.
 
-- **Port to v0.2.9** (branch `opt11/port`). Stock v0.2.9 decodes 20-26% slower here (code 118 vs 156, prose 84 vs 112,
-  205K 82 vs 110 t/s; it has default switch tables only for gfx12 and Strix Halo). All 14 of our levers were ported
-  (the batched commit was already upstream); the result is bit-exact to stock v0.2.9 and decodes as fast as the old
-  engine. Config notes: reserve 1744 keeps the old cache size; `--pool-workers 13` (v0.2.9 defaults to 9, -5-12% in
-  serve mode); `"presence_penalty": 0` (v0.2.9's server adds the model card's 1.5 otherwise).
-- **Prompt reads** (other gfx1100 forks report 3,400-3,500 t/s). Their edge is mostly RAM: their 92-128 GB boxes keep
-  the 27 GB n-gram table cached, while ours is read cold from the QLC SSD (2-5 s a cold read). One 32K chunk was
-  0.86-1.17x here and failed KL on one prompt. Installed instead: equal-size 16K chunks (`STRATA_PREFILL_EQUAL=1`):
-  reads over 16K 8% faster (18K +20%, 35K +7%), KL <= 0.0077. `STRATA_GDN_CHUNKED` and `STRATA_PF_F16` failed KL
-  (up to 0.13).
-- **Disk tier for the conversation cache** (branch `opt11/disk-tier`, own block store: content-addressed 2,048-token
-  K/V blobs and a manifest per chat; writes only while the engine is idle, because SSD writes stall the n-gram reads):
-  34-64K chats restore in 2.5-3.3 s instead of 12-22 s, a 200K chat in 3.9 s instead of 70 s, token-identical to RAM
-  restores, also after a restart. Budget 32 GiB.
-- **Decode bundle** (branch `opt11/decode`): round 9's launch cuts (+0.5-1.1%) and next-layer weight prefetch during
-  GPU waits for CPU experts (`STRATA_WAIT_PF=1`, 32 blocks x 8 loads): code 160.6 -> 165.9, prose 115.0 -> 122.4, edit
-  138.5 -> 144.7, 200K 108.3 -> 111.8 t/s, bit-exact. Dropped: a Q6_K instruction cut (the kernels are bandwidth and
-  launch bound, not instruction bound), the GDN commit beside the draft (both use the full bandwidth).
-- **Host stalls:** decode windows read ~50 of 64 n-gram rows from the SSD; other programs' writes (file indexer,
-  browser) stall them 50-110 ms. 3 of 15 timing runs were lost to them. Fix outside the engine: no heavy writers on that
-  drive, or the `kyber` I/O scheduler (`tmp/strata-opt/progress/r11-plus.md`).
-- **Agent side:** claude-local sends WebSearch to the helper at low effort (max effort made each search 70-145 s;
-  research subagents spent 82% of their time waiting on searches).
-- **27B elpis** (Qwen3.8-27B EXL3 + DFlash2 on exllamav3-rocm): on the same bench Flash-Next beats its published 7900
-  XTX numbers in 6 of 8 rows and ties 2; prefill ~1,100 vs ~2,900 t/s; no Anthropic API. Not used.
-- **Left, all small or risky:** merging the GDN state pass into the next window (~+0.6%), prefetch extras (0.1-0.2%
-  each), a persistent pre-expert kernel (+5-6%, risky: in-kernel waits; a hung GPU resets the desktop).
+### Installed
+
+| Change | Branch / engine | Measured | Exactness |
+|---|---|---|---|
+| Our 14 gfx1100 levers ported to upstream v0.2.9 | `opt11/port` | decode equal to the 0.1.43 engine; prompt reads 2-9% faster (15K 6.10 -> 5.56 s, 200K 71.7 -> 69.5 s) | bit-exact to stock v0.2.9 |
+| Equal-size prompt chunks, `STRATA_PREFILL_EQUAL=1` (16K chunks kept) | config only | reads over 16K 8% faster: 18K +20%, 20K +16%, 26-35K +2-7%; up to 16K unchanged | identical up to 16K; first-token KL <= 0.0077 above |
+| Disk tier for the conversation cache, 32 GiB in `Strata-data/conv-disk` | `opt11/disk-tier` | a chat pushed out of RAM or parked at a restart restores in 2.5-3.3 s (34-64K) and 3.9 s (200K) instead of 12-22 s and 70 s | token-identical to RAM restores, also after a restart |
+| Decode bundle: round 9's launch cuts + next-layer prefetch in GPU waits (`STRATA_WAIT_PF=1`) | `opt11/decode`, engine `strata-0.2.9-gfx1100opt-b3dcc3d4` | code 160.6 -> 165.9, prose 115.0 -> 122.4, edit 138.5 -> 144.7, 200K 108.3 -> 111.8 t/s | bit-exact |
+
+Soak after all installs (2026-11-02): 443 mixed requests over 15 min from two clients (code, prose, thinking, tool
+calls, a 20K prompt, cancelled streams, two chats taking turns), 0 errors, 0 amdgpu kernel lines.
+
+### Port to v0.2.9
+
+- Stock v0.2.9 (built unchanged for gfx1100) runs our pack, drafter and config, but decodes 20-26% slower: code 118
+  vs 156, prose 84 vs 112, edit 110 vs 137, 82 vs 110 t/s after 205K. Prompt reads are equal. A round costs 23-37% more:
+  GPU ring wait +3.5-4.6 ms, CPU pool +2.2-3.5 ms, host +1.0 ms. v0.2.9 has default switch tables only for gfx12
+  and Strix Halo.
+- Stock flag screen (code): `STRATA_FUSE_CONVAB` +1.1%, the gfx12 decode set +1.5%, `--spec-min-p 0.5` +1.0%,
+  `--pool-workers 9` -2.2%, the gfx1151 set -9%.
+- Config changes the port needs: reserve 1744 (v0.2.9 reserves 256 MiB more; same 10,018 slots), `--pool-workers 13`
+  (v0.2.9 defaults to 9: -5-12% in serve mode), `"presence_penalty": 0` (v0.2.9's server adds the model card's 1.5).
+  `~/Documents/projects/Strata` is at tag v0.2.9 (was 7695859a).
+- Compare engines with a pinned `--expert-cache`: `auto` moved 10 slots on a 0.02 GiB change in free VRAM and flipped
+  argmaxes.
+- v0.2.9 brought sibling borrow (new subagents reuse a parked chat's prefix) and lenient tool-call parsing (Python
+  `True`/`False` in arguments failed 14 subagent launches before).
+
+### Prompt reads
+
+Other gfx1100 Strata builds report 3,400-3,500 t/s (nicejunjie/Strata-rdna3; Strata PR #4859) against our
+2,550-2,900.
+- One chunk per prompt (`--prefill auto:32768`) cut GPU time 4-17%, but total read time was 0.86-1.17x of ours, and
+  one 33K prompt hit KL 0.048. The bigger first chunk waits for all its cold n-gram rows.
+- The n-gram (PLE) table is 27 GB and comes off the DRAM-less QLC SSD when not cached, at ~100K rows/s: a cold read
+  waits 2-5 s for it. Their 92-128 GB boxes likely keep it in RAM. Eight read threads did not help.
+- No prompt stage is CPU-bound. The power cap's share is not measured.
+- `STRATA_GDN_CHUNKED=1` and `STRATA_PF_F16=1` cut read time ~4% each but fail the quality bar (first-token KL up to
+  0.128 and 0.106; the top token changed on 1-2 of 12 prompts, short prompts included).
+
+### Disk tier
+
+- Own block store: content-addressed 2,048-token K/V blobs across layers, one blob per saved running state, a manifest
+  per chat, hash checks on every part, crash-safe writes, files bound to the engine binary and its STRATA_* settings
+  (changing either drops stored chats). Fits v0.2.9's sibling borrow: a disk match is restored whole and the disk keeps
+  its copy.
+- The writer runs only while the engine is idle (no request, no heartbeat for 1 s) and stops within one 1 MiB write when
+  a request arrives, because SSD writes during decode stall the n-gram reads. First write of a chat: 0.8-1.2 GiB in
+  0.5-1.0 s (200K: 3.5 GB in 2.1 s); a turn later only 251-278 MiB is new. Exit flush 0.5-0.6 s.
+- Not tested: decode while other programs write to the SSD with cold n-gram rows.
+
+### Decode bundle
+
+| Lever | ms a window (code / prose / edit) | Result |
+|---|---|---|
+| Launch cuts `STRATA_QSA_NR3`, `STRATA_Z_CONVAB`, `STRATA_QSA_KV_ROLE` | -0.11 / -0.27 / -0.15 | +0.5 / +1.1 / +0.5%, kept |
+| `STRATA_WAIT_PF=1`: the waits before the experts and inside the combine read the next layer's ~66 MB of dense weights (32 blocks x 8 loads) | -0.60 / -1.11 / -1.51 | +3.0 / +5.2 / +5.5%, kept; a layer after a long wait runs its pre path in 151 us instead of 188; 54% of layers have no idle time and gain nothing |
+| Q6_K instruction cut | kernel bench +-0.3% | dropped: the kernels run at 60-68% of bandwidth with a fixed launch cost, not instruction-bound |
+| GDN state commit beside the draft (stream priorities, CU-limited stream) | +0.01 to +0.10 | dropped: both use the full bandwidth |
+
+`STRATA_WAIT_PF=0` turns off only the prefetch.
+
+### Host stalls
+
+- 4 of 11 instrumented runs lost 3-30%; 3 of 15 bundle A/B runs were lost on both engines. In the server log 5.8% of
+  requests run >= 15% slower per round than similar ones. Estimated 1-4% of decode in real use.
+- Cause: the SSD, not memory compaction. Each decode window reads ~50 of its 64 n-gram rows from the drive; when other
+  programs write to it (the vicinae file indexer, the browser, agents), a read waits 50-110 ms.
+- Fixes outside the engine: no heavy writers on that drive, the `kyber` I/O scheduler (needs root; udev rule in
+  `r11-plus.md`), or the GGUF shard with the table on a drive nothing else writes to.
+
+### Agent side (ai-harnesses)
+
+- Auto mode's safety checks go to Claude Haiku in "local + Haiku" mode (5dbb263): they took 18-29% of the local
+  model's busy time.
+- WebSearch goes to the helper at low effort without the session's thinking (947dae1): at max effort one search took
+  149 s against 11 s; research subagents spent 82% of their time waiting on searches.
+- Local sessions get a short note on the server's limits (ad4a9f3).
+
+### Other things measured
+
+- **27B elpis** (Qwen3.8-27B EXL3 + DFlash2 on exllamav3-rocm, github.com/thefahien/elpis-on-7900xtx): built on Arch
+  (torch 2.14.1; a clang host wrapper for GCC 16's `<format>` against HIP's `__noinline__`), never loaded. On its own
+  bench Flash-Next measured code 115-144 / prose 114-123 t/s with thinking, 153-176 / 102-126 without, prefill 2,943 t/s
+  at 51K: above elpis's published numbers in 6 of 8 rows, level in 2. TabbyAPI has no Anthropic `/v1/messages`.
+- **7900 XTX sweep** (10-25 to 11-01, `r11-xtx.md`): no public single-card result beats our decode (best other Strata
+  setups 94-110 t/s). Avalon is slower at every depth. A llama.cpp Vulkan GQA-packing patch (mossipcams/ajax-optimization)
+  gave the 27B +16% with two streams. Strata issue #4938 (a VGPR jump in v0.2.9's 160-dot fast path) should not apply to
+  our port; not checked.
+
+### Open leads
+
+Measured ceilings or estimates; not a complete list. Each needs its own measurement.
+
+| Lead | Expected | Why / what to check |
+|---|---|---|
+| Keep more of the n-gram table in RAM: shrink the RAM conversation cache (16 -> ~8 GiB) now that the disk tier catches evictions | fewer 2-5 s cold prompt waits and fewer decode stalls; untested | measure cold reads and stall rate both ways |
+| One-chunk prompt reads with the n-gram rows warm or resident | GPU time -4-17% on 20-35K reads | the cold-row wait is what made it slower here; recheck KL at 33K |
+| Persistent kernel for the per-layer work before the experts | +5-6% decode (est.) | in-kernel waits; a hung GPU resets the desktop session, so only with the user's OK |
+| Prefetch each layer's own hit experts during waitB | untested | the waits before the experts have ~34 MB of room |
+| GDN state pass merged into the next window | ~+0.6% | ~113 MB fewer reads a round |
+| Prefetch extras | 0.1-0.2% each | |
+| DFlash2 plus suffix drafts on edit-like text | untested | needs the 8-12 day port; DFlash2 alone priced -9% to +7% |
+| Storage or RAM: a faster drive or more RAM for the 27 GB table | removes cold prompt waits and stalls | hardware |
+| Thinking effort | medium 5.7x faster on 4 prompts, max better on open-ended planning | the user prefers max |
+| Re-sweep upstream Strata, Basalt and r/LocalLLaMA | | Reddit RSS ends 2026-11-13; another route is needed |
 
 ## Headline
 
