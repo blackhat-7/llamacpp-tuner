@@ -66,6 +66,7 @@ Comparing engine builds (Strata): same-text runs vary 8-16%, so compare fixed dr
   - `--cache-ram N` keeps prompts in RAM; too small → rereads, too big → OOM with large offloaded models.
   - **Two clients** (chat + classifier/titles): `-np 2 --kv-unified --no-cache-idle-slots`. Without the last flag, every new request clears idle slots and the chat rereads its whole prompt.
   - Client-side prompt changes (dates, tool lists toggled) defeat caching; check the harness. Background requests (titles, autoname) default to the session model in some harnesses and evict its cache.
+  - Claude Code logs every request's shape in its transcript (`api-request` with `shapeHash` and `keep`, `api-request-shape` with the system prompt and tools). To find what broke a cached prefix, diff the shapes before and after a cold turn: dropped connector tools and moved system messages were the causes found here.
   - Cache save/restore lines only print at `-lv 4`.
 - **Vision**: measure VRAM after the first image, not at startup. Without `--mmproj`, image requests return HTTP 500 and the model learns from its history that it "cannot see"; keep the projector when swapping models behind a port a vision client uses.
 - **Client contract** (read the client's config, then check `/props` and `/slots`):
