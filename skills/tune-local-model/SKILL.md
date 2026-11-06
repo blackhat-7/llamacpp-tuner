@@ -56,6 +56,8 @@ Order of levers, biggest first (details and numbers in the reference):
 
 The first request after a load is not a measurement: lazy-loaded tensors (`-lzm auto`) stream from disk.
 
+Comparing engine builds (Strata): same-text runs vary 8-16%, so compare fixed drafts priced by window size, A B B A, not raw t/s. Pin the expert cache size for exactness checks (`auto` moves rows with free VRAM and flips picks). Accept a rounding-level change only with first-token KL ≤ 0.01 and the same top token on short and long prompts; two prompt switches with -4% read time each failed this.
+
 ## 5. Deployment checks in the real server
 
 - **Depth**: confirm prefill and decode near the context you will actually reach. Known Vulkan cliff near 131k (llama.cpp #27734): set `GGML_VK_SUBALLOCATION_BLOCK_SIZE=4294967296` (`lct serve --env`).
@@ -70,11 +72,13 @@ The first request after a load is not a measurement: lazy-loaded tensors (`-lzm 
   - Its context and compaction budget must sit below the server's per-slot context (OpenClaw budgets ≈ n_ctx − 20k; Pi compacts at ctx − 16k). An agent compacting every turn loops.
   - Thinking needs `max_tokens` ≈ 32k; at 4k, half the turns ended mid-thought.
   - Claude Code's auto-mode safety checks and helper calls (titles, summaries) send no `thinking` and a small `max_tokens`. A server that thinks anyway gives no verdict, and every tool call waits for retries and a timeout. On Strata set `"anthropic_thinking": "on_request"`.
+  - A proxy that forwards some requests to a cloud helper (claude-local's WebSearch) passes on the session's thinking and effort: one search took 149 s at max against 11 s at low. Strip them for helper calls.
   - Effort levels are template-specific: read `/props` → `chat_template`. Some templates only have on/off; some ignore `low` and think in full. `--reasoning-budget N` is the only hard cap; `reasoning_effort` just adds a sentence.
   - Clients in containers or on other hosts need `--host 0.0.0.0`. `-a NAME` gives every model the same id.
   - When a harness stalls, repeat the call against a cloud model before blaming the server.
   - Test fallback chains (local → cloud) in both modes; a local-first fallback once broke every cloud session.
 - **Soak**: a few real multi-turn sessions; watch GTT spill, RAM, temperature and the kernel log (`journalctl -k | grep amdgpu`).
+- **Storage**: weights or tables read from disk during decode (Strata's n-gram table on a QLC SSD) stall 50-110 ms whenever other programs write to that drive. Keep heavy writers off it; a disk-backed chat cache should write only while the server is idle.
 - **Where agent time goes** (Strata + Claude Code): `python3 bench/agent_time.py <strata config>` splits each engine run into the agent's writing, reading, cold re-reads and the client's other calls. Fix the biggest share first; it was not decode speed.
 
 ## 6. Report
