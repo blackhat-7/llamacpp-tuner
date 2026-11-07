@@ -5,6 +5,7 @@ Each line carries its own done-check. A task too big for one session gets split 
 
 ## Now
 
+- [x] **Local video: MiniMax H3 on ComfyUI.** `lct setup --backend comfyui`, the `video` profile, `lct video make/edit/extend/upscale/join/status/guide`, a Video tab in the TUI and the `make-video` skill. Done 2026-11-07: text, photo, extend, edit and upscale made real clips on the 7900 XTX, checked by eye and Whisper; times in the skill.
 - [x] **Serve aliases.** `lct serve <name>` expands arguments saved in `aliases.toml` (cache dir); later options override. Done: commit `9c53d08`, two CLI tests.
 - [x] **Adopt the long-task framework.** `AGENTS.md` routine, `PLAN.md`, `PROGRESS.md`, `DECISIONS.md`, `CLAUDE.md` symlink. Done when all four exist within their caps and are committed.
 - [x] **TUI shell.** `lct tui` opens a Textual app with Serve / Download / Benchmark tabs, a shared output log and footer shortcuts. Done when a `run_test` smoke test renders at widths 40, 80 and 120.

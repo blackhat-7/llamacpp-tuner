@@ -84,6 +84,8 @@ def address(line: str) -> str:
         return json.loads(line)["serving"]
     if line.startswith("ready: http"):  # Strata: "ready: http://host:port/v1  (...)"
         return line.split()[1].removesuffix("/v1")
+    if "To see the GUI go to: " in line:  # ComfyUI
+        return line.split("go to: ")[-1].strip()
     return ""
 
 

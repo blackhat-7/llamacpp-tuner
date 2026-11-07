@@ -14,7 +14,8 @@ from rich.console import Console
 from textual.widgets import Input, OptionList, RichLog, Static
 
 from llamacpp_tuner.cli import load_aliases, write_aliases
-from llamacpp_tuner.tui import LctApp, bench_row, card_summary
+from llamacpp_tuner.servers import LCT
+from llamacpp_tuner.tui import LctApp, bench_row, card_summary, video_command
 
 FAKE_SERVER = """
 import time
@@ -79,7 +80,7 @@ def test_renders_every_page_at_common_widths(width, workspace):
         app = LctApp()
         async with app.run_test(size=(width, 40)) as pilot:
             assert "4096" in row(app, "#settings", "ctx")
-            for key in "231":
+            for key in "2341":
                 await pilot.press(key)
                 await pilot.pause()
             assert "model missing" in row(app, "#profiles", "gone")
@@ -472,5 +473,105 @@ def test_editing_a_profile_keeps_its_env(workspace):
         async with app.run_test(size=(100, 40)) as pilot:
             await edit(pilot, app, "ctx", "8192")
             assert load_aliases() == {"mine": f"{workspace} --ctx 8192 --env A=1"}
+
+    asyncio.run(run())
+
+
+def test_video_command_follows_the_mode(tmp_path):
+    values = {
+        "mode": "make",
+        "prompt": "a cat",
+        "source": "",
+        "photos": "a.png, b.png",
+        "seconds": "8",
+        "quality": "draft",
+        "aspect": "9:16",
+        "seed": "",
+    }
+    make = video_command(values)
+    assert make[len(LCT) :] == ["video", "make", "a cat", "--quality", "draft"] + [
+        "--photo",
+        "a.png",
+        "--photo",
+        "b.png",
+        "--seconds",
+        "8",
+        "--aspect",
+        "9:16",
+    ]
+    edit = video_command(
+        values | {"mode": "edit", "source": "s.mp4", "prompt": "@p.txt", "seed": "5"}
+    )
+    assert edit[edit.index("edit") :][:4] == ["edit", "s.mp4", "--prompt-file", "p.txt"]
+    assert "--seconds" not in edit and edit[-2:] == ["--seed", "5"]
+    upscale = video_command(
+        values | {"mode": "upscale", "source": "s.mp4", "prompt": ""}
+    )
+    assert upscale[upscale.index("upscale") :] == ["upscale", "s.mp4"]
+    with pytest.raises(ValueError, match="Pick a clip"):
+        video_command(values | {"mode": "extend"})
+    with pytest.raises(ValueError, match="prompt"):
+        video_command(values | {"prompt": " "})
+
+
+def test_video_page_makes_a_clip_and_lists_it(monkeypatch, workspace, tmp_path):
+    library = tmp_path / "comfyui" / "data" / "output" / "video"
+    fake = tmp_path / "fake_video.py"
+    fake.write_text(
+        "import pathlib, sys\n"
+        f"out = pathlib.Path({str(library)!r}) / 'make_00001_.mp4'\n"
+        "out.parent.mkdir(parents=True, exist_ok=True)\n"
+        "out.write_bytes(b'mp4')\n"
+        "print('Making a 5 s draft clip, seed 1…', flush=True)\n"
+        "print('  step 2/4 (00:03)', flush=True)\n"
+        "print(f'Saved: {out} (832x480, 5.2 s)', flush=True)\n"
+    )
+    commands = []
+
+    def fake_command(values):
+        commands.append(video_command(values))
+        return [sys.executable, str(fake)]
+
+    monkeypatch.setattr("llamacpp_tuner.tui.video_command", fake_command)
+    monkeypatch.setattr("llamacpp_tuner.tui.probe", lambda path: (832, 480, 5.2))
+
+    async def run() -> None:
+        app = LctApp()
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.press("4")
+            assert "No clips yet" in str(
+                app.query_one("#clips", OptionList).get_option_at_index(0).prompt
+            )
+            await pilot.press("tab")  # Make settings: open Quality and pick draft
+            settings = app.query_one("#video-settings", OptionList)
+            settings.highlighted = settings.get_option_index("quality")
+            await pilot.press("enter")
+            app.query_one("#editor-input", Input).value = "best"
+            await pilot.press("enter")
+            assert app.video["quality"] == "standard"  # rejected: not a quality
+            app.query_one("#editor-input", Input).value = "draft"
+            await pilot.press("enter")
+            settings.highlighted = settings.get_option_index("prompt")
+            await pilot.press("enter")
+            app.query_one("#editor-input", Input).value = "a cat selling RAM"
+            await pilot.press("enter")
+            settings.highlighted = settings.get_option_index("run")
+            await pilot.press("enter")
+            await until(pilot, lambda: app.clips and "video" not in app.procs)
+            assert app.clips[0].name == "make_00001_.mp4"
+            assert "saved make_00001_.mp4" in text(app, "#video-status")
+            assert commands[0][-6:] == [
+                "--quality",
+                "draft",
+                "--seconds",
+                "5",
+                "--aspect",
+                "16:9",
+            ]
+            # x on the new clip sets up an extension of it.
+            await pilot.press("shift+tab", "x")
+            assert app.video["mode"] == "extend" and app.video["source"].endswith(
+                "make_00001_.mp4"
+            )
 
     asyncio.run(run())

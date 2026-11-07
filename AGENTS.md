@@ -5,13 +5,14 @@
 
 ## What this is
 
-`lct` is a small Python wrapper around llama.cpp. It does five things:
+`lct` is a small Python wrapper around llama.cpp. It does six things:
 
 1. find, download or build `llama-server`
 2. download an exact GGUF quantization and optional projector
 3. start `llama-server` with explicit pass-through arguments, directly or from a saved alias; `lct up/down/ps` run several detached at once (stacks)
 4. list downloaded GGUF files
-5. offer a terminal UI (`lct tui`) for the above plus `llama-bench` runs
+5. make and edit video clips with MiniMax H3 on ComfyUI (`lct video`; ComfyUI runs as the `video` profile)
+6. offer a terminal UI (`lct tui`) for the above plus `llama-bench` runs
 
 Model recommendations and tuning methodology belong in `skills/`, not Python heuristics.
 

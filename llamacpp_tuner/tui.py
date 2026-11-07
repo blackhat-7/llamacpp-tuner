@@ -6,6 +6,8 @@ import json
 import os
 import re
 import shlex
+import shutil
+import subprocess
 import time
 from collections.abc import Callable
 from itertools import pairwise
@@ -36,6 +38,7 @@ from textual.widgets.option_list import Option
 
 from llamacpp_tuner import servers
 from llamacpp_tuner.cli import (
+    VIDEO_PROFILE,
     load_aliases,
     load_stacks,
     pick_projector,
@@ -52,6 +55,14 @@ from llamacpp_tuner.downloader import (
 )
 from llamacpp_tuner.llama import get_llama_binary
 from llamacpp_tuner.servers import LCT, child_env, interrupt
+from llamacpp_tuner.video import (
+    ASPECTS,
+    MAX_SECONDS,
+    MIN_SECONDS,
+    QUALITIES,
+    output_dir,
+    probe,
+)
 
 # Kanagawa Dragon (rebelot/kanagawa.nvim), to match the user's editor and terminal.
 ACCENT, MUTED, GOOD, WARN = "#8ba4b0", "#737c73", "#87a987", "#e6c384"
@@ -121,6 +132,8 @@ HINTS = {
     "downloading": "c cancel-download  / search  p projector",
     "bench": "enter run/stop  tab settings",
     "bench-settings": "enter edit  tab models",
+    "video": "enter play  e edit  x extend  u upscale  tab settings",
+    "video-settings": "enter edit/run  tab library",
     "editor": "enter save  esc cancel",
     "search": "enter results  esc done",
 }
@@ -128,6 +141,26 @@ PANES = {
     "serve": ["#profiles", "#settings"],
     "download": ["#results", "#files"],
     "bench": ["#bench-model", "#bench-settings"],
+    "video": ["#clips", "#video-settings"],
+}
+# Video page settings: label, default, and the choices offered while editing.
+VIDEO_MODES = ("make", "edit", "extend", "upscale")
+VIDEO_SETTINGS = {
+    "mode": ("Mode", "make", VIDEO_MODES),
+    "prompt": ("Prompt", "", ()),
+    "source": ("Source", "", ()),
+    "photos": ("Photos", "", ()),
+    "seconds": ("Seconds", "5", ()),
+    "quality": ("Quality", "standard", QUALITIES),
+    "aspect": ("Aspect", "16:9", tuple(ASPECTS)),
+    "seed": ("Seed", "", ()),
+}
+# Settings each mode uses; the others are shown muted.
+VIDEO_USES = {
+    "make": {"prompt", "photos", "seconds", "quality", "aspect", "seed"},
+    "edit": {"prompt", "source", "photos", "quality", "seed"},
+    "extend": {"prompt", "source", "photos", "seconds", "quality", "seed"},
+    "upscale": {"source", "seed"},
 }
 SETTINGS = {
     "name": "Name",
@@ -247,6 +280,43 @@ def bench_row(result: dict) -> tuple[str, str, str, str]:
     return name, test, f"{result['avg_ts']:.1f}", f"± {result['stddev_ts']:.1f}"
 
 
+def video_command(values: dict[str, str]) -> list[str]:
+    """The 'lct video' command for the Video page's settings.
+
+    A prompt starting with @ is a file to read it from, for long prompts.
+    """
+    mode = values["mode"]
+    command = [*LCT, "video", mode]
+    if mode != "make":
+        if not values["source"]:
+            raise ValueError("Pick a clip in the library and press e, x or u.")
+        command.append(values["source"])
+    if mode != "upscale":
+        prompt = values["prompt"].strip()
+        if not prompt:
+            raise ValueError("Write a prompt first.")
+        command += ["--prompt-file", prompt[1:]] if prompt.startswith("@") else [prompt]
+        command += ["--quality", values["quality"]]
+        for photo in filter(None, (p.strip() for p in values["photos"].split(","))):
+            command += ["--photo", photo]
+    if mode in ("make", "extend"):
+        command += ["--seconds", values["seconds"]]
+    if mode == "make":
+        command += ["--aspect", values["aspect"]]
+    return command + (["--seed", values["seed"]] if values["seed"] else [])
+
+
+def clip_row(path: Path) -> Text:
+    """A library row: when it was made, its size and its name."""
+    stat = path.stat()
+    made = time.strftime("%b %d %H:%M", time.localtime(stat.st_mtime))
+    return Text.assemble(
+        (made + "   ", SOFT),
+        (f"{stat.st_size / 1024**2:5.1f} MB   ", NUMBER),
+        path.name,
+    )
+
+
 def profile(args: str) -> dict:
     """Parse a saved profile into setting values plus the tokens behind them."""
     ctx = serve.make_context("serve", shlex.split(args), resilient_parsing=True)
@@ -257,6 +327,9 @@ def profile(args: str) -> dict:
         elif p["backend"] == "strata":
             model = Path(p["model"]).expanduser()
             model, mmproj = (model if model.is_file() else None), None
+        elif p["backend"] == "comfyui":
+            model = Path(p["model"]).expanduser()
+            model, mmproj = (model if model.is_dir() else None), None
         else:
             model = resolve_model(p["model"], quant=p["quant"], filename=p["filename"])
             mmproj = pick_projector(p["model"], p["mmproj"], p["no_mmproj"])
@@ -277,6 +350,7 @@ def profile(args: str) -> dict:
         (v for flag, v in pairwise(extra) if flag in ("-np", "--parallel")), "1"
     )
     return {
+        "backend": p["backend"],
         "missing": model is None,
         "model": model.name
         if model and model.is_file()
@@ -379,6 +453,10 @@ class LctApp(App[None]):
         Binding("1", "page('serve')"),
         Binding("2", "page('download')"),
         Binding("3", "page('bench')"),
+        Binding("4", "page('video')"),
+        Binding("e", "video_from_clip('edit')"),
+        Binding("x", "video_from_clip('extend')"),
+        Binding("u", "video_from_clip('upscale')"),
         Binding("tab", "pane(1)", priority=True),
         Binding("shift+tab", "pane(-1)", priority=True),
         Binding("right", "pane(1)"),
@@ -423,6 +501,8 @@ class LctApp(App[None]):
         self.repos: dict[str, tuple[ModelInfo, str]] = {}
         self.bench = {key: default for key, (_, _, default) in BENCH_SETTINGS.items()}
         self.results: list[tuple[str, str, str, str]] = []
+        self.video = {key: default for key, (_, default, _) in VIDEO_SETTINGS.items()}
+        self.clips: list[Path] = []
 
     def compose(self) -> ComposeResult:
         with Horizontal(id="top"):
@@ -433,6 +513,7 @@ class LctApp(App[None]):
             Tab("Serve", id="serve"),
             Tab("Download", id="download"),
             Tab("Benchmark", id="bench"),
+            Tab("Video", id="video"),
         )
         with ContentSwitcher(initial="serve-page"):
             with Horizontal(id="serve-page", classes="page"):
@@ -465,6 +546,15 @@ class LctApp(App[None]):
                     panel.border_title = "Settings"
                     yield PickList(id="bench-settings")
                     yield Static(id="results-table", classes="gap")
+            with Horizontal(id="video-page", classes="page"):
+                with Vertical(classes="column panel") as panel:
+                    panel.border_title = "Library"
+                    yield PickList(id="clips")
+                    yield Static(id="clip-info", classes="gap")
+                with Vertical(classes="column panel") as panel:
+                    panel.border_title = "Make"
+                    yield PickList(id="video-settings")
+                    yield Static(id="video-status", classes="gap")
         with Horizontal(id="editor"):
             yield Label("", id="editor-label")
             yield Input(id="editor-input")
@@ -485,6 +575,8 @@ class LctApp(App[None]):
         self.refresh_models()
         self.refresh_profiles()
         self.show_bench_settings()
+        self.refresh_clips()
+        self.show_video_settings()
         self.query_one("#profiles").focus()
         for name, pid in servers.running().items():
             self.follow_server(name, pid)
@@ -529,7 +621,16 @@ class LctApp(App[None]):
             if not state:
                 state = Text("○ idle", style=MUTED)
         self.query_one("#state", Static).update(state)
+        if "video" not in self.procs:  # a running job shows its own progress there
+            self.query_one("#video-status", Static).update(self.video_server_state())
         self.update_hints()
+
+    def video_server_state(self) -> Text:
+        if VIDEO_PROFILE in self.urls:
+            return Text(f"● ComfyUI ready at {self.urls[VIDEO_PROFILE]}", style=GOOD)
+        if VIDEO_PROFILE in self.servers:
+            return Text("◌ ComfyUI loading", style=WARN)
+        return Text("○ ComfyUI stopped · the first job starts it", style=MUTED)
 
     def update_hints(self) -> None:
         focused = self.focused
@@ -552,7 +653,7 @@ class LctApp(App[None]):
             keys = keys.replace("p projector", f"p projector-{state}")
         hints = hint_line(keys)
         if context not in ("editor", "search"):
-            hints.append_text(hint_line("1-3 pages  q quit"))
+            hints.append_text(hint_line("1-4 pages  q quit"))
         if self.pending:
             hints = Text(self.pending[0], style=WARN)
         self.query_one("#hints", Static).update(hints)
@@ -609,6 +710,8 @@ class LctApp(App[None]):
         editor = self.query_one("#editor-input", Input)
         choices = {"model": self.models, "mmproj": self.projectors}.get(target[1])
         suggestions = ["none", *choices] if choices is not None else []
+        if target[0] == "video":
+            suggestions = list(VIDEO_SETTINGS[target[1]][2])
         editor.suggester = SuggestFromList(suggestions, case_sensitive=False)
         editor.value = value
         self.query_one("#editor").add_class("-open")
@@ -633,6 +736,9 @@ class LctApp(App[None]):
         if page == "bench":
             self.bench[key] = value
             self.show_bench_settings()
+        elif page == "video":
+            if not self.save_video_setting(key, value):
+                return
         elif not self.save_setting(key, value):
             return
         self.close_editor()
@@ -799,6 +905,8 @@ class LctApp(App[None]):
                 label.append(f"{details['slots']} slots", style=NUMBER)
         elif details["missing"]:
             label.append("model missing", style=WARN)
+        elif details["backend"] == "comfyui":
+            label.append("video · ComfyUI", style=MEDIA)
         else:
             label.append(f"{tokens(int(details['ctx'] or 0))} ctx  ", style=NUMBER)
             if details["slots"] != "1":
@@ -1007,7 +1115,10 @@ class LctApp(App[None]):
                     partial += chunk
                     if not partial.endswith("\n"):
                         continue
-                    line, partial = partial.rstrip(), ""
+                    # Progress bars redraw with \r; show only their latest state.
+                    # Colour codes (ComfyUI logs) would print as raw escapes.
+                    line = partial.rstrip().rsplit("\r", 1)[-1]
+                    line, partial = re.sub(r"\x1b\[[0-9;]*[A-Za-z]", "", line), ""
                     if found := servers.address(line):
                         self.urls[name] = found
                         self.render_profiles()
@@ -1222,3 +1333,189 @@ class LctApp(App[None]):
         if code > 0:
             self.fail(f"llama-bench exited with code {code}. See the output log.")
         self.show_results("stopped")
+
+    # Video page: the clip library on the left, what to make next on the right
+
+    def refresh_clips(self, select: Path | None = None) -> None:
+        folder = output_dir()
+        found = folder.glob("*.mp4") if folder.is_dir() else []
+        self.clips = sorted(found, key=lambda p: p.stat().st_mtime, reverse=True)
+        options = self.query_one("#clips", OptionList)
+        options.clear_options()
+        for path in self.clips:
+            options.add_option(Option(clip_row(path), str(path)))
+        if not self.clips:
+            empty = "No clips yet. Press tab, write a prompt and run ▶ make."
+            options.add_option(Option(Text(empty, style=MUTED), disabled=True))
+            self.query_one("#clip-info", Static).update("")
+            return
+        options.highlighted = self.clips.index(select) if select in self.clips else 0
+
+    @on(OptionList.OptionHighlighted, "#clips")
+    @work(exclusive=True, group="clip-info")
+    async def show_clip(self, event: OptionList.OptionHighlighted) -> None:
+        path = Path(str(event.option.id))
+        info = self.query_one("#clip-info", Static)
+        try:
+            width, height, seconds = await asyncio.to_thread(probe, path)
+        except (OSError, RuntimeError, ValueError, KeyError, IndexError):
+            info.update(Text(f"Cannot read {path.name}", style=WARN))
+            return
+        rows: list[tuple[str, Text | str]] = [
+            ("Size", Text(f"{width}×{height}", style=NUMBER)),
+            ("Length", Text(f"{seconds:.1f} s", style=NUMBER)),
+            ("File", Text(str(path), style=SOFT)),
+        ]
+        info.update(grid(rows))
+
+    @on(OptionList.OptionSelected, "#clips")
+    def play_clip(self, event: OptionList.OptionSelected) -> None:
+        opener = shutil.which("xdg-open") or shutil.which("open")
+        if not opener:
+            self.fail("No xdg-open to play clips with.")
+            return
+        subprocess.Popen(
+            [opener, str(event.option.id)],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+
+    def action_video_from_clip(self, mode: str) -> None:
+        """e, x or u on a library clip: edit, extend or upscale it next."""
+        if self.page != "video" or self.edit_target or "video" in self.procs:
+            return
+        options = self.query_one("#clips", OptionList)
+        if not self.clips or options.highlighted is None:
+            self.fail("Make a clip first.")
+            return
+        source = str(options.get_option_at_index(options.highlighted).id)
+        self.video |= {"mode": mode, "source": source}
+        self.show_video_settings()
+        settings = self.query_one("#video-settings", OptionList)
+        settings.focus()
+        settings.highlighted = settings.get_option_index(
+            "run" if mode == "upscale" else "prompt"
+        )
+
+    def show_video_settings(self) -> None:
+        options = self.query_one("#video-settings", OptionList)
+        highlighted = options.highlighted
+        options.clear_options()
+        mode = self.video["mode"]
+        empty = {"prompt": "describe the clip, or @file.txt", "seed": "random"}
+        for key, (label, _, _) in VIDEO_SETTINGS.items():
+            value = self.video[key]
+            if key == "mode":
+                shown = Text(value, style=f"bold {ACCENT}")
+            elif key not in VIDEO_USES[mode]:
+                shown = Text("–", style=MUTED)
+            elif key == "source":
+                shown = (
+                    Text(Path(value).name, style=MEDIA)
+                    if value
+                    else Text(
+                        "highlight a clip in the library, press e, x or u", style=MUTED
+                    )
+                )
+            elif not value:
+                shown = Text(empty.get(key, "none"), style=MUTED)
+            else:
+                shown = Text(value, style="" if key in ("prompt", "photos") else NUMBER)
+            options.add_option(Option(setting_row(label, shown), key))
+        options.add_option(Option(Text(""), disabled=True))
+        running = "video" in self.procs
+        action = Text(
+            "■ stop" if running else f"▶ {mode}",
+            style=f"bold {WARN if running else GOOD}",
+        )
+        options.add_option(Option(action, "run"))
+        options.highlighted = highlighted or 0
+
+    @on(OptionList.OptionSelected, "#video-settings")
+    def edit_video_setting(self, event: OptionList.OptionSelected) -> None:
+        key = str(event.option.id)
+        if key == "run":
+            self.toggle_video()
+        else:
+            self.open_editor(("video", key), VIDEO_SETTINGS[key][0], self.video[key])
+
+    def save_video_setting(self, key: str, value: str) -> bool:
+        label, _, choices = VIDEO_SETTINGS[key]
+        try:
+            if choices and value not in choices:
+                raise ValueError(f"{label} is one of: {', '.join(choices)}.")
+            if key == "seconds":
+                try:
+                    seconds = float(value)
+                except ValueError:
+                    seconds = -1.0
+                if not MIN_SECONDS <= seconds <= MAX_SECONDS:
+                    raise ValueError(f"Seconds go from {MIN_SECONDS} to {MAX_SECONDS}.")
+            if key == "seed" and value and not value.isdigit():
+                raise ValueError(
+                    "The seed is a whole number, or empty for a random one."
+                )
+            if key in ("source", "photos"):
+                paths = [p.strip() for p in value.split(",") if p.strip()]
+                if missing := [p for p in paths if not Path(p).expanduser().is_file()]:
+                    raise ValueError(f"No such file: {', '.join(missing)}")
+                value = ", ".join(str(Path(p).expanduser()) for p in paths)
+        except ValueError as error:
+            self.fail(str(error))
+            return False
+        self.video[key] = value
+        self.show_video_settings()
+        return True
+
+    def toggle_video(self) -> None:
+        if job := self.procs.get("video"):
+            interrupt(job.pid)
+            return
+        try:
+            command = video_command(self.video)
+        except ValueError as error:
+            self.fail(str(error))
+            return
+        self.run_video(command)
+
+    def adopt_video_server(self) -> None:
+        """Show the ComfyUI server a job started, like any server started here."""
+        pid = servers.running().get(VIDEO_PROFILE)
+        if pid and VIDEO_PROFILE not in self.servers:
+            self.follow_server(VIDEO_PROFILE, pid)
+
+    @work(group="video")
+    async def run_video(self, command: list[str]) -> None:
+        status = self.query_one("#video-status", Static)
+        saved: list[Path] = []
+        shown_stop = False
+
+        def follow(line: str) -> bool:
+            nonlocal shown_stop
+            if not shown_stop:  # the job is running now, so ▶ becomes ■ stop
+                shown_stop = True
+                self.show_video_settings()
+            text = line.strip()
+            if text.startswith("Saved: "):
+                saved.append(Path(text.removeprefix("Saved: ").rsplit(" (", 1)[0]))
+            elif text.startswith("step ") or text.endswith("…"):
+                status.update(Text(f"◌ {text}", style=WARN))
+                if text.startswith("Starting ComfyUI"):
+                    self.set_timer(2, self.adopt_video_server)
+            return False
+
+        status.update(Text("◌ starting…", style=WARN))
+        self.update_state(f"◌ video {self.video['mode']}", WARN)
+        code = await self.stream("video", command, follow)
+        self.update_state()
+        self.show_video_settings()
+        self.adopt_video_server()
+        if code == 0 and saved:
+            status.update(Text(f"● saved {saved[-1].name}", style=GOOD))
+            self.refresh_clips(select=saved[-1])
+            self.notify(f"Saved {saved[-1].name}")
+        else:
+            status.update(Text("✕ stopped; see the output log", style=BAD))
+            if code > 0:
+                self.fail("The video job failed. See the output log.")
