@@ -21,6 +21,7 @@ Each line carries its own done-check. A task too big for one session gets split 
 - [x] **CPU side lane and embeddings.** Profiles `side` (Qwen3.6-35B-A3B on CPU, port 6869, model name `side`) and `embed` (Qwen3-Embedding-0.6B, port 6870), stack `local`. Done when both answer after `lct up local`.
 - [x] **N-gram drafting on the 27B.** Rejected: `draft-mtp,ngram-mod` made a code edit slower (120 → 105 t/s), prose unchanged (~60). MTP alone stays.
 - [x] **Live usage and a resizable log in the TUI.** Per-server CPU/RAM/VRAM, machine CPU/RAM/GPU/VRAM, draggable `Output` rule; `lct ps` shows VRAM. Done: 58 tests, screenshots at 90/120.
+- [x] **Live dashboard tab.** `lct tui` page 5: request lanes, speed and activity over time, recent requests, tool counts, parsed from server logs (`live.py`). Done: tests, screenshots at 80/100/140, the live Strata server.
 - [x] **Jeeves backend.** `--backend jeeves` runs PostHog/jeeves on its own PyTorch venv; profiles, `lct up/down/ps` and the TUI treat it like llama-server. Done: 64 tests, live fp8 run on the 7900 XTX.
 - [x] **Strata backend.** `--backend strata` starts a Strata run config (`strata-<model>.json`); profiles, `lct up/down/ps` and the TUI treat it like llama-server. Done: 68 tests, live `lct up/down strata-flash-next`.
 - [x] **Setup without a compiler.** `lct setup` downloads a prebuilt llama.cpp release (Vulkan; Metal on macOS) and checks it runs; source build only for `nvcc` or `--cmake-arg`. Done: 73 tests, fresh `LCT_HOME` install in 3 s finds the GPU, README install steps.

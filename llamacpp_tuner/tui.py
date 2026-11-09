@@ -9,13 +9,16 @@ import shlex
 import shutil
 import subprocess
 import time
+from collections import Counter
 from collections.abc import Callable
 from itertools import pairwise
 from pathlib import Path
 
 import click
 from huggingface_hub import ModelInfo
-from rich.console import Group
+from rich.color import Color, blend_rgb
+from rich.console import Console, ConsoleOptions, Group, RenderableType, RenderResult
+from rich.style import Style
 from rich.table import Table
 from rich.text import Text
 from textual import events, on, work
@@ -53,6 +56,7 @@ from llamacpp_tuner.downloader import (
     resolve_repository,
     search_repos,
 )
+from llamacpp_tuner.live import Live, Request
 from llamacpp_tuner.llama import get_llama_binary
 from llamacpp_tuner.servers import LCT, child_env, interrupt
 from llamacpp_tuner.video import (
@@ -122,6 +126,15 @@ Input:focus { background: $selection; }
 #splitter { height: 1; content-align: center middle; color: $text-muted; }
 #splitter:hover { color: $accent; }
 #hints { height: 1; margin-top: 1; }
+.-live #log, .-live #splitter { display: none; }
+#tiles { height: 7; }
+.tile { width: 1fr; height: 7; border: round """
+    + EDGE
+    + """; padding: 0 1; margin-right: 1; }
+#lanes, #pulse { height: auto; }
+#live-bottom { height: auto; min-height: 12; }
+#recent { width: 3fr; height: auto; }
+#tools { width: 1fr; height: auto; }
 """
 )
 
@@ -134,6 +147,7 @@ HINTS = {
     "bench-settings": "enter edit  tab models",
     "video": "enter play  e edit  x extend  u upscale  tab settings",
     "video-settings": "enter edit/run  tab library",
+    "live": "↑↓ scroll",
     "editor": "enter save  esc cancel",
     "search": "enter results  esc done",
 }
@@ -142,6 +156,7 @@ PANES = {
     "download": ["#results", "#files"],
     "bench": ["#bench-model", "#bench-settings"],
     "video": ["#clips", "#video-settings"],
+    "live": ["#live-page"],
 }
 # Video page settings: label, default, and the choices offered while editing.
 VIDEO_MODES = ("make", "edit", "extend", "upscale")
@@ -410,6 +425,369 @@ def repo_view(info: ModelInfo) -> Group:
     return Group(Text(info.id, style="bold"), Text(""), grid(rows))
 
 
+# Live page: requests drawn from the server logs (live.py parses them)
+
+AQUA = "#8ea4a2"
+PHASES = {  # phase: colour, word
+    "prompt": (ACCENT, "reading"),
+    "thinking": (MEDIA, "thinking"),
+    "answering": (GOOD, "answering"),
+    "tool": (WARN, "tool"),
+    "busy": (AQUA, "busy"),
+}
+# A 3-wide, 3-row font of half blocks for the headline numbers.
+FONT = {
+    "0": ("█▀█", "█ █", "█▄█"),
+    "1": ("▄█ ", " █ ", "▄█▄"),
+    "2": ("▀▀█", "█▀▀", "█▄▄"),
+    "3": ("▀▀█", "▀▀█", "▄▄█"),
+    "4": ("█ █", "▀▀█", "  █"),
+    "5": ("█▀▀", "▀▀█", "▄▄█"),
+    "6": ("█▀▀", "█▀█", "█▄█"),
+    "7": ("▀▀█", "  █", "  █"),
+    "8": ("█▀█", "█▀█", "█▄█"),
+    "9": ("█▀█", "▀▀█", "▄▄█"),
+    ".": (" ", " ", "▄"),
+    "k": ("█  ", "█▄▀", "█ █"),
+    "M": ("█▄█", "█ █", "█ █"),
+    "/": ("  █", " █ ", "█  "),
+    "-": ("   ", "▄▄▄", "   "),
+}
+
+
+def shade(colour: str, toward: str, amount: float) -> Style:
+    """colour moved part of the way toward another, for fading tails and gradients."""
+    rgb = blend_rgb(
+        Color.parse(colour).get_truecolor(), Color.parse(toward).get_truecolor(), amount
+    )
+    return Style(color=Color.from_triplet(rgb))
+
+
+class Tile:
+    """A headline number in the 3-row font, or in plain text where that does not fit."""
+
+    def __init__(self, title: str, value: str, colour: str, note: str) -> None:
+        self.title, self.value, self.colour, self.note = title, value, colour, note
+
+    def __rich_console__(
+        self, console: Console, options: ConsoleOptions
+    ) -> RenderResult:
+        yield Text(self.title.upper(), style=f"bold {MUTED}", no_wrap=True)
+        rows = [
+            " ".join(FONT[c][row] for c in self.value if c in FONT) for row in range(3)
+        ]
+        if len(rows[0]) <= options.max_width:
+            for line in rows:
+                yield Text(line, style=f"bold {self.colour}")
+        else:
+            yield Text("")
+            yield Text(self.value, style=f"bold {self.colour}")
+            yield Text("")
+        yield Text(self.note, style=SOFT, overflow="ellipsis", no_wrap=True)
+
+
+def steps(request: Request) -> Text:
+    """'read › think › bash › answer' in each phase's colour."""
+    text = Text(no_wrap=True, overflow="ellipsis")
+    for index, (phase, tool) in enumerate(request.steps):
+        if index:
+            text.append(" › ", style=EDGE)
+        colour, word = PHASES[phase]
+        text.append(
+            tool or word.removesuffix("ing") if phase != "prompt" else "read",
+            style=colour,
+        )
+    return text
+
+
+class Stream:
+    """A lane's bar: prompt progress while reading, else a comet as fast as the tokens."""
+
+    def __init__(self, request: Request | None, now: float) -> None:
+        self.request, self.now = request, now
+
+    def __rich_console__(
+        self, console: Console, options: ConsoleOptions
+    ) -> RenderResult:
+        width, request = max(options.max_width, 4), self.request
+        if request is None:
+            yield Text("╌" * width, style=EDGE)
+            return
+        colour = PHASES[request.phase][0]
+        if request.phase == "prompt" and request.prompt:
+            done = round(width * min(request.read / request.prompt, 1.0))
+            yield Text.assemble(
+                ("━" * done, colour), (("╺" + "─" * width)[: width - done], EDGE)
+            )
+            return
+        # The comet runs at a speed set by the request's tokens per second.
+        tail = min(12, width // 2)
+        head = int(self.now * max(request.rate, 15) / 4) % (width + tail)
+        bar = Text(no_wrap=True)
+        for x in range(width):
+            back = head - x
+            if 0 <= back < tail:
+                bar.append(
+                    "●" if back == 0 else "━", style=shade(colour, EDGE, back / tail)
+                )
+            else:
+                bar.append("─", style=EDGE)
+        yield bar
+
+
+def lanes_view(live: Live, now: float) -> RenderableType:
+    monitors = live.serving
+    if not monitors:
+        return Text(
+            "No model server is running. Start one on the Serve page (press 1).",
+            style=MUTED,
+        )
+    table = Table.grid(padding=(0, 2), expand=True)
+    table.add_column(no_wrap=True, max_width=14)  # server and slot
+    table.add_column(no_wrap=True, width=12)  # phase
+    table.add_column(ratio=1)  # bar
+    table.add_column(no_wrap=True, justify="right", width=28)  # numbers
+    for monitor in monitors:
+        for lane in range(monitor.lanes):
+            request = monitor.active.get(lane)
+            name = Text.assemble(
+                (monitor.name if lane == 0 else "", SOFT), (f" ·{lane}", EDGE)
+            )
+            if request is None:
+                table.add_row(name, Text("○ idle", style=MUTED), Stream(None, now), "")
+                continue
+            colour, word = PHASES[request.phase]
+            pulse = "●" if int(now * 2) % 2 else "◉"
+            state = Text.assemble(
+                (f"{pulse} ", colour), (request.tool or word, f"bold {colour}")
+            )
+            elapsed = f"{monitor.elapsed(request, now):.0f} s"
+            if request.phase == "prompt":
+                numbers = Text.assemble(
+                    (f"{compact(request.read)}/{compact(request.prompt)}", NUMBER),
+                    (" tok  ", MUTED),
+                    elapsed,
+                )
+            elif request.rate:
+                numbers = Text.assemble(
+                    (f"{request.tokens:,}", NUMBER),
+                    (" tok  ", MUTED),
+                    (f"{request.rate:.1f}", NUMBER),
+                    (" t/s  ", MUTED),
+                    elapsed,
+                )
+            else:
+                numbers = Text(elapsed)
+            table.add_row(name, state, Stream(request, now), numbers)
+    return table
+
+
+class Pulse:
+    """Generation speed over time, coloured by what was running, above each lane's history."""
+
+    HEIGHT = 5
+
+    def __init__(self, live: Live) -> None:
+        self.live = live
+
+    def __rich_console__(
+        self, console: Console, options: ConsoleOptions
+    ) -> RenderResult:
+        label = 12
+        width = max(options.max_width - label, 10)
+        speed = list(self.live.speed)[-width:]
+        speed = [(0.0, "")] * (width - len(speed)) + speed
+        top = max((s for s, _ in speed), default=0.0) or 1.0
+        for row in range(self.HEIGHT, 0, -1):
+            line = Text(no_wrap=True)
+            axis = f"{top:.0f} t/s" if row == self.HEIGHT else "0" if row == 1 else ""
+            line.append(
+                axis.rjust(label - 2) + " ┤" if axis else " " * (label - 1) + "│",
+                style=MUTED if axis else EDGE,
+            )
+            for value, phase in speed:
+                eighths = round(value / top * self.HEIGHT * 8) - (row - 1) * 8
+                colour = PHASES.get(phase, (AQUA, ""))[0]
+                if eighths >= 8:
+                    line.append(
+                        "█",
+                        style=shade(colour, "#181616", 0.45 * (1 - row / self.HEIGHT)),
+                    )
+                elif eighths > 0:
+                    line.append(" ▁▂▃▄▅▆▇"[eighths], style=colour)
+                else:
+                    line.append("·" if row == 1 else " ", style=EDGE)
+            yield line
+        yield Text("")
+        for monitor in self.live.serving:
+            for lane in range(monitor.lanes):
+                trail = list(monitor.trail.get(lane, ()))[-width:]
+                trail = [""] * (width - len(trail)) + trail
+                line = Text(
+                    f"{monitor.name[: label - 4]} ·{lane}".ljust(label)[:label],
+                    style=SOFT,
+                    no_wrap=True,
+                )
+                for phase in trail:
+                    line.append(*(("▆", PHASES[phase][0]) if phase else ("▁", EDGE)))
+                yield line
+        axis = Text(" " * label + " " * width, style=MUTED, no_wrap=True)
+        for minute in range(1, width // 60 + 1):
+            mark = f"-{minute}m"
+            x = label + width - 1 - minute * 60
+            axis = axis[:x] + Text("╵" + mark, style=MUTED) + axis[x + len(mark) + 1 :]
+        yield axis[: label + width - 3] + Text("now", style=MUTED)
+        legend = Text(" " * label)
+        for phase in ("prompt", "thinking", "tool", "answering", "busy"):
+            colour, word = PHASES[phase]
+            legend.append("▆ ", style=colour).append(f"{word}   ", style=MUTED)
+        yield legend
+
+
+def recent_view(live: Live, limit: int) -> RenderableType:
+    done = live.recent(limit)
+    if not done:
+        return Text("Finished requests appear here.", style=MUTED)
+    several = len(live.serving) > 1
+    fastest = max((r.rate for r in done), default=1.0) or 1.0
+    table = Table(
+        box=None,
+        expand=True,
+        padding=(0, 1),
+        header_style=f"bold {MUTED}",
+        show_edge=False,
+    )
+    if several:
+        table.add_column("server", style=SOFT, no_wrap=True, max_width=10)
+    table.add_column("flow", ratio=1, no_wrap=True, min_width=18)
+    table.add_column("in", justify="right", style=NUMBER)
+    table.add_column("out", justify="right", style=NUMBER)
+    table.add_column("time", justify="right", style=SOFT)
+    table.add_column("speed", no_wrap=True)
+    table.add_column("hit", justify="right", style=SOFT)
+    for request in done:
+        filled = round(request.rate / fastest * 4)
+        speed = Text.assemble(
+            (f"{request.rate:5.1f} ", NUMBER),
+            ("▮" * filled, GOOD),
+            ("▯" * (4 - filled), EDGE),
+        )
+        cut = request.end not in ("", "stop")
+        flow = steps(request)
+        if cut:
+            flow.append(f"  ✕ {request.end}", style=BAD)
+        row = [
+            flow,
+            compact(request.prompt) if request.prompt else "—",
+            compact(request.tokens),
+            f"{request.seconds:.0f}s",
+            speed,
+            f"{request.hit:.0f}%" if request.hit is not None else "—",
+        ]
+        table.add_row(*([request.server] if several else []), *row)
+    return table
+
+
+def tools_view(live: Live) -> RenderableType:
+    tools: Counter[str] = Counter()
+    ends: Counter[str] = Counter()
+    for monitor in live.serving:
+        tools.update(monitor.tools)
+        ends.update(monitor.ends)
+    if not tools and not ends:
+        return Text("Tool calls are counted here.", style=MUTED)
+    table = Table.grid(padding=(0, 1), expand=True)
+    table.add_column(no_wrap=True, style=SOFT, max_width=14)
+    table.add_column(ratio=1)
+    table.add_column(justify="right", style=NUMBER)
+    most = max(tools.values(), default=1)
+    for index, (tool, calls) in enumerate(tools.most_common(8)):
+        table.add_row(
+            tool, Bar(calls / most, shade(WARN, MEDIA, index / 8)), str(calls)
+        )
+    ending = Text("\n")
+    for end, times in ends.most_common():
+        ending.append(f"{end} ", style=MUTED).append(
+            f"{times}   ", style=GOOD if end == "stop" else BAD
+        )
+    return Group(table, ending)
+
+
+class Bar:
+    """A bar filling a share of its column, in eighths."""
+
+    def __init__(self, share: float, style: Style) -> None:
+        self.share, self.style = share, style
+
+    def __rich_console__(
+        self, console: Console, options: ConsoleOptions
+    ) -> RenderResult:
+        eighths = round(self.share * options.max_width * 8)
+        yield Text(
+            "█" * (eighths // 8) + (" ▏▎▍▌▋▊▉"[eighths % 8] if eighths % 8 else ""),
+            style=self.style,
+            no_wrap=True,
+        )
+
+
+def tiles(live: Live, now: float) -> dict[str, Tile]:
+    active = live.active
+    done = live.recent(200)
+    speed = sum(r.rate for r in active if r.phase != "prompt")
+    timed = [r for r in done if r.rate]
+    average = sum(r.tokens for r in timed) / (
+        sum(r.tokens / r.rate for r in timed) or 1
+    )
+    # Speed would mislead here: most of a long prompt is usually cached.
+    latest = next((r for r in active + done if r.prompt), None)
+    largest = max((r.prompt for r in done + active), default=0)
+    lanes = sum(m.lanes for m in live.serving)
+    busy = sum(1 for b in live.busy if b) / len(live.busy) * 100 if live.busy else 0.0
+    served = sum(m.served for m in live.serving)
+    took = sum(m.prompt_tokens for m in live.serving)
+    made = sum(m.generated for m in live.serving)
+    hit = next((r for r in done if r.hit is not None), None)
+    hit_kind = "draft tokens accepted"
+    if hit and live.monitors[hit.server].backend == "strata":
+        hit_kind = "expert cache hits"
+
+    def value(number: float) -> str:
+        return f"{number:.0f}" if number else "-"
+
+    return {
+        "decode": Tile(
+            "tok/s",
+            value(speed),
+            GOOD if speed else MUTED,
+            f"peak {live.peak:.0f} · avg {average:.0f}",
+        ),
+        "prompt": Tile(
+            "context tok",
+            compact(latest.prompt) if latest else "-",
+            ACCENT if latest in active else MUTED,
+            f"largest {compact(largest)}",
+        ),
+        "flight": Tile(
+            "in flight",
+            f"{len(active)}/{lanes}",
+            (WARN if len(active) == lanes else MEDIA) if active else MUTED,
+            f"busy {busy:.0f}% · last {len(live.busy) // 60 + 1} min",
+        ),
+        "served": Tile(
+            "requests",
+            compact(served) if served else "-",
+            NUMBER if served else MUTED,
+            f"{compact(took)} in · {compact(made)} out",
+        ),
+        "hit": Tile(
+            "cache hit %",
+            value(hit.hit) if hit and hit.hit else "-",
+            WARN if hit else MUTED,
+            hit_kind if hit else "of the last request",
+        ),
+    }
+
+
 class Splitter(Static):
     """A grip above the log; drag it to resize the log."""
 
@@ -454,6 +832,7 @@ class LctApp(App[None]):
         Binding("2", "page('download')"),
         Binding("3", "page('bench')"),
         Binding("4", "page('video')"),
+        Binding("5", "page('live')"),
         Binding("e", "video_from_clip('edit')"),
         Binding("x", "video_from_clip('extend')"),
         Binding("u", "video_from_clip('upscale')"),
@@ -503,6 +882,7 @@ class LctApp(App[None]):
         self.results: list[tuple[str, str, str, str]] = []
         self.video = {key: default for key, (_, default, _) in VIDEO_SETTINGS.items()}
         self.clips: list[Path] = []
+        self.live = Live()
 
     def compose(self) -> ComposeResult:
         with Horizontal(id="top"):
@@ -514,6 +894,7 @@ class LctApp(App[None]):
             Tab("Download", id="download"),
             Tab("Benchmark", id="bench"),
             Tab("Video", id="video"),
+            Tab("Live", id="live"),
         )
         with ContentSwitcher(initial="serve-page"):
             with Horizontal(id="serve-page", classes="page"):
@@ -555,6 +936,25 @@ class LctApp(App[None]):
                     panel.border_title = "Make"
                     yield PickList(id="video-settings")
                     yield Static(id="video-status", classes="gap")
+            with VerticalScroll(id="live-page", classes="page"):
+                with Horizontal(id="tiles"):
+                    for key in ("decode", "prompt", "flight", "served", "hit"):
+                        yield Static(id=f"tile-{key}", classes="tile")
+                for key, title in (
+                    ("lanes", "Lanes"),
+                    ("pulse", "Pulse · one column a second"),
+                ):
+                    panel = Static(id=key, classes="panel")
+                    panel.border_title = title
+                    yield panel
+                with Horizontal(id="live-bottom"):
+                    for key, title in (
+                        ("recent", "Recent requests"),
+                        ("tools", "Tools"),
+                    ):
+                        panel = Static(id=key, classes="panel")
+                        panel.border_title = title
+                        yield panel
         with Horizontal(id="editor"):
             yield Label("", id="editor-label")
             yield Input(id="editor-input")
@@ -581,6 +981,8 @@ class LctApp(App[None]):
         for name, pid in servers.running().items():
             self.follow_server(name, pid)
         self.set_interval(2, self.measure)
+        self.set_interval(1, self.live.sample)
+        self.set_interval(0.25, self.draw_live)
 
     def stop_children(self) -> None:
         """Stop downloads and benchmarks; servers are left running on purpose."""
@@ -642,7 +1044,7 @@ class LctApp(App[None]):
         elif (
             self.page != "download"
             and focused is not None
-            and f"#{focused.id}" == PANES[self.page][1]
+            and f"#{focused.id}" in PANES[self.page][1:]
         ):
             context = f"{self.page}-settings"
         if context == "download" and "download" in self.procs:
@@ -653,7 +1055,7 @@ class LctApp(App[None]):
             keys = keys.replace("p projector", f"p projector-{state}")
         hints = hint_line(keys)
         if context not in ("editor", "search"):
-            hints.append_text(hint_line("1-4 pages  q quit"))
+            hints.append_text(hint_line("1-5 pages  q quit"))
         if self.pending:
             hints = Text(self.pending[0], style=WARN)
         self.query_one("#hints", Static).update(hints)
@@ -686,6 +1088,8 @@ class LctApp(App[None]):
         page = str(event.tab.id)
         self.close_editor()
         self.query_one(ContentSwitcher).current = f"{page}-page"
+        # The live page fills the screen, for watching it from across the room.
+        self.screen.set_class(page == "live", "-live")
         self.query_one(PANES[page][0]).focus()
         self.update_state()
 
@@ -1123,6 +1527,7 @@ class LctApp(App[None]):
                         self.urls[name] = found
                         self.render_profiles()
                         self.update_state()
+                    self.live.feed(name, line)
                     style = ACCENT if line.startswith("$ ") else ""
                     log.write(Text.assemble((f"{name} ", MUTED), (line, style)))
                 elif running:
@@ -1134,8 +1539,22 @@ class LctApp(App[None]):
         self.stopping.discard(name)
         for state in (self.servers, self.urls, self.usage, self.samples):
             state.pop(name, None)
+        self.live.forget(name)
         self.refresh_profiles()
         self.update_state()
+
+    # Live page
+
+    def draw_live(self) -> None:
+        if self.page != "live":
+            return
+        now = time.monotonic()
+        for key, renderable in tiles(self.live, now).items():
+            self.query_one(f"#tile-{key}", Static).update(renderable)
+        self.query_one("#lanes", Static).update(lanes_view(self.live, now))
+        self.query_one("#pulse", Static).update(Pulse(self.live))
+        self.query_one("#recent", Static).update(recent_view(self.live, 12))
+        self.query_one("#tools", Static).update(tools_view(self.live))
 
     # Download page: search as you type, details of the highlighted repository
 

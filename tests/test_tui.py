@@ -80,7 +80,7 @@ def test_renders_every_page_at_common_widths(width, workspace):
         app = LctApp()
         async with app.run_test(size=(width, 40)) as pilot:
             assert "4096" in row(app, "#settings", "ctx")
-            for key in "2341":
+            for key in "23451":
                 await pilot.press(key)
                 await pilot.pause()
             assert "model missing" in row(app, "#profiles", "gone")
@@ -427,6 +427,48 @@ def test_running_servers_show_live_usage(monkeypatch, workspace):
             await pilot.pause()
             assert "cpu" in row(app, "#profiles", "mine")
             assert "ram" in text(app, "#meters")
+
+    asyncio.run(run())
+
+
+FAKE_STRATA = """
+import time
+print("ready: http://127.0.0.1:9/v1", flush=True)
+print("[strata] reading the prompt: 9,000 of 12,000 tokens, 1 s so far", flush=True)
+print("[strata] thinking: 120 of budget 16384 (max 32000) tokens, 61.5 tok/s, 3 s", flush=True)
+time.sleep(1.5)
+print("[strata] writing a tool call: bash: 300 of max 32768 tokens, 60.0 tok/s, 5 s", flush=True)
+print("[strata] done: 320 tokens in 6 s (60.2 tok/s) (stop, cancel=False), expert cache 91.0% hit", flush=True)
+try:
+    time.sleep(30)
+except KeyboardInterrupt:
+    pass
+"""
+
+
+def test_live_page_shows_a_request_in_flight_then_served(monkeypatch, workspace):
+    write_aliases({"mine": str(workspace)})
+    monkeypatch.setattr(
+        "llamacpp_tuner.servers.LCT", [sys.executable, "-c", FAKE_STRATA]
+    )
+
+    async def run() -> None:
+        app = LctApp()
+        async with app.run_test(size=(120, 50)) as pilot:
+            await pilot.press("enter")
+            await until(pilot, lambda: app.live.active)
+            await pilot.press("5")
+            app.live.sample()
+            app.draw_live()
+            assert "thinking" in text(app, "#lanes")
+            assert "61.5" in text(app, "#lanes")
+            assert not app.query_one("#log").display  # the page fills the screen
+            await until(pilot, lambda: not app.live.active)
+            app.draw_live()
+            recent = text(app, "#recent")
+            assert "read › think › bash" in recent and "91%" in recent
+            assert "bash" in text(app, "#tools")
+            assert "idle" in text(app, "#lanes")
 
     asyncio.run(run())
 
