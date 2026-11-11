@@ -29,9 +29,8 @@ Next task: `PLAN.md`. Rules: `AGENTS.md`.
 - **Strata noise:** server t/s swings 8-16% between identical runs. Screen kernel switches in generate mode (`--stats`, ±1.5%); compare drafters on the follow texts priced at one ms-by-window-size table (`tmp/strata-opt/r7d_std.py`, `r9d.sh`), not by t/s.
 - **Downloads cap at ~19 MiB/s, the internet plan** (Wi-Fi `wlan0`; `enp7s0` is a shared link to another machine, not an uplink).
 - **Other programs writing to the SSD stall decode 50-110 ms:** each window reads ~50 of 64 n-gram rows from the QLC drive (the vicinae indexer, the browser, agents' builds). Discard runs with `--stats` host > 1 ms; fixes in `tmp/strata-opt/progress/r11-plus.md` (`kyber`, quieter writers). `"parallel": 2` stays off (DECISIONS 2026-10-28).
-- **An empty `servers/<name>.json` (left by a freeze) crashes `lct ps/up`**: delete it.
+- **An empty `servers/<name>.json` (left by a freeze) crashes `lct ps/up`**: delete it. **`pkill -f PATTERN` kills the calling shell** when the pattern is in its own command line (exit 144). Use `pgrep -f "name[.]py"`.
 - **Qwen3.5 in transformers has no fast DeltaNet/conv kernels here** (`flash-linear-attention`, `causal_conv1d` missing; slow reference path). Pass `AutoTokenizer` as trl's `processing_class`, or it loads the image processor (needs torchvision). `SFTConfig` has no `warmup_ratio`; a float `warmup_steps` is a ratio.
-- **`pkill -f PATTERN` kills the calling shell** when the pattern is in its own command line (exit 144). Use `pgrep -f "name[.]py"`.
 - **Never run Strata with the PM4 graph replay libs** (`~/rocm/clr-pm4-snap2`, `DEBUG_HIP_GRAPH_PM4`): each GPU page fault reset the whole GPU; one crashed Hyprland.
 - **`STRATA_PREFILL_CPU_SHARE=auto` makes Strata replies differ run to run.** Set it to 0 for any exactness check.
 - **llama.cpp: with `--kv-unified`, use `--no-cache-idle-slots`**, and check per-process GTT spill (`drm-memory-gtt` in `/proc/<pid>/fdinfo`); spill + deep prompt = GPU reset.
