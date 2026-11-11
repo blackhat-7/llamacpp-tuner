@@ -3,7 +3,7 @@
 Handoff note. Rewritten at the end of every session, never appended to. Cap 40 lines.
 Next task: `PLAN.md`. Rules: `AGENTS.md`.
 
-**Last session:** 2026-11-11 (branch `feat/finetune`: real style pairs in `tmp/ft-style/` (gitignored, has work data): 1,137 mined chains (PC 69, Mac 1,068) → 682 after dedupe → 365 Flash-Next judged true restyles; `train.jsonl` 165 (rewrite 123, reply 38, description 4), `test.jsonl` 200 (rewrite 165, reply 35), split by session; 0 secrets found. Scripts: `tmp/ft-mine/style_pairs.py` (miner, run on each host), `label_pairs.py`, `build_style.py`. Real PR/ticket pairs are near zero, so synthetic rewrites must supply descriptions). Before: 2026-11-11 (`lct logs export`, `logs.py`). Before: 2026-11-11 (planned the fine-tune: `PLAN.md` "Fine-tuning").
+**Last session:** 2026-11-11 (training env, branch `feat/finetune`: venv `tmp/ft-venv` = uv Python 3.13, torch 2.14.1+rocm7.2 (index `download.pytorch.org/whl/rocm7.2`, pinned by `tmp/ft-torch-constraints.txt`) + transformers 5.22, peft 0.21, trl 1.17; scripts `tmp/ft-train/` `sft.py` (bf16 LoRA r16 all-linear, completion-only loss, checkpoint every 200 steps), `load_check.py`, `gpu_smoke.sh` (idle wait, `lct down local-flash`, SFT, always `lct up`); Qwen3.5-4B 50-example smoke: 8 steps in 21 s, peak 10.0 GiB, adapter `tmp/ft-train/out-4b-gpu` loads. Before: style pairs in `tmp/ft-style/` (gitignored, work data): `train.jsonl` 165, `test.jsonl` 200 real pairs, split by session; scripts `tmp/ft-mine/style_pairs.py`, `label_pairs.py`, `build_style.py`; real PR/ticket pairs near zero, so synthetic rewrites must supply descriptions. Before: `lct logs export` (`logs.py`).
 
 ## State
 
@@ -30,6 +30,7 @@ Next task: `PLAN.md`. Rules: `AGENTS.md`.
 - **Downloads cap at ~19 MiB/s, the internet plan** (Wi-Fi `wlan0`; `enp7s0` is a shared link to another machine, not an uplink).
 - **Other programs writing to the SSD stall decode 50-110 ms:** each window reads ~50 of 64 n-gram rows from the QLC drive (the vicinae indexer, the browser, agents' builds). Discard runs with `--stats` host > 1 ms; fixes in `tmp/strata-opt/progress/r11-plus.md` (`kyber`, quieter writers). `"parallel": 2` stays off (DECISIONS 2026-10-28).
 - **An empty `servers/<name>.json` (left by a freeze) crashes `lct ps/up`**: delete it.
+- **Qwen3.5 in transformers has no fast DeltaNet/conv kernels here** (`flash-linear-attention`, `causal_conv1d` missing; slow reference path). Pass `AutoTokenizer` as trl's `processing_class`, or it loads the image processor (needs torchvision). `SFTConfig` has no `warmup_ratio`; a float `warmup_steps` is a ratio.
 - **`pkill -f PATTERN` kills the calling shell** when the pattern is in its own command line (exit 144). Use `pgrep -f "name[.]py"`.
 - **Never run Strata with the PM4 graph replay libs** (`~/rocm/clr-pm4-snap2`, `DEBUG_HIP_GRAPH_PM4`): each GPU page fault reset the whole GPU; one crashed Hyprland.
 - **`STRATA_PREFILL_CPU_SHARE=auto` makes Strata replies differ run to run.** Set it to 0 for any exactness check.
