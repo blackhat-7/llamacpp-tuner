@@ -3,7 +3,7 @@
 Handoff note. Rewritten at the end of every session, never appended to. Cap 40 lines.
 Next task: `PLAN.md`. Rules: `AGENTS.md`.
 
-**Last session:** 2026-11-09 (a Live tab in `lct tui`, page 5: a request dashboard parsed from server logs, `live.py`). Before: 2026-11-07 (local video: `lct video` make/edit/extend/upscale/join, a Video tab in `lct tui` and the `make-video` skill, on MiniMax H3 in ComfyUI; real clips on the 7900 XTX checked by eye and Whisper; three AMD crashes found and fixed). Before: 2026-11-02 (round 11: Flash-Next on Strata v0.2.9 with 14 gfx1100 speedups, equal prompt chunks, disk tier, decode bundle; `docs/flash-next-speed-research.md`).
+**Last session:** 2026-11-11 (planned a small house-style fine-tune from the user's chat logs on branch `feat/finetune`: `PLAN.md` "Fine-tuning", data and scripts in `tmp/ft-mine/`, gitignored). Before: 2026-11-09 (a Live tab in `lct tui`, page 5: a request dashboard parsed from server logs, `live.py`). Before: 2026-11-07 (local video: `lct video`, the Video tab and the `make-video` skill on MiniMax H3 in ComfyUI).
 
 ## State
 

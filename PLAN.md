@@ -47,3 +47,18 @@ Each line carries its own done-check. A task too big for one session gets split 
 - [ ] **GDN state pass merged into the next window (~+0.6%).** Done when bit-exact and priced.
 - [ ] **Measure the new setup on real agent sessions.** `python3 bench/agent_time.py <strata config>` after a few long sessions: cold re-reads, disk restores, search waits vs runs 51 and 61. Done when the numbers are in `PROGRESS.md`.
 - [ ] **Re-sweep upstream Strata, Basalt and r/LocalLLaMA.** Reddit RSS ends 2026-11-13; find another route first. Done when new leads are ranked in the research doc.
+
+## Fine-tuning: a small house-style model (branch `feat/finetune`)
+
+One 4B model that rewrites text in the user's style: drafts shortened and de-slopped, short Slack/GitHub replies, PR/ticket/standup bullets. Why this task and the order: `DECISIONS.md` 2026-11-11. Mined data and scripts: `tmp/ft-mine/` (gitignored, this PC).
+
+- [ ] **`lct logs export`.** Move `tmp/ft-mine/extract.py` into lct (stdlib only): prompts and subagent briefs from Claude Code, Pi, opencode and Codex as JSONL. Done when tests on small fixture logs of each source pass and its PC output matches the script's row count.
+- [ ] **Style pairs.** Mine (long reply → "shorter/simpler/no slop" ask → rewrite) triples on the PC and Mac (`tmp/ft-mine/count_pairs.py` finds ~1,240 raw); drop pairs re-asked, keep a chain's last rewrite, dedupe, scrub secrets, tag rewrite/reply/description. Done when `tmp/ft-style/{train,test}.jsonl` exist with a 200-pair real test set and counts in `PROGRESS.md`.
+- [ ] **Synthetic rewrites.** Opus subagents rewrite ~3k long replies from the logs by the user's writing rules (`~/.claude/CLAUDE.md` "Writing style"). Done when ~4k training pairs pass length and banned-word checks; real pairs never enter it from the test set.
+- [ ] **Training env.** ROCm torch + peft + trl venv in `tmp/ft-venv`; bf16 LoRA (no bitsandbytes). Done when a 50-example SFT saves an adapter that loads.
+- [ ] **SFT.** Qwen3-class 4B base, 2-3 epochs, checkpoint every 200 steps. GPU: needs the user's OK and Flash-Next down (`lct down local-flash`). Done when the adapter and loss curve are saved.
+- [ ] **DPO.** Real pairs: the user's accepted rewrite chosen, the long reply rejected. Done when it beats SFT on the test set's length and banned-word scores.
+- [ ] **`lct import`.** Merge a LoRA, convert with llama.cpp's `convert_hf_to_gguf.py`, `llama-quantize`, save an alias. Done when tests pass and a live `house-style` alias answers.
+- [ ] **Eval vs Opus.** 200 test pairs, blind judge plus length/banned-word checks; the user reads 20 blind samples. Done when win/tie rates and the user's go/no-go are in `PROGRESS.md`.
+- [ ] **Wire it in.** Serve on the Mac (M4 Pro) through lct; a `house-style` skill that agents call before showing text (falls back to the big model if down); Pi/Paseo provider entry; clipboard `tone` hotkey. Done when each path rewrites one real draft.
+- [ ] **`skills/finetune`.** Write the method from this run: picking a task from logs, pair mining, cleaning, SFT → DPO, eval, GPU safety. Done when a fresh session could repeat the run from it.
