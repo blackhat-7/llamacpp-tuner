@@ -3,7 +3,7 @@
 Handoff note. Rewritten at the end of every session, never appended to. Cap 40 lines.
 Next task: `PLAN.md`. Rules: `AGENTS.md`.
 
-**Last session:** 2026-11-11 (branch `feat/finetune`: `lct logs export` prints prompts and subagent briefs from Claude Code, Pi, opencode and Codex logs as JSONL, `logs.py`; replaces `tmp/ft-mine/extract.py`, whose 3,000-char cap is gone). Before: 2026-11-11 (planned a small house-style fine-tune from the user's chat logs: `PLAN.md` "Fine-tuning", mined data in `tmp/ft-mine/`, gitignored). Before: 2026-11-09 (a Live tab in `lct tui`, page 5, `live.py`).
+**Last session:** 2026-11-11 (branch `feat/finetune`: real style pairs in `tmp/ft-style/` (gitignored, has work data): 1,137 mined chains (PC 69, Mac 1,068) → 682 after dedupe → 365 Flash-Next judged true restyles; `train.jsonl` 165 (rewrite 123, reply 38, description 4), `test.jsonl` 200 (rewrite 165, reply 35), split by session; 0 secrets found. Scripts: `tmp/ft-mine/style_pairs.py` (miner, run on each host), `label_pairs.py`, `build_style.py`. Real PR/ticket pairs are near zero, so synthetic rewrites must supply descriptions). Before: 2026-11-11 (`lct logs export`, `logs.py`). Before: 2026-11-11 (planned the fine-tune: `PLAN.md` "Fine-tuning").
 
 ## State
 
