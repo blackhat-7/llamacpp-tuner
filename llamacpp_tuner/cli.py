@@ -6,6 +6,7 @@ import random
 import shlex
 import shutil
 import signal
+import sqlite3
 import subprocess
 import time
 import tomllib
@@ -27,6 +28,7 @@ from llamacpp_tuner.downloader import (
 )
 from llamacpp_tuner.jeeves import install_jeeves, run_jeeves
 from llamacpp_tuner.llama import install_llama, list_devices, run_server
+from llamacpp_tuner.logs import SOURCES
 from llamacpp_tuner.strata import run_strata
 from llamacpp_tuner.video import (
     ASPECTS,
@@ -477,6 +479,23 @@ def ps() -> None:
             f"{name:<20} {address:<28} {used.ram / 1024**3:5.1f} GiB RAM"
             f" {used.vram / 1024**3:5.1f} GiB VRAM  pid {pid}"
         )
+
+
+@main.group()
+def logs() -> None:
+    """Read local coding-agent logs (Claude Code, Pi, opencode, Codex)."""
+
+
+@logs.command(name="export")
+def export_logs() -> None:
+    """Print human prompts and subagent briefs as JSONL, one row per message."""
+    for name, read in SOURCES.items():
+        # One unreadable store must not hide the others.
+        try:
+            for row in read(Path.home()):
+                click.echo(json.dumps(row))
+        except (OSError, sqlite3.Error, ValueError) as error:
+            click.echo(f"Skipped the rest of {name}'s logs: {error}", err=True)
 
 
 # Video: MiniMax H3 on ComfyUI, which runs as the 'video' profile.

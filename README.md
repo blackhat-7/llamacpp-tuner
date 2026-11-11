@@ -111,6 +111,14 @@ lct serve PostHog/jeeves --backend jeeves --ctx 4096 --port 6871 --extra-args '-
 
 `--ctx` becomes Jeeves's `--max-len`; `--extra-args` go to `python -m inference.serve`. It answers `POST /v1/systemone`, not the OpenAI API.
 
+### Agent logs
+
+`lct logs export` prints your prompts and the briefs your agents gave subagents, from the local logs of Claude Code, Pi, opencode and Codex, as JSONL: one row per message with `src`, `kind` (`human`, `delegate` or `subagent_first`), `project`, `session`, `model`, `agent` and `text`. Use it to mine fine-tuning data.
+
+```bash
+lct logs export > prompts.jsonl
+```
+
 ### Video
 
 `lct video` makes and edits clips with sound on your GPU with [MiniMax H3](https://huggingface.co/MiniMaxAI/MiniMax-H3), an open audio-video model: dialogue with lip sync, sound effects and music in one pass, 4-15 s at 24 fps. It runs on [ComfyUI](https://github.com/Comfy-Org/ComfyUI), which lct installs in its own venv and runs as the `video` profile, using ComfyUI's own H3 and SeedVR2 workflows; you never edit a node graph. It needs a 24 GB GPU, ffmpeg, and about 80 GB of disk for the models.

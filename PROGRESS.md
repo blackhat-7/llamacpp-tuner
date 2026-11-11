@@ -3,7 +3,7 @@
 Handoff note. Rewritten at the end of every session, never appended to. Cap 40 lines.
 Next task: `PLAN.md`. Rules: `AGENTS.md`.
 
-**Last session:** 2026-11-11 (planned a small house-style fine-tune from the user's chat logs on branch `feat/finetune`: `PLAN.md` "Fine-tuning", data and scripts in `tmp/ft-mine/`, gitignored). Before: 2026-11-09 (a Live tab in `lct tui`, page 5: a request dashboard parsed from server logs, `live.py`). Before: 2026-11-07 (local video: `lct video`, the Video tab and the `make-video` skill on MiniMax H3 in ComfyUI).
+**Last session:** 2026-11-11 (branch `feat/finetune`: `lct logs export` prints prompts and subagent briefs from Claude Code, Pi, opencode and Codex logs as JSONL, `logs.py`; replaces `tmp/ft-mine/extract.py`, whose 3,000-char cap is gone). Before: 2026-11-11 (planned a small house-style fine-tune from the user's chat logs: `PLAN.md` "Fine-tuning", mined data in `tmp/ft-mine/`, gitignored). Before: 2026-11-09 (a Live tab in `lct tui`, page 5, `live.py`).
 
 ## State
 
@@ -17,7 +17,7 @@ Next task: `PLAN.md`. Rules: `AGENTS.md`.
 - H2O-Lightning-4B (decision model, `/v1/systemone`, :6872) needs llama.cpp PR #30361: `tmp/llama.cpp-h2o/build-hip`, passed with `--server`. Profile `h2o-lightning` (GPU, ~7 GB VRAM), only with Strata down. The Claude skill `classify` (dotfiles) uses Flash-Next by default, H2O on the GPU for big bulk jobs. Profiles `swarm`, `birbot-a3b`, `side` unchanged (`jeeves` retired 2026-10-17); see `skills/tune-local-model/references/host-7900xtx.md`.
 - **Video** (`lct video`, `lct tui` page 4, skill `skills/make-video` linked from `~/dotfiles/.claude/skills`, symlink not committed there): profile `video` = ComfyUI v0.44.2 on :8188 with `--disable-pinned-memory --disable-smart-memory --reserve-vram 4`; venv `tmp/comfyui/venv` (torch 2.14.1+rocm7.2 on uv's Python 3.13); ~80 GB of models in `tmp/comfyui/data/models`; clips in `tmp/comfyui/data/output/video`; test clips and prompts in `tmp/comfyui/tests`, `test-prompts`. 5 s draft (832x480): 2.5-4 min; standard (1344x768) ~2m45s a step, 20+ min. Text, photo, extend and edit clips verified by eye and Whisper (edit 7m35s for 5 s draft, needs `--reserve-vram 4`); 1080p upscale 16 min per 5 s. Standard quality not timed end to end.
 - Speed now (2026-11-02 A/B, normal drafting): code 166, prose 122, edit 145 t/s; 112 after a 200K prompt. Prompt reads ~2,900 t/s at 51K (2026-10-13 start: 92 / 76 / 78 decode). Engine sources are local only (the old 0.1.43 base is `opt7/integrate` in `Strata-wt/r5-upstream`). Notes: `docs/flash-next-speed-research.md` (round 11), `tmp/strata-opt/progress/r11-*.md`, `tmp/strata-opt/RESUME.md`.
-- Checks: `pytest` 109/109, ruff clean, pyright clean.
+- Checks: `pytest` 112/112, ruff clean, pyright clean.
 
 ## Gotchas
 
