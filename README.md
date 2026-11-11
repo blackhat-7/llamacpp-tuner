@@ -99,6 +99,18 @@ lct down side     # stop one; 'lct down' alone stops every server
 
 Servers run detached and keep running after `lct up` or the TUI exits. Their logs are in `servers/<name>.log` in the cache directory.
 
+### Fine-tuned LoRA adapters
+
+`lct import` turns a PEFT LoRA adapter into one quantized GGUF and a profile, with llama.cpp's own tools: `convert_hf_to_gguf.py`, `convert_lora_to_gguf.py`, `llama-export-lora` and `llama-quantize`. It needs llama.cpp's source (a `lct setup --cmake-arg=...` build) and `uv`, which builds the convert scripts' Python env from llama.cpp's requirements on first use (several minutes).
+
+```bash
+lct pull Qwen/Qwen3-4B --all     # the base model's Hugging Face weights
+lct import ./adapter --name house-style --quant Q4_K_M
+lct serve house-style
+```
+
+The base is the adapter's `base_model_name_or_path`; `--base` overrides it. `--force` replaces an earlier import.
+
 ### Jeeves
 
 [Jeeves](https://github.com/PostHog/jeeves) is a reasoning classifier that llama.cpp cannot run. `--backend jeeves` runs it on its own PyTorch server, installed into a separate venv in the cache directory. Profiles, stacks, `lct up/down/ps` and the TUI treat it like any other server.

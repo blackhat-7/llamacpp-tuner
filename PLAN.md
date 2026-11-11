@@ -58,7 +58,7 @@ One 4B model that rewrites text in the user's style: drafts shortened and de-slo
 - [ ] **Training env.** ROCm torch + peft + trl venv in `tmp/ft-venv`; bf16 LoRA (no bitsandbytes). Done when a 50-example SFT saves an adapter that loads.
 - [ ] **SFT.** Qwen3-class 4B base, 2-3 epochs, checkpoint every 200 steps. GPU: needs the user's OK and Flash-Next down (`lct down local-flash`). Done when the adapter and loss curve are saved.
 - [ ] **DPO.** Real pairs: the user's accepted rewrite chosen, the long reply rejected. Done when it beats SFT on the test set's length and banned-word scores.
-- [ ] **`lct import`.** Merge a LoRA, convert with llama.cpp's `convert_hf_to_gguf.py`, `llama-quantize`, save an alias. Done when tests pass and a live `house-style` alias answers.
+- [x] **`lct import`.** Merge a LoRA, convert with llama.cpp's `convert_hf_to_gguf.py`, `llama-quantize`, save an alias. Done 2026-11-11 (branch `feat/import`): 4 tests; a random LoRA on Qwen3-0.6B imported, served from its alias on CPU, and its merged F16 matched `--lora` at run time token for token. `house-style` itself waits for SFT.
 - [ ] **Eval vs Opus.** 200 test pairs, blind judge plus length/banned-word checks; the user reads 20 blind samples. Done when win/tie rates and the user's go/no-go are in `PROGRESS.md`.
 - [ ] **Wire it in.** Serve on the Mac (M4 Pro) through lct; a `house-style` skill that agents call before showing text (falls back to the big model if down); Pi/Paseo provider entry; clipboard `tone` hotkey. Done when each path rewrites one real draft.
 - [ ] **`skills/finetune`.** Write the method from this run: picking a task from logs, pair mining, cleaning, SFT → DPO, eval, GPU safety. Done when a fresh session could repeat the run from it.

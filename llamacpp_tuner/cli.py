@@ -27,6 +27,7 @@ from llamacpp_tuner.downloader import (
 )
 from llamacpp_tuner.jeeves import install_jeeves, run_jeeves
 from llamacpp_tuner.llama import install_llama, list_devices, run_server
+from llamacpp_tuner.lora import adapter_base, import_lora
 from llamacpp_tuner.strata import run_strata
 from llamacpp_tuner.video import (
     ASPECTS,
@@ -411,6 +412,44 @@ def list_models() -> None:
         size_gib = model.stat().st_size / (1024**3)
         tag = " [projector]" if "mmproj" in model.name.lower() else ""
         click.echo(f"{model.relative_to(root)} ({size_gib:.2f} GiB){tag}")
+
+
+@main.command(name="import")
+@click.argument(
+    "adapter", type=click.Path(exists=True, file_okay=False, path_type=Path)
+)
+@click.option("--name", required=True, help="Profile to save the model as")
+@click.option(
+    "--quant", "-q", required=True, help="llama-quantize type, such as Q4_K_M"
+)
+@click.option(
+    "--base",
+    help="Base model directory or downloaded repository; "
+    "default: the adapter's base_model_name_or_path",
+)
+@click.option("--force", "-f", is_flag=True, help="Replace the model and profile")
+def import_adapter(
+    adapter: Path, name: str, quant: str, base: str | None, force: bool
+) -> None:
+    """Merge a PEFT LoRA ADAPTER into its base model, quantize it, save a profile.
+
+    The base model's Hugging Face weights must be local: lct pull REPO --all.
+    """
+    aliases = load_aliases()
+    out = get_models_dir() / "imported" / f"{name}-{quant}.gguf"
+    if not force and (name in aliases or out.exists()):
+        raise click.ClickException(f"{name} already exists; --force replaces it.")
+    try:
+        base_dir = resolve_repository(base or adapter_base(adapter))
+        model = import_lora(adapter, base_dir, quant, out)
+    except (OSError, ValueError) as error:
+        raise click.ClickException(str(error)) from error
+    except subprocess.CalledProcessError as error:
+        raise click.ClickException(
+            f"Exit code {error.returncode} from: {shlex.join(error.cmd)}"
+        ) from error
+    write_aliases({**aliases, name: shlex.join([str(model)])})
+    click.echo(f"Model: {model}\nProfile: {name} (lct serve {name})")
 
 
 @main.command()
