@@ -271,3 +271,15 @@ configs. Quality noise: the set's "agent" segment swings up to 20% in perplexity
 very unlikely tokens); code / docs / English / multilingual are stable to ~1%. On those, tail skip and HC_Q8 are within
 noise, and mixD vs today is -8% to -14% in every one (code 2.41 -> 2.13, docs 11.6 -> 10.3, English 5.57 -> 4.80,
 multilingual 2.94 -> 2.72).
+
+### Where the user's engine time goes (the live server's log, 10,774 requests since October)
+
+- Decode 70.9K s (75%), prompt reads 24.2K s (25%); 92.6% of prompt tokens came from the conversation cache.
+- Reads over 16K tokens: 590 requests, 12.8K s (half the read time); 357 of them reused nothing (fresh prompts).
+- So decode speed is the lever: the 4070's +6-34% decode is ~+5-25% engine time. Prompt-path work on the 4070
+  (+~12% reads, est.) is worth ~3% of engine time; fusing the drafter's step (0.55 ms, ~16 small kernels, ~2.3x its
+  memory floor: profile below) ~4%.
+
+Drafter profile (mixD + 4070, free-running code, 1,500 tokens: 181 t/s, 4.66 tokens a step): a draft step is 0.546 ms
+of GPU time (draft head 0.104, experts 0.053, q+norm-rope 0.052, attention 0.035, the rest 12-35 us each); its weights
+need ~0.24 ms at 850 GB/s.

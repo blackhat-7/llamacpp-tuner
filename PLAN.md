@@ -8,9 +8,11 @@ Each line carries its own done-check. A task too big for one session gets split 
 ### Two GPUs: the 4070 as the XTX engine's expert helper (branch `feat/dual-gpu-helper`; engine `opt12/nvhelper`)
 
 - [x] **A CUDA helper for the HIP engine.** Strata's `--expert-cache-device1` on the 4070 through a CUDA plugin. Done 2026-11-16: engine `4a79cf5a`; generate mode code/prose/edit +11/+20/+40% (fixed ranking), +9/+6/+32% adaptive with `--spec 6`; server +5/+1/+21%.
-- [x] **Better quality at today's speed.** Done 2026-11-16: mixD (2-bit `down` projections to IQ4_NL) + the 4070: perplexity 4.79 -> 4.15; server speed within 2% of today, prompt reads -15%. Profile `strata-swift-flash-next-mixd`, stack `local-flash-mixd`.
+- [x] **Better quality at today's speed.** Done 2026-11-16: mixD (2-bit `down` projections to IQ4_NL) + the 4070 + tail skip + HC_Q8: perplexity 4.79 -> 4.15; server code/prose/edit +10/+7/+13% vs today, prompt reads -2%. Stack `local-flash-mixd`.
+- [~] **Agent replay, mixD vs today.** `tmp/dual/eval_chain.sh` (8 slots each). Done when both arms' pass counts and minutes are in `PROGRESS.md`.
 - [ ] **The user picks the default stack** (`local-flash`, `local-flash-dual` or `local-flash-mixd`) after a day of real sessions. Done when `local-flash` points at the choice and the others are rollbacks.
-- [ ] **Prompt reads on the 4070 too.** mixD reads prompts 15% slower (bigger experts streamed). Let the 4070 compute its experts' rows for prompt chunks, as the peer tier does. Done when a 35K read is back at ~2,500 t/s.
+- [ ] **Prompt reads on the 4070 too.** Let the 4070 compute its experts' rows for prompt chunks, as the peer tier does (~+12% reads est.; reads are 25% of the live server's engine time). Done when a 35K read is measured both ways.
+- [ ] **Fuse the drafter's step.** 0.55 ms of ~16 small kernels, ~2.3x its memory floor; ~1.2 ms a round at `--spec 6` (~+4%). Done when the step is measured fused and the drafts are unchanged.
 - [ ] **The 4070's tier in resident RAM mode.** Its swaps must exchange with the RAM copy (today they leave the CPU reading the SSD), so full 4-bit (perplexity 3.99, code 113 t/s) can adapt. Done when the full 4-bit run reads no expert from the file.
 - [ ] **Free the 4-bit download's unused bytes.** mixD reads only 30 layers' down tensors from the 91 GiB IQ4_XS shards; punch holes in the rest (offsets stay valid). Done when the shards use ~14 GB on disk and mixD still loads.
 
