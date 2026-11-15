@@ -51,7 +51,7 @@ Each line carries its own done-check. A task too big for one session gets split 
 - [ ] **Measure the new setup on real agent sessions.** `python3 bench/agent_time.py <strata config>` after a few long sessions: cold re-reads, disk restores, search waits vs runs 51 and 61. Done when the numbers are in `PROGRESS.md`.
 - [ ] **Re-sweep upstream Strata, Basalt and r/LocalLLaMA.** Reddit RSS ends 2026-11-13; find another route first. Done when new leads are ranked in the research doc.
 
-## Fine-tuning: a small house-style model (branch `feat/finetune`)
+## Fine-tuning: a small house-style model (on `main` since 2026-11-15)
 
 One 4B model that rewrites text in the user's style: drafts shortened and de-slopped, short Slack/GitHub replies, PR/ticket/standup bullets. Why this task and the order: `DECISIONS.md` 2026-11-11. Mined data and scripts: `tmp/ft-mine/` (gitignored, this PC).
 
