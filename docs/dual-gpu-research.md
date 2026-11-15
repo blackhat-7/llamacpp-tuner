@@ -248,3 +248,26 @@ the IQ4_XS shards) is the pick: E is 3-8% slower for 1% lower perplexity.
 
 The server's learned expert profile already keeps the XTX near 95% hits, so the 4070's decode gain there is smaller
 than in generate mode. A 1000 MiB XTX reserve (vs 2000) gave +523 slots and no gain (+1.4% / -0.9%).
+
+### Tail skip beside the helper (engine `e7d42fa9`, both dual configs)
+
+`STRATA_ROUTE_TAIL_SKIP=7` (upstream's CUDA serve default; off on HIP and, before this, off whenever a helper ran)
+skips a cold expert that every token of the window routes only at rank 7-9 (the three smallest top-10 weights), and
+never one a GPU holds. mixD, generate mode: the CPU's cold experts 2.4 -> 1.5 a layer, code +3.3%, prose +2.8%.
+Quality set: perplexity 4.153 -> 4.096 (within noise), KL to the 4-bit reference 0.179 -> 0.181. It changes output
+like any rounding move, so it is a choice: `"STRATA_ROUTE_TAIL_SKIP": "0"` in the config turns it off.
+
+| server, median of 3 | code | prose | edit | 35K prompt read | perplexity |
+|---|---|---|---|---|---|
+| today `local-flash` | 163.2 | 125.7 | 141.2 | 2,546 | 4.79 |
+| `local-flash-dual` (+ tail skip) | 175.9 (+8%) | 132.7 (+6%) | 189.8 (+34%) | 2,575 | 4.79 |
+| `local-flash-mixd` (+ tail skip) | 173.0 (+6%) | 134.7 (+7%) | 172.5 (+22%) | 2,509 | 4.15 |
+
+mixD's earlier 2,153 t/s prompt read was a cold page cache (the IQ4_XS downs read from the SSD); warm it is 2,509.
+
+`STRATA_HC_Q8=1` (8-bit hyper-connection weights for decode, quantized at load; on by default upstream for RDNA4 and
+Strix Halo, off for gfx1100): mixD + tail skip, generate mode, 2 runs each: code +1.0%, prose +1.6%. Now in both dual
+configs. Quality noise: the set's "agent" segment swings up to 20% in perplexity between near-identical runs (a few
+very unlikely tokens); code / docs / English / multilingual are stable to ~1%. On those, tail skip and HC_Q8 are within
+noise, and mixD vs today is -8% to -14% in every one (code 2.41 -> 2.13, docs 11.6 -> 10.3, English 5.57 -> 4.80,
+multilingual 2.94 -> 2.72).
