@@ -292,6 +292,24 @@ def test_usage_and_system_read_live_numbers():
     assert system["cpu_busy"] <= system["cpu_total"]
 
 
+def test_system_reads_a_sleeping_gpu_as_idle(monkeypatch, tmp_path):
+    (tmp_path / "card0" / "device").mkdir(parents=True)  # a GPU with no VRAM counters
+    device = tmp_path / "card1" / "device"
+    device.mkdir(parents=True)
+    (device / "mem_info_vram_used").write_text("1024\n")
+    (device / "mem_info_vram_total").write_text("4096\n")
+    # A runtime-suspended amdgpu card refuses this read; a directory fails the same way.
+    (device / "gpu_busy_percent").mkdir()
+    monkeypatch.setattr(servers, "DRM", tmp_path)
+
+    system = servers.system()
+    assert (system["vram_used"], system["vram_total"], system["gpu_busy"]) == (
+        1024,
+        4096,
+        0,
+    )
+
+
 def test_serve_passes_env_to_llama_server(monkeypatch):
     with (
         patch("llamacpp_tuner.cli.resolve_model", return_value=Path("m.gguf")),

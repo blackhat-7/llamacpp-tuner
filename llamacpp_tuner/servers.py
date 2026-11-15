@@ -13,6 +13,7 @@ from typing import NamedTuple
 from llamacpp_tuner.cache import get_servers_dir
 
 LCT = [sys.executable, "-m", "llamacpp_tuner.cli"]
+DRM = Path("/sys/class/drm")
 
 
 def log_path(name: str) -> Path:
@@ -172,7 +173,7 @@ def _temperature(hwmon: Path, label: str) -> int | None:
 
 def system() -> dict[str, int]:
     """Whole-machine CPU ticks, RAM and temperature and, for the first GPU that
-    reports them, VRAM, load and hotspot temperature."""
+    reports VRAM, its VRAM, load and hotspot temperature."""
     cpu = Path("/proc/stat").read_text().split("\n", 1)[0].split()[1:]
     meminfo = {
         line.split(":")[0]: int(line.split()[1]) * 1024
@@ -186,16 +187,22 @@ def system() -> dict[str, int]:
         "ram_used": meminfo["MemTotal"] - meminfo["MemAvailable"],
         "ram_total": meminfo["MemTotal"],
     }
-    for device in sorted(Path("/sys/class/drm").glob("card[0-9]*/device")):
+    for device in sorted(DRM.glob("card[0-9]*/device")):
+        try:
+            used = int((device / "mem_info_vram_used").read_text())
+            total = int((device / "mem_info_vram_total").read_text())
+        except (OSError, ValueError):
+            continue
+        found["vram_used"], found["vram_total"] = used, total
+        # A runtime-suspended GPU refuses these reads (EBUSY); asleep means idle.
+        found["gpu_busy"] = 0
         with contextlib.suppress(OSError, ValueError):
-            found["vram_used"] = int((device / "mem_info_vram_used").read_text())
-            found["vram_total"] = int((device / "mem_info_vram_total").read_text())
             found["gpu_busy"] = int((device / "gpu_busy_percent").read_text())
             # The hotspot (junction) is what throttles, not the edge sensor.
             for hwmon in device.glob("hwmon/hwmon*"):
                 if (celsius := _temperature(hwmon, "junction")) is not None:
                     found["gpu_temp"] = celsius
-            break
+        break
     for hwmon in Path("/sys/class/hwmon").glob("hwmon*"):
         with contextlib.suppress(OSError):
             is_cpu = (hwmon / "name").read_text().strip() == "coretemp"
