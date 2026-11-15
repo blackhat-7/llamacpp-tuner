@@ -1,0 +1,200 @@
+===== speed_code
+command: ["/home/illusion/Documents/projects/Strata-data/engines/strata-0.1.43-gfx1100opt-6ecfbdb4", "--pack", "/home/illusion/Documents/projects/Strata-data/packs/swift-iq3_xxs", "--native", "/home/illusion/Documents/projects/llamacpp-tuner/tmp/models/ukisai%2FSwift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-GGUF/IQ3_XXS/Swift-Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf", "--ple-gguf", "/home/illusion/Documents/projects/llamacpp-tuner/tmp/models/ukisai%2FSwift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-GGUF/IQ3_XXS/Swift-Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf", "--expert-profile", "/home/illusion/Documents/projects/Strata-data/profiles/swift-1.5-iq3_xxs.bin", "--expert-cache", "auto", "--prefill", "auto:16384", "--spec", "4", "--spec-min-p", "0.5", "--mtp", "/home/illusion/Documents/projects/Strata-data/mtp/rt", "--max-context", "262144", "--kv", "int8", "--kv-resident", "32768", "--vision", "--vram-reserve-mib", "2000", "--conversation-cache-mib", "4096", "--conversation-cache-slots", "3", "--prompt-cache-root", "1024", "--pcie-frac", "0.35", "--pcie-mode", "dma", "--ple-io", "mmap", "--mtp-draft-vocab", "/home/illusion/Documents/projects/Strata-data/draft_vocab_agent.bin", "--mtp-window", "8192", "--tokens-file", "/home/illusion/Documents/projects/llamacpp-tuner/bench/strata-compare/inputs/code.ids", "--max-new", "600", "--stats", "--adapt-every", "0", "--spec-follow", "/home/illusion/Documents/projects/llamacpp-tuner/bench/strata-compare/inputs/code.follow", "--window-hashes", "/home/illusion/Documents/projects/llamacpp-tuner/bench/strata-compare/results/7900xtx-13600k-20261014/speed_code.hashes"]
+strata: gfx1100 (RX 7900): 7 exact speed switches on by default (STRATA_GFX1100_DEFAULTS=0 turns them off; a switch you set is kept): ROUTE_DPP ROUTER_TAIL GDN_AB_ILP FUSE_CONVAB MULTI_BLOCK_ARGMAX UMWAIT POOL_GUIDED
+strata generate: GPU 0: AMD Radeon RX 7900 XTX (gfx1100)
+strata generate: CPU pool tasks/phase: shrinking to 1/32 of a thread's share (STRATA_POOL_GUIDED), participating threads: 14
+strata generate: 13 pool workers on logical processors 2,4,6,8,10,12,13,14,15,16,17,18,19, the host thread on 0 (draining too) (--host-core first)
+strata generate: expert cache auto: 18.28 GiB free, 2000 MiB reserved (+84 MiB for the draft head) -> 7486 slots
+strata generate: expert cache 10021 slots, 16.24 GiB of VRAM; policy is
+strata generate: session is up (engine 0.1.43)
+strata generate: prompt chunk auto: 256 tokens
+strata generate: prompt path borrows 373 cache slots (0.58 GiB)
+prefill gemm: hipBLASLt tuning enabled (26 rows, gfx1100, version 100202)
+strata mtp: coupled draft sampling on (STRATA_SPEC_COUPLED): sampled requests draft with the target's chain and Philox draw over 46242 tokens
+strata: STRATA_HIP_WMMA: the prompt attention on matrix cores on (gfx1100)
+strata hc: CUDA0: the hyper-connection read runs as staged (the norm per token and stream, the down projection's activations staged ahead by cp.async); checked bit for bit against the plain read on this card (STRATA_HC_SPLIT=1 or 0 for the earlier ones)
+speculation              187 rounds of 6, drafts accepted 416 of 520 (0.800), 3.22 tokens per round
+follow                   3 of 600 emitted tokens differ from the argmax
+window sizes             T1:7 T2:9 T3:6 T4:163 T5:0 T6:2  (min draft probability 0.50)
+accepted per round       0:25 1:22 2:26 3:114 4:0 5:0
+verify window            wait for rings 12.777  pool 7.551  host 0.103  commit 0.014 ms/round; CPU experts 3.46 distinct / 4.47 routed per layer
+pool multi               gate/up 4.707  quantize 0.052  down 2.196 ms/round; 41.7 GB/s over the rows phases; CPU pool call 7.454 ms/round
+dispatch                 plan 0.296  activation quantize 0.182  jobs 0.015  run 6.958 ms/round
+pcie experts             1.24 distinct experts per layer read over PCIe (share 90/256 of the misses)
+mtp                      2.318 ms/round drafting (186 rounds), MTP prompt 15.1 ms, 880 MiB of VRAM
+decode                   600 tokens in 4515.5 ms  ->  132.87 tok/s
+prefill                  60 tokens in 516.3 ms  ->  116.20 tok/s  (time to first token 868.5 ms)
+  R4 expert-cache hits   287311 of 327447 = 0.8774      (0 admitted, 40136 refused, cache 100.0000% full)
+===== speed_edit
+command: ["/home/illusion/Documents/projects/Strata-data/engines/strata-0.1.43-gfx1100opt-6ecfbdb4", "--pack", "/home/illusion/Documents/projects/Strata-data/packs/swift-iq3_xxs", "--native", "/home/illusion/Documents/projects/llamacpp-tuner/tmp/models/ukisai%2FSwift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-GGUF/IQ3_XXS/Swift-Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf", "--ple-gguf", "/home/illusion/Documents/projects/llamacpp-tuner/tmp/models/ukisai%2FSwift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-GGUF/IQ3_XXS/Swift-Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf", "--expert-profile", "/home/illusion/Documents/projects/Strata-data/profiles/swift-1.5-iq3_xxs.bin", "--expert-cache", "auto", "--prefill", "auto:16384", "--spec", "4", "--spec-min-p", "0.5", "--mtp", "/home/illusion/Documents/projects/Strata-data/mtp/rt", "--max-context", "262144", "--kv", "int8", "--kv-resident", "32768", "--vision", "--vram-reserve-mib", "2000", "--conversation-cache-mib", "4096", "--conversation-cache-slots", "3", "--prompt-cache-root", "1024", "--pcie-frac", "0.35", "--pcie-mode", "dma", "--ple-io", "mmap", "--mtp-draft-vocab", "/home/illusion/Documents/projects/Strata-data/draft_vocab_agent.bin", "--mtp-window", "8192", "--tokens-file", "/home/illusion/Documents/projects/llamacpp-tuner/bench/strata-compare/inputs/edit.ids", "--max-new", "600", "--stats", "--adapt-every", "0", "--spec-follow", "/home/illusion/Documents/projects/llamacpp-tuner/bench/strata-compare/inputs/edit.follow", "--window-hashes", "/home/illusion/Documents/projects/llamacpp-tuner/bench/strata-compare/results/7900xtx-13600k-20261014/speed_edit.hashes"]
+strata: gfx1100 (RX 7900): 7 exact speed switches on by default (STRATA_GFX1100_DEFAULTS=0 turns them off; a switch you set is kept): ROUTE_DPP ROUTER_TAIL GDN_AB_ILP FUSE_CONVAB MULTI_BLOCK_ARGMAX UMWAIT POOL_GUIDED
+strata generate: GPU 0: AMD Radeon RX 7900 XTX (gfx1100)
+strata generate: CPU pool tasks/phase: shrinking to 1/32 of a thread's share (STRATA_POOL_GUIDED), participating threads: 14
+strata generate: 13 pool workers on logical processors 2,4,6,8,10,12,13,14,15,16,17,18,19, the host thread on 0 (draining too) (--host-core first)
+strata generate: expert cache auto: 18.28 GiB free, 2000 MiB reserved (+84 MiB for the draft head) -> 7486 slots
+strata generate: expert cache 10021 slots, 16.24 GiB of VRAM; policy is
+strata generate: session is up (engine 0.1.43)
+strata generate: prompt chunk auto: 2048 tokens
+strata generate: prompt path borrows 799 cache slots (1.26 GiB)
+prefill gemm: hipBLASLt tuning enabled (26 rows, gfx1100, version 100202)
+strata mtp: coupled draft sampling on (STRATA_SPEC_COUPLED): sampled requests draft with the target's chain and Philox draw over 46242 tokens
+strata: prompt experts on the fused int8 kernels (STRATA_PF_FUSED=1, #136)
+strata: STRATA_HIP_WMMA: the prompt attention on matrix cores on (gfx1100)
+strata hc: CUDA0: the hyper-connection read runs as staged (the norm per token and stream, the down projection's activations staged ahead by cp.async); checked bit for bit against the plain read on this card (STRATA_HC_SPLIT=1 or 0 for the earlier ones)
+speculation              114 rounds of 6, drafts accepted 488 of 508 (0.961), 5.28 tokens per round
+follow                   0 of 600 emitted tokens differ from the argmax
+window sizes             T1:1 T2:0 T3:0 T4:28 T5:1 T6:84  (min draft probability 0.50)
+accepted per round       0:3 1:3 2:2 3:23 4:3 5:80
+verify window            wait for rings 17.111  pool 22.910  host 0.169  commit 0.014 ms/round; CPU experts 11.18 distinct / 15.36 routed per layer
+pool multi               gate/up 14.820  quantize 0.178  down 6.772 ms/round; 42.6 GB/s over the rows phases; CPU pool call 22.754 ms/round
+dispatch                 plan 0.653  activation quantize 0.283  jobs 0.035  run 21.775 ms/round
+pcie experts             5.29 distinct experts per layer read over PCIe (share 90/256 of the misses)
+mtp                      2.526 ms/round drafting (113 rounds), MTP prompt 7.8 ms, 880 MiB of VRAM
+decode                   600 tokens in 5134.8 ms  ->  116.85 tok/s
+prefill                  2028 tokens in 1663.6 ms  ->  1219.03 tok/s  (time to first token 1794.1 ms)
+  R4 expert-cache hits   183391 of 267420 = 0.6858      (0 admitted, 84029 refused, cache 100.0000% full)
+===== speed_prose
+command: ["/home/illusion/Documents/projects/Strata-data/engines/strata-0.1.43-gfx1100opt-6ecfbdb4", "--pack", "/home/illusion/Documents/projects/Strata-data/packs/swift-iq3_xxs", "--native", "/home/illusion/Documents/projects/llamacpp-tuner/tmp/models/ukisai%2FSwift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-GGUF/IQ3_XXS/Swift-Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf", "--ple-gguf", "/home/illusion/Documents/projects/llamacpp-tuner/tmp/models/ukisai%2FSwift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-GGUF/IQ3_XXS/Swift-Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf", "--expert-profile", "/home/illusion/Documents/projects/Strata-data/profiles/swift-1.5-iq3_xxs.bin", "--expert-cache", "auto", "--prefill", "auto:16384", "--spec", "4", "--spec-min-p", "0.5", "--mtp", "/home/illusion/Documents/projects/Strata-data/mtp/rt", "--max-context", "262144", "--kv", "int8", "--kv-resident", "32768", "--vision", "--vram-reserve-mib", "2000", "--conversation-cache-mib", "4096", "--conversation-cache-slots", "3", "--prompt-cache-root", "1024", "--pcie-frac", "0.35", "--pcie-mode", "dma", "--ple-io", "mmap", "--mtp-draft-vocab", "/home/illusion/Documents/projects/Strata-data/draft_vocab_agent.bin", "--mtp-window", "8192", "--tokens-file", "/home/illusion/Documents/projects/llamacpp-tuner/bench/strata-compare/inputs/prose.ids", "--max-new", "600", "--stats", "--adapt-every", "0", "--spec-follow", "/home/illusion/Documents/projects/llamacpp-tuner/bench/strata-compare/inputs/prose.follow", "--window-hashes", "/home/illusion/Documents/projects/llamacpp-tuner/bench/strata-compare/results/7900xtx-13600k-20261014/speed_prose.hashes"]
+strata: gfx1100 (RX 7900): 7 exact speed switches on by default (STRATA_GFX1100_DEFAULTS=0 turns them off; a switch you set is kept): ROUTE_DPP ROUTER_TAIL GDN_AB_ILP FUSE_CONVAB MULTI_BLOCK_ARGMAX UMWAIT POOL_GUIDED
+strata generate: GPU 0: AMD Radeon RX 7900 XTX (gfx1100)
+strata generate: CPU pool tasks/phase: shrinking to 1/32 of a thread's share (STRATA_POOL_GUIDED), participating threads: 14
+strata generate: 13 pool workers on logical processors 2,4,6,8,10,12,13,14,15,16,17,18,19, the host thread on 0 (draining too) (--host-core first)
+strata generate: expert cache auto: 18.28 GiB free, 2000 MiB reserved (+84 MiB for the draft head) -> 7486 slots
+strata generate: expert cache 10021 slots, 16.24 GiB of VRAM; policy is
+strata generate: session is up (engine 0.1.43)
+strata generate: prompt chunk auto: 256 tokens
+strata generate: prompt path borrows 373 cache slots (0.58 GiB)
+prefill gemm: hipBLASLt tuning enabled (26 rows, gfx1100, version 100202)
+strata mtp: coupled draft sampling on (STRATA_SPEC_COUPLED): sampled requests draft with the target's chain and Philox draw over 46242 tokens
+strata: STRATA_HIP_WMMA: the prompt attention on matrix cores on (gfx1100)
+strata hc: CUDA0: the hyper-connection read runs as staged (the norm per token and stream, the down projection's activations staged ahead by cp.async); checked bit for bit against the plain read on this card (STRATA_HC_SPLIT=1 or 0 for the earlier ones)
+speculation              272 rounds of 6, drafts accepted 329 of 536 (0.614), 2.21 tokens per round
+follow                   9 of 600 emitted tokens differ from the argmax
+window sizes             T1:45 T2:54 T3:37 T4:136 T5:0 T6:0  (min draft probability 0.50)
+accepted per round       0:99 1:74 2:42 3:57 4:0 5:0
+verify window            wait for rings 11.019  pool 9.211  host 0.090  commit 0.014 ms/round; CPU experts 4.21 distinct / 6.33 routed per layer
+pool multi               gate/up 5.810  quantize 0.074  down 2.722 ms/round; 41.2 GB/s over the rows phases; CPU pool call 9.124 ms/round
+dispatch                 plan 0.335  activation quantize 0.157  jobs 0.018  run 8.610 ms/round
+pcie experts             1.61 distinct experts per layer read over PCIe (share 90/256 of the misses)
+mtp                      2.058 ms/round drafting (271 rounds), MTP prompt 15.9 ms, 880 MiB of VRAM
+decode                   600 tokens in 6367.3 ms  ->  94.23 tok/s
+prefill                  58 tokens in 664.7 ms  ->  87.25 tok/s  (time to first token 1064.9 ms)
+  R4 expert-cache hits   281938 of 364600 = 0.7733      (0 admitted, 82662 refused, cache 100.0000% full)
+===== prof_code
+command: ["/home/illusion/Documents/projects/Strata-data/engines/strata-0.1.43-gfx1100opt-6ecfbdb4", "--pack", "/home/illusion/Documents/projects/Strata-data/packs/swift-iq3_xxs", "--native", "/home/illusion/Documents/projects/llamacpp-tuner/tmp/models/ukisai%2FSwift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-GGUF/IQ3_XXS/Swift-Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf", "--ple-gguf", "/home/illusion/Documents/projects/llamacpp-tuner/tmp/models/ukisai%2FSwift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-GGUF/IQ3_XXS/Swift-Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf", "--expert-profile", "/home/illusion/Documents/projects/Strata-data/profiles/swift-1.5-iq3_xxs.bin", "--expert-cache", "auto", "--prefill", "auto:16384", "--spec", "4", "--spec-min-p", "0.5", "--mtp", "/home/illusion/Documents/projects/Strata-data/mtp/rt", "--max-context", "262144", "--kv", "int8", "--kv-resident", "32768", "--vision", "--vram-reserve-mib", "2000", "--conversation-cache-mib", "4096", "--conversation-cache-slots", "3", "--prompt-cache-root", "1024", "--pcie-frac", "0.35", "--pcie-mode", "dma", "--ple-io", "mmap", "--mtp-draft-vocab", "/home/illusion/Documents/projects/Strata-data/draft_vocab_agent.bin", "--mtp-window", "8192", "--tokens-file", "/home/illusion/Documents/projects/llamacpp-tuner/bench/strata-compare/inputs/code.ids", "--max-new", "600", "--stats", "--adapt-every", "0", "--spec-follow", "/home/illusion/Documents/projects/llamacpp-tuner/bench/strata-compare/inputs/code.follow", "--window-hashes", "/home/illusion/Documents/projects/llamacpp-tuner/bench/strata-compare/results/7900xtx-13600k-20261014/prof_code.hashes"]
+extra env: {"STRATA_VERIFY_PROFILE": "1", "STRATA_DECODE_TIMING": "1"}
+strata: gfx1100 (RX 7900): 7 exact speed switches on by default (STRATA_GFX1100_DEFAULTS=0 turns them off; a switch you set is kept): ROUTE_DPP ROUTER_TAIL GDN_AB_ILP FUSE_CONVAB MULTI_BLOCK_ARGMAX UMWAIT POOL_GUIDED
+strata generate: GPU 0: AMD Radeon RX 7900 XTX (gfx1100)
+strata generate: CPU pool tasks/phase: shrinking to 1/32 of a thread's share (STRATA_POOL_GUIDED), participating threads: 14
+strata generate: 13 pool workers on logical processors 2,4,6,8,10,12,13,14,15,16,17,18,19, the host thread on 0 (draining too) (--host-core first)
+strata generate: expert cache auto: 18.28 GiB free, 2000 MiB reserved (+84 MiB for the draft head) -> 7486 slots
+strata generate: expert cache 10021 slots, 16.24 GiB of VRAM; policy is
+strata generate: session is up (engine 0.1.43)
+strata generate: prompt chunk auto: 256 tokens
+strata generate: prompt path borrows 373 cache slots (0.58 GiB)
+prefill gemm: hipBLASLt tuning enabled (26 rows, gfx1100, version 100202)
+strata mtp: coupled draft sampling on (STRATA_SPEC_COUPLED): sampled requests draft with the target's chain and Philox draw over 46242 tokens
+strata: STRATA_HIP_WMMA: the prompt attention on matrix cores on (gfx1100)
+strata hc: CUDA0: the hyper-connection read runs as staged (the norm per token and stream, the down projection's activations staged ahead by cp.async); checked bit for bit against the plain read on this card (STRATA_HC_SPLIT=1 or 0 for the earlier ones)
+speculation              187 rounds of 6, drafts accepted 416 of 520 (0.800), 3.22 tokens per round
+follow                   3 of 600 emitted tokens differ from the argmax
+window sizes             T1:7 T2:9 T3:6 T4:163 T5:0 T6:2  (min draft probability 0.50)
+accepted per round       0:25 1:22 2:26 3:114 4:0 5:0
+verify window            wait for rings 15.452  pool 7.759  host 0.442  commit 0.014 ms/round; CPU experts 3.46 distinct / 4.47 routed per layer
+verify GPU stages        GDN layers: q8+qkv/q-idx gemv 1.30 conv 0.22 ab 0.27 z 0.83 rec 0.50 out-proj 1.03 router+plan+bell 0.71 shared+quant 1.48 waitA 0.59 VRAM hits 3.16 waitB 0.89 PCIe grp 0.54 waitCPU 1.00 copy+combine 0.62 (gap) 0.09 head 0.87   hc0 norm 0.45   hc0 down 0.77   hc0 up 0.71   hc1 norm 0.24   hc1 down 0.68   hc1 up 0.70 | QSA layers: q8+kv-idx 0.08 k/v+norm-rope 0.27 kv+idx append 0.21 q+q-idx 0.63 scores+topk 0.13 kv-resolve 0.19 attention 0.59 gate 0.07 out-proj 0.37 router+plan+bell 0.24 shared+quant 0.49 waitA 0.20 VRAM hits 0.97 waitB 0.33 PCIe grp 0.18 waitCPU 0.19 copy+combine 0.20 (gap) 0.03   hc0 norm 0.08   hc0 down 0.25   hc0 up 0.24   hc1 norm 0.08   hc1 down 0.23   hc1 up 0.24 | total 24.15 ms/window over 187 windows
+pool multi               gate/up 4.668  quantize 0.053  down 2.107 ms/round; 42.5 GB/s over the rows phases; CPU pool call 7.323 ms/round
+dispatch                 plan 0.291  activation quantize 0.183  jobs 0.015  run 6.830 ms/round
+pcie experts             1.24 distinct experts per layer read over PCIe (share 90/256 of the misses)
+mtp                      2.317 ms/round drafting (186 rounds), MTP prompt 15.3 ms, 880 MiB of VRAM
+decode                   600 tokens in 5065.3 ms  ->  118.45 tok/s
+prefill                  60 tokens in 509.6 ms  ->  117.74 tok/s  (time to first token 755.6 ms)
+  R4 expert-cache hits   287311 of 327447 = 0.8774      (0 admitted, 40136 refused, cache 100.0000% full)
+===== prof_prose
+command: ["/home/illusion/Documents/projects/Strata-data/engines/strata-0.1.43-gfx1100opt-6ecfbdb4", "--pack", "/home/illusion/Documents/projects/Strata-data/packs/swift-iq3_xxs", "--native", "/home/illusion/Documents/projects/llamacpp-tuner/tmp/models/ukisai%2FSwift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-GGUF/IQ3_XXS/Swift-Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf", "--ple-gguf", "/home/illusion/Documents/projects/llamacpp-tuner/tmp/models/ukisai%2FSwift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-GGUF/IQ3_XXS/Swift-Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf", "--expert-profile", "/home/illusion/Documents/projects/Strata-data/profiles/swift-1.5-iq3_xxs.bin", "--expert-cache", "auto", "--prefill", "auto:16384", "--spec", "4", "--spec-min-p", "0.5", "--mtp", "/home/illusion/Documents/projects/Strata-data/mtp/rt", "--max-context", "262144", "--kv", "int8", "--kv-resident", "32768", "--vision", "--vram-reserve-mib", "2000", "--conversation-cache-mib", "4096", "--conversation-cache-slots", "3", "--prompt-cache-root", "1024", "--pcie-frac", "0.35", "--pcie-mode", "dma", "--ple-io", "mmap", "--mtp-draft-vocab", "/home/illusion/Documents/projects/Strata-data/draft_vocab_agent.bin", "--mtp-window", "8192", "--tokens-file", "/home/illusion/Documents/projects/llamacpp-tuner/bench/strata-compare/inputs/prose.ids", "--max-new", "600", "--stats", "--adapt-every", "0", "--spec-follow", "/home/illusion/Documents/projects/llamacpp-tuner/bench/strata-compare/inputs/prose.follow", "--window-hashes", "/home/illusion/Documents/projects/llamacpp-tuner/bench/strata-compare/results/7900xtx-13600k-20261014/prof_prose.hashes"]
+extra env: {"STRATA_VERIFY_PROFILE": "1", "STRATA_DECODE_TIMING": "1"}
+strata: gfx1100 (RX 7900): 7 exact speed switches on by default (STRATA_GFX1100_DEFAULTS=0 turns them off; a switch you set is kept): ROUTE_DPP ROUTER_TAIL GDN_AB_ILP FUSE_CONVAB MULTI_BLOCK_ARGMAX UMWAIT POOL_GUIDED
+strata generate: GPU 0: AMD Radeon RX 7900 XTX (gfx1100)
+strata generate: CPU pool tasks/phase: shrinking to 1/32 of a thread's share (STRATA_POOL_GUIDED), participating threads: 14
+strata generate: 13 pool workers on logical processors 2,4,6,8,10,12,13,14,15,16,17,18,19, the host thread on 0 (draining too) (--host-core first)
+strata generate: expert cache auto: 18.28 GiB free, 2000 MiB reserved (+84 MiB for the draft head) -> 7486 slots
+strata generate: expert cache 10021 slots, 16.24 GiB of VRAM; policy is
+strata generate: session is up (engine 0.1.43)
+strata generate: prompt chunk auto: 256 tokens
+strata generate: prompt path borrows 373 cache slots (0.58 GiB)
+prefill gemm: hipBLASLt tuning enabled (26 rows, gfx1100, version 100202)
+strata mtp: coupled draft sampling on (STRATA_SPEC_COUPLED): sampled requests draft with the target's chain and Philox draw over 46242 tokens
+strata: STRATA_HIP_WMMA: the prompt attention on matrix cores on (gfx1100)
+strata hc: CUDA0: the hyper-connection read runs as staged (the norm per token and stream, the down projection's activations staged ahead by cp.async); checked bit for bit against the plain read on this card (STRATA_HC_SPLIT=1 or 0 for the earlier ones)
+speculation              272 rounds of 6, drafts accepted 329 of 536 (0.614), 2.21 tokens per round
+follow                   9 of 600 emitted tokens differ from the argmax
+window sizes             T1:45 T2:54 T3:37 T4:136 T5:0 T6:0  (min draft probability 0.50)
+accepted per round       0:99 1:74 2:42 3:57 4:0 5:0
+verify window            wait for rings 13.538  pool 9.273  host 0.407  commit 0.013 ms/round; CPU experts 4.21 distinct / 6.33 routed per layer
+verify GPU stages        GDN layers: q8+qkv/q-idx gemv 1.17 conv 0.22 ab 0.27 z 0.78 rec 0.46 out-proj 0.96 router+plan+bell 0.69 shared+quant 1.45 waitA 0.63 VRAM hits 2.55 waitB 1.57 PCIe grp 0.59 waitCPU 1.28 copy+combine 0.61 (gap) 0.09 head 0.76   hc0 norm 0.42   hc0 down 0.69   hc0 up 0.66   hc1 norm 0.24   hc1 down 0.62   hc1 up 0.65 | QSA layers: q8+kv-idx 0.08 k/v+norm-rope 0.25 kv+idx append 0.21 q+q-idx 0.59 scores+topk 0.12 kv-resolve 0.17 attention 0.59 gate 0.07 out-proj 0.35 router+plan+bell 0.23 shared+quant 0.48 waitA 0.21 VRAM hits 0.77 waitB 0.43 PCIe grp 0.19 waitCPU 0.29 copy+combine 0.20 (gap) 0.03   hc0 norm 0.08   hc0 down 0.23   hc0 up 0.22   hc1 norm 0.08   hc1 down 0.21   hc1 up 0.22 | total 23.65 ms/window over 272 windows
+pool multi               gate/up 5.717  quantize 0.072  down 2.596 ms/round; 42.3 GB/s over the rows phases; CPU pool call 8.868 ms/round
+dispatch                 plan 0.305  activation quantize 0.153  jobs 0.017  run 8.389 ms/round
+pcie experts             1.61 distinct experts per layer read over PCIe (share 90/256 of the misses)
+mtp                      2.055 ms/round drafting (271 rounds), MTP prompt 16.0 ms, 880 MiB of VRAM
+decode                   600 tokens in 7116.0 ms  ->  84.32 tok/s
+prefill                  58 tokens in 808.6 ms  ->  71.73 tok/s  (time to first token 1008.8 ms)
+  R4 expert-cache hits   281938 of 364600 = 0.7733      (0 admitted, 82662 refused, cache 100.0000% full)
+===== prompt_15k
+command: ["/home/illusion/Documents/projects/Strata-data/engines/strata-0.1.43-gfx1100opt-6ecfbdb4", "--pack", "/home/illusion/Documents/projects/Strata-data/packs/swift-iq3_xxs", "--native", "/home/illusion/Documents/projects/llamacpp-tuner/tmp/models/ukisai%2FSwift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-GGUF/IQ3_XXS/Swift-Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf", "--ple-gguf", "/home/illusion/Documents/projects/llamacpp-tuner/tmp/models/ukisai%2FSwift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-GGUF/IQ3_XXS/Swift-Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf", "--expert-profile", "/home/illusion/Documents/projects/Strata-data/profiles/swift-1.5-iq3_xxs.bin", "--expert-cache", "auto", "--prefill", "auto:16384", "--spec", "4", "--spec-min-p", "0.5", "--mtp", "/home/illusion/Documents/projects/Strata-data/mtp/rt", "--max-context", "262144", "--kv", "int8", "--kv-resident", "32768", "--vision", "--vram-reserve-mib", "2000", "--conversation-cache-mib", "4096", "--conversation-cache-slots", "3", "--prompt-cache-root", "1024", "--pcie-frac", "0.35", "--pcie-mode", "dma", "--ple-io", "mmap", "--mtp-draft-vocab", "/home/illusion/Documents/projects/Strata-data/draft_vocab_agent.bin", "--mtp-window", "8192", "--tokens-file", "/home/illusion/Documents/projects/llamacpp-tuner/bench/strata-compare/inputs/p15k.ids", "--max-new", "16", "--stats", "--adapt-every", "0"]
+extra env: {"STRATA_PREFILL_TIMING": "1"}
+strata: gfx1100 (RX 7900): 7 exact speed switches on by default (STRATA_GFX1100_DEFAULTS=0 turns them off; a switch you set is kept): ROUTE_DPP ROUTER_TAIL GDN_AB_ILP FUSE_CONVAB MULTI_BLOCK_ARGMAX UMWAIT POOL_GUIDED
+strata generate: GPU 0: AMD Radeon RX 7900 XTX (gfx1100)
+strata generate: CPU pool tasks/phase: shrinking to 1/32 of a thread's share (STRATA_POOL_GUIDED), participating threads: 14
+strata generate: 13 pool workers on logical processors 2,4,6,8,10,12,13,14,15,16,17,18,19, the host thread on 0 (draining too) (--host-core first)
+strata generate: expert cache auto: 18.28 GiB free, 2000 MiB reserved (+84 MiB for the draft head) -> 7486 slots
+strata generate: expert cache 10021 slots, 16.24 GiB of VRAM; policy is
+strata generate: session is up (engine 0.1.43)
+strata generate: prompt chunk auto: 15104 tokens
+strata generate: prompt path borrows 3051 cache slots (4.84 GiB)
+prefill gemm: hipBLASLt tuning enabled (26 rows, gfx1100, version 100202)
+strata mtp: coupled draft sampling on (STRATA_SPEC_COUPLED): sampled requests draft with the target's chain and Philox draw over 46242 tokens
+strata: prompt experts on the fused int8 kernels (STRATA_PF_FUSED=1, #136)
+strata: STRATA_HIP_WMMA: the prompt attention on matrix cores on (gfx1100)
+strata prefill timing: 14999 tokens, GPU timeline 6795 ms, wall 6816 ms, host staging 3314 ms: embed+steps 205 (3.0%) hc read 1013 (14.9%) gdn 517 (7.6%) qsa proj 334 (4.9%) qsa indexer 1 (0.0%) qsa select 69 (1.0%) qsa attn 601 (8.8%) router+shared 131 (1.9%) gather 14 (0.2%) wait copy 22 (0.3%) gemm gate/up 1483 (21.8%) combine 1512 (22.3%) ple 156 (2.3%) kv stage 0 (0.0%) gdn conv+gates 64 (0.9%) gdn recurrence 399 (5.9%) gdn out proj 274 (4.0%)
+strata prefill timing: host: chunk setup (PLE rows, the expert stream plan) 6 ms, waiting for each chunk 1461 ms, after each chunk (the draft layer, progress) 21 ms, PLE 1360 ms
+strata hc: CUDA0: the hyper-connection read runs as staged (the norm per token and stream, the down projection's activations staged ahead by cp.async); checked bit for bit against the plain read on this card (STRATA_HC_SPLIT=1 or 0 for the earlier ones)
+speculation              9 rounds of 6, drafts accepted 8 of 17 (0.471), 1.89 tokens per round
+window sizes             T1:2 T2:1 T3:2 T4:4 T5:0 T6:0  (min draft probability 0.50)
+accepted per round       0:5 1:2 2:0 3:2 4:0 5:0
+verify window            wait for rings 12.363  pool 10.639  host 0.129  commit 0.022 ms/round; CPU experts 4.49 distinct / 6.58 routed per layer
+pool multi               gate/up 6.779  quantize 0.110  down 2.953 ms/round; 38.5 GB/s over the rows phases; CPU pool call 10.524 ms/round
+dispatch                 plan 0.472  activation quantize 0.175  jobs 0.024  run 9.847 ms/round
+pcie experts             1.75 distinct experts per layer read over PCIe (share 90/256 of the misses)
+mtp                      2.039 ms/round drafting (8 rounds), MTP prompt 20.6 ms, 880 MiB of VRAM
+decode                   16 tokens in 315.0 ms  ->  50.79 tok/s
+prefill                  14999 tokens in 7023.6 ms  ->  2135.51 tok/s  (time to first token 7628.2 ms)
+  R4 expert-cache hits   8801 of 11642 = 0.7560      (0 admitted, 2841 refused, cache 100.0000% full)
+===== prompt_35k
+command: ["/home/illusion/Documents/projects/Strata-data/engines/strata-0.1.43-gfx1100opt-6ecfbdb4", "--pack", "/home/illusion/Documents/projects/Strata-data/packs/swift-iq3_xxs", "--native", "/home/illusion/Documents/projects/llamacpp-tuner/tmp/models/ukisai%2FSwift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-GGUF/IQ3_XXS/Swift-Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf", "--ple-gguf", "/home/illusion/Documents/projects/llamacpp-tuner/tmp/models/ukisai%2FSwift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-GGUF/IQ3_XXS/Swift-Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf", "--expert-profile", "/home/illusion/Documents/projects/Strata-data/profiles/swift-1.5-iq3_xxs.bin", "--expert-cache", "auto", "--prefill", "auto:16384", "--spec", "4", "--spec-min-p", "0.5", "--mtp", "/home/illusion/Documents/projects/Strata-data/mtp/rt", "--max-context", "262144", "--kv", "int8", "--kv-resident", "32768", "--vision", "--vram-reserve-mib", "2000", "--conversation-cache-mib", "4096", "--conversation-cache-slots", "3", "--prompt-cache-root", "1024", "--pcie-frac", "0.35", "--pcie-mode", "dma", "--ple-io", "mmap", "--mtp-draft-vocab", "/home/illusion/Documents/projects/Strata-data/draft_vocab_agent.bin", "--mtp-window", "8192", "--tokens-file", "/home/illusion/Documents/projects/llamacpp-tuner/bench/strata-compare/inputs/long32k.ids", "--max-new", "16", "--stats", "--adapt-every", "0"]
+extra env: {"STRATA_PREFILL_TIMING": "1"}
+strata: gfx1100 (RX 7900): 7 exact speed switches on by default (STRATA_GFX1100_DEFAULTS=0 turns them off; a switch you set is kept): ROUTE_DPP ROUTER_TAIL GDN_AB_ILP FUSE_CONVAB MULTI_BLOCK_ARGMAX UMWAIT POOL_GUIDED
+strata generate: GPU 0: AMD Radeon RX 7900 XTX (gfx1100)
+strata generate: CPU pool tasks/phase: shrinking to 1/32 of a thread's share (STRATA_POOL_GUIDED), participating threads: 14
+strata generate: 13 pool workers on logical processors 2,4,6,8,10,12,13,14,15,16,17,18,19, the host thread on 0 (draining too) (--host-core first)
+strata generate: expert cache auto: 18.28 GiB free, 2000 MiB reserved (+84 MiB for the draft head) -> 7486 slots
+strata generate: expert cache 10021 slots, 16.24 GiB of VRAM; policy is
+strata generate: session is up (engine 0.1.43)
+strata generate: prompt chunk auto: 16384 tokens
+strata generate: prompt path borrows 3273 cache slots (5.20 GiB)
+prefill gemm: hipBLASLt tuning enabled (26 rows, gfx1100, version 100202)
+strata mtp: coupled draft sampling on (STRATA_SPEC_COUPLED): sampled requests draft with the target's chain and Philox draw over 46242 tokens
+strata: prompt experts on the fused int8 kernels (STRATA_PF_FUSED=1, #136)
+strata: STRATA_HIP_WMMA: the prompt attention on matrix cores on (gfx1100)
+strata prefill timing: 34970 tokens, GPU timeline 13457 ms, wall 13464 ms, host staging 8440 ms: embed+steps 200 (1.5%) hc read 1328 (9.9%) gdn 1225 (9.1%) qsa proj 795 (5.9%) qsa indexer 1 (0.0%) qsa select 324 (2.4%) qsa attn 1479 (11.0%) router+shared 317 (2.4%) gather 33 (0.2%) wait copy 735 (5.5%) gemm gate/up 3600 (26.8%) combine 1330 (9.9%) ple 303 (2.2%) kv stage 34 (0.2%) gdn conv+gates 151 (1.1%) gdn recurrence 938 (7.0%) gdn out proj 666 (4.9%)
+strata prefill timing: host: chunk setup (PLE rows, the expert stream plan) 7 ms, waiting for each chunk 3790 ms, after each chunk (the draft layer, progress) 21 ms, PLE 867 ms
+strata hc: CUDA0: the hyper-connection read runs as staged (the norm per token and stream, the down projection's activations staged ahead by cp.async); checked bit for bit against the plain read on this card (STRATA_HC_SPLIT=1 or 0 for the earlier ones)
+speculation              6 rounds of 6, drafts accepted 12 of 15 (0.800), 3.00 tokens per round
+window sizes             T1:1 T2:0 T3:0 T4:5 T5:0 T6:0  (min draft probability 0.50)
+accepted per round       0:1 1:0 2:3 3:2 4:0 5:0
+verify window            wait for rings 13.439  pool 10.060  host 0.123  commit 0.017 ms/round; CPU experts 4.57 distinct / 7.51 routed per layer
+pool multi               gate/up 6.283  quantize 0.085  down 2.989 ms/round; 41.5 GB/s over the rows phases; CPU pool call 9.946 ms/round
+dispatch                 plan 0.379  activation quantize 0.181  jobs 0.020  run 9.362 ms/round
+pcie experts             1.78 distinct experts per layer read over PCIe (share 90/256 of the misses)
+mtp                      2.295 ms/round drafting (5 rounds), MTP prompt 20.6 ms, 880 MiB of VRAM
+decode                   16 tokens in 188.3 ms  ->  84.97 tok/s
+prefill                  34970 tokens in 13687.9 ms  ->  2554.82 tok/s  (time to first token 14075.9 ms)
+  R4 expert-cache hits   7319 of 9481 = 0.7720      (0 admitted, 2162 refused, cache 100.0000% full)

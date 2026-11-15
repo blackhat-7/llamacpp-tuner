@@ -1,0 +1,60 @@
+{
+ "time": "2026-10-14 23:23:38",
+ "os": "Linux-6.18.55-x86_64-with-glibc2.44",
+ "cpu": "model name\t: Intel(R) Core(TM) i9-14900KS",
+ "lscpu": "Architecture:                            x86_64\nCPU op-mode(s):                          32-bit, 64-bit\nAddress sizes:                           46 bits physical, 48 bits virtual\nByte Order:                              Little Endian\nCPU(s):                                  32\nOn-line CPU(s) list:                     0-31\nVendor ID:                               GenuineIntel\nModel name:                              Intel(R) Core(TM) i9-14900KS\nCPU family:                              6\nModel:                                   183\nThread(s) per core:                      2\nCore(s) per socket:                      24\nSocket(s):                               1\nStepping:                                1\nMicrocode version:                       0x137\nCPU(s) scaling MHz:                      42%\nCPU max MHz:                             6200.0000\nCPU min MHz:                             800.0000\nBogoMIPS:                                6374.40\nFlags:                                   fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov pat pse36 clflush dts acpi mmx fxsr sse sse2 ss ht tm pbe syscall nx pdpe1gb rdtscp lm constant_tsc art arch_perfmon pebs bts rep_good nopl xtopology nonstop_tsc cpuid aperfmperf tsc_known_freq pni pclmulqdq dtes64 monitor ds_cpl vmx smx est tm2 ssse3 sdbg fma cx16 xtpr pdcm pcid sse4_1 sse4_2 x2apic movbe popcnt tsc_deadline_timer aes xsave avx f16c rdrand lahf_lm abm 3dnowprefetch cpuid_fault epb ssbd ibrs ibpb stibp ibrs_enhanced tpr_shadow flexpriority ept vpid ept_ad fsgsbase tsc_adjust bmi1 avx2 smep bmi2 erms invpcid rdseed adx smap clflushopt clwb intel_pt sha_ni xsaveopt xsavec xgetbv1 xsaves split_lock_detect user_shstk avx_vnni dtherm ida arat pln pts hwp hwp_notify hwp_act_window hwp_epp hwp_pkg_req hfi vnmi umip pku ospke waitpkg gfni vaes vpclmulqdq rdpid movdiri movdir64b fsrm md_clear serialize pconfig arch_lbr ibt flush_l1d arch_capabilities\nVirtualization:                          VT-x\nL1d cache:                               896 KiB (24 instances)\nL1i cache:                               1.3 MiB (24 instances)\nL2 cache:                                32 MiB (12 instances)\nL3 cache:                                36 MiB (1 instance)\nNUMA node(s):                            1\nNUMA node0 CPU(s):                       0-31\nVulnerability Gather data sampling:      Not affected\nVulnerability Ghostwrite:                Not affected\nVulnerability Indirect target selection: Not affected\nVulnerability Itlb multihit:             Not affected\nVulnerability L1tf:                      Not affected\nVulnerability Mds:                       Not affected\nVulnerability Meltdown:                  Not affected\nVulnerability Mmio stale data:           Not affected\nVulnerability Old microcode:             Not affected\nVulnerability Reg file data sampling:    Mitigation; Clear Register File\nVulnerability Retbleed:                  Not affected\nVulnerability Spec rstack overflow:      Not affected\nVulnerability Spec store bypass:         Mitigation; Speculative Store Bypass disabled via prctl\nVulnerability Spectre v1:                Mitigation; usercopy/swapgs barriers and __user pointer sanitization\nVulnerability Spectre v2:                Mitigation; Enhanced / Automatic IBRS; IBPB conditional; PBRSB-eIBRS SW sequence; BHI BHI_DIS_S\nVulnerability Srbds:                     Not affected\nVulnerability Tsa:                       Not affected\nVulnerability Tsx async abort:           Not affected\nVulnerability Vmscape:                   Mitigation; IBPB before exit to userspace",
+ "memory": "total        used        free      shared  buff/cache   available\nMem:              62           7          47           0           7          54\nSwap:             63           7          56",
+ "gpu": "name, driver_version, memory.total [MiB], pcie.link.gen.max, pcie.link.width.max, clocks.max.sm [MHz], clocks.max.memory [MHz], power.limit [W]\nNVIDIA GeForce RTX 5090, 610.43.02, 32607 MiB, 5, 16, 3090 MHz, 14001 MHz, 450.00 W",
+ "strata_commit": "v0.1.44.1",
+ "strata_head": "296b59d2f73c8f04a805df29c2fa97655adace78 Wed Oct 14 01:51:12 2026 +0200 Merge f-1441-perf (Responses/Codex honours reasoning_effort; setup keeps the installed size on a re-run) into f-1441",
+ "config": {
+  "exe": "/home/servius/Projects/Strata/engine/strata",
+  "args": [
+   "--pack",
+   "/volumes/media/strata/packs/swift-iq3_xxs",
+   "--native",
+   "/volumes/media/strata/Swift-Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf",
+   "--ple-gguf",
+   "/volumes/media/strata/Swift-Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf",
+   "--expert-profile",
+   "/home/servius/Projects/Strata/data/expert-profile.bin",
+   "--expert-cache",
+   "auto",
+   "--prefill",
+   "auto",
+   "--spec",
+   "4",
+   "--mtp",
+   "/volumes/media/strata/mtp/rt",
+   "--max-context",
+   "262144",
+   "--kv",
+   "int8",
+   "--vision",
+   "--vram-reserve-mib",
+   "832",
+   "--pcie-frac",
+   "0.35",
+   "--spec-min-p",
+   "0.70"
+  ],
+  "cwd": "/home/servius/Projects/Strata",
+  "tokenizer": "/volumes/media/strata/packs/swift-iq3_xxs/tokenizer",
+  "model_name": "swift-1.5-iq3_xxs",
+  "log": "/home/servius/Projects/Strata/strata-swift-iq3_xxs.log",
+  "lib_dirs": [
+   "/nix/store/7mi3cxyj9rgx76yxr6jg4z8i3cvb3dmz-cuda-merged-13.0/bin"
+  ],
+  "port": 8080,
+  "gpu": 0,
+  "gpus_asked": true,
+  "vision": {
+   "exe": "/home/servius/Projects/Strata/engine/strata-vision",
+   "mmproj": "/volumes/media/strata/mmproj-Swift-Qwen3.8-Flash-Next-BF16.gguf",
+   "model": "/volumes/media/strata/Swift-Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf",
+   "gpu": true,
+   "max_tokens": 1024
+  },
+  "open_browser": false
+ }
+}

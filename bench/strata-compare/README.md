@@ -2,7 +2,7 @@
 
 `run.py` runs Strata's engine directly on fixed token inputs (Qwen3.8-Flash-Next, Swift 1.5 GSQ-RCO IQ3_XXS), with the
 engine's own per-stage profilers, so two machines can be compared line by line. The results so far (RX 7900 XTX +
-i5-13600K, RTX 5090 + i9-14900KS) are on branch `strata-5090-compare` under `bench/strata-compare/results/`.
+i5-13600K, RTX 5090 + i9-14900KS) are in `results/`; the 7900 XTX has no `noskip_*` runs, as the skip is off on AMD.
 `share/` holds our Swift expert profile and agent draft vocabulary, and how to try them on another machine
 (`share/README.md`).
 
@@ -37,7 +37,7 @@ Please do this, then push. Change nothing else in the repository.
    - OS, CPU, RAM size and speed, GPU power limit;
    - anything else running on the GPU or CPU during the runs;
    - the server's startup log, if you have it (the lines from `engine started` to `session is up`).
-6. Commit the results folder on branch `strata-5090-compare` (not `main`) and push it.
+6. Commit the results folder and push it.
 7. Start the Strata server again.
 
 ## What it measures

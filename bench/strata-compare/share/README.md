@@ -29,7 +29,7 @@ Our engine patches are for AMD gfx1100 only and sit on Strata 0.1.43, so they do
 3. Optional: the CPU expert pool read only ~18 GB/s with 23 workers (ours does 42 GB/s with 13). Try
    `--pool-workers 15` in the new config, then rerun with
    `--only speed_code,speed_edit,speed_prose --out ...-oursettings-w15`.
-4. Commit the results folders on branch `strata-5090-compare` (not `main`) and push it. Keep the server's own config unless the numbers say otherwise.
+4. Commit the results folders and push them. Keep the server's own config unless the numbers say otherwise.
 
 To keep what the expert cache learns across restarts, add `"expert_profile_save": "expert-profile-learned.bin"` to the
 server's config (upstream feature since 0.1.36).
