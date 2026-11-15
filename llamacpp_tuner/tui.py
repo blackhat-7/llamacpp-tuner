@@ -361,7 +361,7 @@ def profile(args: str) -> dict:
     mmproj_tokens += ["--no-mmproj-offload"] if p["no_mmproj_offload"] else []
     # Kept as-is on every edit: the settings page does not show them.
     run_tokens = [token for item in p["env"] for token in ("--env", item)]
-    run_tokens += ["--keep-awake"] if p["keep_awake"] else []
+    run_tokens += ["--no-keep-awake"] if p["keep_awake"] is False else []
     extra = (p["extra_args"] or "").split()
     slots = next(
         (v for flag, v in pairwise(extra) if flag in ("-np", "--parallel")), "1"

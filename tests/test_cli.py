@@ -9,6 +9,8 @@ from click.testing import CliRunner
 from llamacpp_tuner import servers
 from llamacpp_tuner.cli import load_aliases, load_stacks, main, write_aliases
 
+REAL_KEEP_AWAKE = servers.keep_awake  # conftest stubs the module's copy for every test
+
 
 def test_setup_reports_binary_and_devices():
     with (
@@ -351,32 +353,52 @@ def test_keep_awake_holds_a_byte_on_every_amd_gpu(monkeypatch):
     hip = FakeHip(devices=2)
     monkeypatch.setattr(servers.ctypes, "CDLL", lambda name: hip)
 
-    servers.keep_awake()
+    assert REAL_KEEP_AWAKE() == 2
     assert hip.held == [(0, 1), (1, 1)]
 
 
-def test_serve_keep_awake_holds_the_gpu_before_the_server_starts(monkeypatch):
-    calls = []
-    with (
-        patch("llamacpp_tuner.cli.servers.keep_awake", lambda: calls.append("awake")),
-        patch("llamacpp_tuner.cli.resolve_model", return_value=Path("m.gguf")),
-        patch("llamacpp_tuner.cli.run_server", lambda *a, **k: calls.append("server")),
-    ):
-        result = CliRunner().invoke(main, ["serve", "m.gguf", "--keep-awake"])
-
-    assert result.exit_code == 0 and calls == ["awake", "server"]
-
-
-def test_serve_keep_awake_without_rocm_is_a_clear_error(monkeypatch):
+def test_keep_awake_does_nothing_without_rocm(monkeypatch):
     def missing(name: str):
         raise OSError(name)
 
     monkeypatch.setattr(servers.ctypes, "CDLL", missing)
-    with patch("llamacpp_tuner.cli.run_server") as run_server:
-        result = CliRunner().invoke(main, ["serve", "m.gguf", "--keep-awake"])
+    assert REAL_KEEP_AWAKE() == 0
 
-    assert result.exit_code == 1 and "ROCm HIP runtime" in result.output
-    run_server.assert_not_called()
+
+def test_serve_keeps_the_gpu_awake_unless_told_not_to(monkeypatch):
+    calls = []
+
+    def hold() -> int:
+        calls.append("awake")
+        return 1
+
+    monkeypatch.setattr(servers, "keep_awake", hold)
+    with (
+        patch("llamacpp_tuner.cli.resolve_model", return_value=Path("m.gguf")),
+        patch("llamacpp_tuner.cli.run_server", lambda *a, **k: calls.append("server")),
+    ):
+        default = CliRunner().invoke(main, ["serve", "m.gguf"])
+        assert calls == ["awake", "server"]
+        calls.clear()
+        off = CliRunner().invoke(main, ["serve", "m.gguf", "--no-keep-awake"])
+
+    assert default.exit_code == 0 and "Keeping 1 AMD GPU powered" in default.output
+    assert off.exit_code == 0 and calls == ["server"]
+
+
+def test_serve_still_runs_when_the_gpu_cannot_be_kept_awake(monkeypatch):
+    def fail() -> int:
+        raise RuntimeError("Could not keep HIP device 0 awake.")
+
+    monkeypatch.setattr(servers, "keep_awake", fail)
+    with (
+        patch("llamacpp_tuner.cli.resolve_model", return_value=Path("m.gguf")),
+        patch("llamacpp_tuner.cli.run_server") as run_server,
+    ):
+        result = CliRunner().invoke(main, ["serve", "m.gguf"])
+
+    assert result.exit_code == 0 and "Warning: Could not keep" in result.output
+    run_server.assert_called_once()
 
 
 def test_serve_jeeves_maps_common_args(tmp_path):

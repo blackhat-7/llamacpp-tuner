@@ -172,29 +172,28 @@ def _temperature(hwmon: Path, label: str) -> int | None:
     return None
 
 
-def keep_awake() -> None:
+def keep_awake() -> int:
     """Hold every AMD GPU that ROCm HIP sees out of runtime suspend until this
-    process exits.
+    process exits, and return how many. Without ROCm there is nothing to hold.
 
-    An idle AMD card with no display suspends after a few seconds and moves a
-    Vulkan server's model to system RAM. ROCm keeps a card powered while any
-    process holds memory on it, so one byte per card is enough.
+    An idle AMD card with no display suspends after ~5 s and moves a Vulkan
+    server's model to system RAM. ROCm keeps a card powered while any process
+    holds memory on it, so one byte per card is enough.
     """
     try:
         hip = ctypes.CDLL("libamdhip64.so")
-    except OSError as error:
-        raise RuntimeError(
-            "--keep-awake needs the ROCm HIP runtime (libamdhip64.so)."
-        ) from error
+    except OSError:
+        return 0
     count = ctypes.c_int()
-    if hip.hipInit(0) or hip.hipGetDeviceCount(ctypes.byref(count)) or count.value < 1:
-        raise RuntimeError("--keep-awake found no AMD GPU through ROCm HIP.")
+    if hip.hipInit(0) or hip.hipGetDeviceCount(ctypes.byref(count)):
+        return 0
     for device in range(count.value):
         memory = ctypes.c_void_p()
         if hip.hipSetDevice(device) or hip.hipMalloc(
             ctypes.byref(memory), ctypes.c_size_t(1)
         ):
-            raise RuntimeError(f"--keep-awake could not hold HIP device {device}.")
+            raise RuntimeError(f"Could not keep HIP device {device} awake.")
+    return count.value
 
 
 def system() -> dict[str, int]:

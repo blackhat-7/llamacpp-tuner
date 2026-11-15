@@ -292,10 +292,10 @@ def pull(
     help="llama-server binary to run instead of the installed one",
 )
 @click.option(
-    "--keep-awake",
-    is_flag=True,
-    help="Keep AMD GPUs powered while the server runs; an idle card with no "
-    "display otherwise suspends and moves a Vulkan server's model to RAM",
+    "--keep-awake/--no-keep-awake",
+    default=True,
+    help="Keep AMD GPUs powered while the server runs (default); an idle card "
+    "with no display otherwise suspends and moves a Vulkan server's model to RAM",
 )
 @BACKEND
 def serve(
@@ -334,10 +334,19 @@ def serve(
         )
 
     environment = dict(item.split("=", 1) for item in env)
+    if keep_awake:
+        # A server that cannot keep its GPU awake still runs; it only slows after idle gaps.
+        try:
+            if held := servers.keep_awake():
+                gpus = "GPU" if held == 1 else "GPUs"
+                click.echo(
+                    f"Keeping {held} AMD {gpus} powered while the server runs.",
+                    err=True,
+                )
+        except RuntimeError as error:
+            click.echo(f"Warning: {error}", err=True)
 
     try:
-        if keep_awake:
-            servers.keep_awake()
         if backend == "jeeves":
             if quant or filename or mmproj or no_mmproj_offload:
                 raise click.UsageError(
@@ -402,7 +411,7 @@ def serve(
         run_server(server_args, env=environment, binary=server)
     except click.ClickException:
         raise
-    except (FileNotFoundError, ValueError, RuntimeError) as error:
+    except (FileNotFoundError, ValueError) as error:
         raise click.ClickException(str(error)) from error
     except subprocess.CalledProcessError as error:
         raise click.ClickException(
