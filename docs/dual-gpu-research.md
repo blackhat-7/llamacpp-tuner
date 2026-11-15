@@ -283,3 +283,18 @@ multilingual 2.94 -> 2.72).
 Drafter profile (mixD + 4070, free-running code, 1,500 tokens: 181 t/s, 4.66 tokens a step): a draft step is 0.546 ms
 of GPU time (draft head 0.104, experts 0.053, q+norm-rope 0.052, attention 0.035, the rest 12-35 us each); its weights
 need ~0.24 ms at 850 GB/s.
+
+### Switching (the user's call; nothing switched yet)
+
+- Try: `lct down local-flash && lct up local-flash-mixd` (or `local-flash-dual`). Back: `lct down local-flash-mixd &&
+  lct up local-flash`. Clients see the same model name (`swift-1.5-iq3_xxs`) and port (:6868).
+- To make one the default, point profile `strata-swift-flash-next` in `tmp/aliases.toml` at
+  `Strata/strata-swift-mixd-dual.json` (or `-iq3_xxs-dual.json`); the old `strata-swift-iq3_xxs-tuned.json` stays the rollback.
+- The test configs keep their own disk tiers (`Strata-data/conv-disk-dual`, `conv-disk-mixd`, 8-16 GiB) so the user's
+  stored chats in `conv-disk` survive. A new engine binary drops a tier's stored chats anyway; once one config is the
+  default, point it at `conv-disk` with 32 GiB again and delete the test tiers.
+- mixD reads the IQ4_XS shards only for 30 layers' down tensors (~14 GB of 91 GiB); the rest (`tmp/models/ukisai...`)
+  can be freed if the full 4-bit and other mixes are not wanted.
+- Gaming on the 4070: stop the dual stack first (the helper holds ~10.5 GB of it); `ornith-vk` stays the gaming model.
+- Untested here (needs sudo): the XTX's power profile is `BOOTUP_DEFAULT` at level `auto`; `COMPUTE` might cut clock
+  ramps in bursty decode (`/sys/class/drm/card2/device/pp_power_profile_mode`).
