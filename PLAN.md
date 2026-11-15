@@ -5,6 +5,8 @@ Each line carries its own done-check. A task too big for one session gets split 
 
 ## Now
 
+- [~] **Keep the XTX awake while lct serves on it.** The display-less XTX runtime-suspends after ~5 s idle and moves a Vulkan server's model to RAM (101 / 73 vs 129 / 82 t/s). A HIP context held by `lct serve` keeps it awake with no root (tested: awake while held, asleep ~8 s after). Done when a profile option holds it for the server's life, tests pass, and live `ornith-vk` stays awake while idle and sleeps after `lct down`.
+- [x] **A 200K model for the XTX while gaming.** Best quality at 200K+ and 100+ t/s on the XTX alone. Done 2026-11-15: nothing reaches 100 t/s at 200K; `ornith-vk` (llama.cpp b12415 Vulkan, `-ub 256`) gives 129-140 / 102 / 84 t/s vs HIP 106 / 57 / 39; MTP and hipfire lose; table in `skills/tune-local-model/references/host-7900xtx.md`.
 - [x] **Local video: MiniMax H3 on ComfyUI.** `lct setup --backend comfyui`, the `video` profile, `lct video make/edit/extend/upscale/join/status/guide`, a Video tab in the TUI and the `make-video` skill. Done 2026-11-07: text, photo, extend, edit and upscale made real clips on the 7900 XTX, checked by eye and Whisper; times in the skill.
 - [x] **Serve aliases.** `lct serve <name>` expands arguments saved in `aliases.toml` (cache dir); later options override. Done: commit `9c53d08`, two CLI tests.
 - [x] **Adopt the long-task framework.** `AGENTS.md` routine, `PLAN.md`, `PROGRESS.md`, `DECISIONS.md`, `CLAUDE.md` symlink. Done when all four exist within their caps and are committed.
@@ -54,7 +56,7 @@ One 4B model that rewrites text in the user's style: drafts shortened and de-slo
 
 - [x] **`lct logs export`.** Move `tmp/ft-mine/extract.py` into lct (stdlib only): prompts and subagent briefs from Claude Code, Pi, opencode and Codex as JSONL. Done when tests on small fixture logs of each source pass and its PC output matches the script's row count. Done 2026-11-11: 3 tests on fixtures of all four sources; PC output 4,270 rows, same as the script per session.
 - [x] **Style pairs.** Mine (long reply → "shorter/simpler/no slop" ask → rewrite) triples on the PC and Mac (`tmp/ft-mine/count_pairs.py` finds ~1,240 raw); drop pairs re-asked, keep a chain's last rewrite, dedupe, scrub secrets, tag rewrite/reply/description. Done when `tmp/ft-style/{train,test}.jsonl` exist with a 200-pair real test set and counts in `PROGRESS.md`.
-- [ ] **Synthetic rewrites.** Opus subagents rewrite ~3k long replies from the logs by the user's writing rules (`~/.claude/CLAUDE.md` "Writing style"). Done when ~4k training pairs pass length and banned-word checks; real pairs never enter it from the test set.
+- [~] **Synthetic rewrites.** Opus subagents rewrite ~3k long replies from the logs by the user's writing rules (`~/.claude/CLAUDE.md` "Writing style"). Done when ~4k training pairs pass length and banned-word checks; real pairs never enter it from the test set.
 - [x] **Training env.** ROCm torch + peft + trl venv in `tmp/ft-venv`; bf16 LoRA (no bitsandbytes). Done when a 50-example SFT saves an adapter that loads. Done 2026-11-11: Qwen3.5-4B, 50 examples, 2 epochs in 21 s, peak 10.0 GiB; adapter loads and answers.
 - [ ] **SFT.** Qwen3-class 4B base, 2-3 epochs, checkpoint every 200 steps. GPU: needs the user's OK and Flash-Next down (`lct down local-flash`). Done when the adapter and loss curve are saved.
 - [ ] **DPO.** Real pairs: the user's accepted rewrite chosen, the long reply rejected. Done when it beats SFT on the test set's length and banned-word scores.

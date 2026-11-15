@@ -54,6 +54,27 @@ Facts measured on this machine unless marked *reported* (third party) or *est.* 
 - **Ignores `reasoning_effort=low`**: 405 thinking tokens on a yes/no check vs 2 with `none`. A 512-token-capped classifier hit `length` and failed closed. Map low → thinking off for it.
 - Quality: 48% vs 63% for the 27B in forseti's agent eval; hard tasks 7% vs 43%. A ~55k-token session compacting every turn looped ~25 failing tool calls; a fresh session fixed it.
 
+### 200K on the XTX alone (2026-11-15, desktop and games on the 4070)
+
+Ornith-1.5 IQ4_XS (any qwen35moe 35B-A3B decodes the same), q8 KV, greedy, thinking off, code-dump prompts (`tmp/model-hunt/probe.py`, raw `results.jsonl`). Decode t/s at short / 100K / 200K:
+
+| setup | short | 100K | 200K | cold 200K read |
+|---|---|---|---|---|
+| llama.cpp b12415 Vulkan, `-ub 256` (profile `ornith-vk`) | 129–140 | 102 | 82–84 | 3.2 min |
+| llama.cpp aa94f208 Vulkan, `-ub 256` | 122–138 | 92–95 | 76–79 | 5.5 min |
+| llama.cpp HIP, q8 KV (profile `ornith`) | 106 | 57 | 39 | ~2 min (est.) |
+| llama.cpp HIP, f16 KV | 110 | 79 | 63 | – |
+| + built-in MTP n3, Vulkan aa94f208 | code 108, prose 69 | – | code 64, prose 42 | 6.2 min |
+| hipfire 0.4.6 `ornith-1.5:35b-a3b` mq4, no drafting | 152 | 77 | 51 | 8.2 min |
+
+- Nothing reaches 100 t/s at 200K. Vulkan wins at every depth; HIP's q8 KV flash-attention decode is the slow part.
+- **Vulkan `-ub 2048` at 100K+ depth tripped the amdgpu compute watchdog twice** (`ring comp_1.1.0 timeout`, queue reset, `ErrorDeviceLost`). `-ub 512` was clean at 100K, `-ub 256` at 200K.
+- MTP drafting loses everywhere on this MoE: verifying several tokens reads more experts, and the draft layer pays its own full-context attention.
+- hipfire also resets the conversation above ~200K ("context full"), so each turn there re-reads the whole prompt.
+- Qwen3.8-27B mq4-xts + MTP on hipfire (q8 KV): code 121 / 98 / 88 and prose 82 / 64 / 58 t/s at short / 100K / 148K; it fits only ~155–185K, so not 200K. hipfire install and models: `tmp/model-hunt/hipfire-*` (built with `PATH=/usr/bin:$PATH CC=/usr/bin/cc CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER=/usr/bin/cc`; Nix's rustup links Nix glibc, which cannot load ROCm).
+- 3-fact recall at depth: 3/3 for every setup above.
+- **With no display on it, the idle XTX runtime-suspends after ~5 s** (`/sys/bus/pci/devices/0000:03:00.0/power/control` = `auto`, `runtime_status` = `suspended`). Suspend moves the model from VRAM to GTT (21.6 GB). On the next request the card wakes (+~2 s) and moves the model back, but ~0.6 GB stays in GTT. Measured afterwards: 101 t/s short (129 fresh), 73 at 200K (82 fresh). Fix (root): `power/control=on` for that device (udev rule) or `amdgpu.runpm=0`. While suspended, reads of its power sysfs files fail with EBUSY.
+
 ## Qwen3.8-Flash-Next (125B-A6B MoE, qwen4exp) — overnight long-context runs on Strata
 
 - **Strata engine** (`~/Documents/projects/Strata`, `--backend strata`) beats llama.cpp for this model by far:
