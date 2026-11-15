@@ -1,6 +1,7 @@
 """Detached llama-server processes, one per profile, shared by the CLI and the TUI."""
 
 import contextlib
+import ctypes
 import json
 import os
 import shlex
@@ -169,6 +170,31 @@ def _temperature(hwmon: Path, label: str) -> int | None:
                     // 1000
                 )
     return None
+
+
+def keep_awake() -> None:
+    """Hold every AMD GPU that ROCm HIP sees out of runtime suspend until this
+    process exits.
+
+    An idle AMD card with no display suspends after a few seconds and moves a
+    Vulkan server's model to system RAM. ROCm keeps a card powered while any
+    process holds memory on it, so one byte per card is enough.
+    """
+    try:
+        hip = ctypes.CDLL("libamdhip64.so")
+    except OSError as error:
+        raise RuntimeError(
+            "--keep-awake needs the ROCm HIP runtime (libamdhip64.so)."
+        ) from error
+    count = ctypes.c_int()
+    if hip.hipInit(0) or hip.hipGetDeviceCount(ctypes.byref(count)) or count.value < 1:
+        raise RuntimeError("--keep-awake found no AMD GPU through ROCm HIP.")
+    for device in range(count.value):
+        memory = ctypes.c_void_p()
+        if hip.hipSetDevice(device) or hip.hipMalloc(
+            ctypes.byref(memory), ctypes.c_size_t(1)
+        ):
+            raise RuntimeError(f"--keep-awake could not hold HIP device {device}.")
 
 
 def system() -> dict[str, int]:

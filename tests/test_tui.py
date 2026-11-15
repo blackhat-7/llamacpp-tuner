@@ -507,14 +507,16 @@ def test_stack_members_are_nested_once_and_start_alone(monkeypatch, workspace):
     asyncio.run(run())
 
 
-def test_editing_a_profile_keeps_its_env(workspace):
-    write_aliases({"mine": f"{workspace} --ctx 4096 --env A=1"})
+def test_editing_a_profile_keeps_its_env_and_keep_awake(workspace):
+    write_aliases({"mine": f"{workspace} --ctx 4096 --env A=1 --keep-awake"})
 
     async def run() -> None:
         app = LctApp()
         async with app.run_test(size=(100, 40)) as pilot:
             await edit(pilot, app, "ctx", "8192")
-            assert load_aliases() == {"mine": f"{workspace} --ctx 8192 --env A=1"}
+            assert load_aliases() == {
+                "mine": f"{workspace} --ctx 8192 --env A=1 --keep-awake"
+            }
 
     asyncio.run(run())
 

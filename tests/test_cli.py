@@ -325,6 +325,60 @@ def test_serve_passes_env_to_llama_server(monkeypatch):
     assert bad.exit_code != 0 and "NAME=VALUE" in bad.output
 
 
+class FakeHip:
+    """Stands in for libamdhip64, whose C function names the methods mirror."""
+
+    def __init__(self, devices: int) -> None:
+        self.devices, self.device, self.held = devices, -1, []
+
+    def hipInit(self, flags: int) -> int:  # noqa: N802
+        return 0
+
+    def hipGetDeviceCount(self, count) -> int:  # noqa: N802
+        count._obj.value = self.devices
+        return 0
+
+    def hipSetDevice(self, device: int) -> int:  # noqa: N802
+        self.device = device
+        return 0
+
+    def hipMalloc(self, pointer, size) -> int:  # noqa: N802
+        self.held.append((self.device, size.value))
+        return 0
+
+
+def test_keep_awake_holds_a_byte_on_every_amd_gpu(monkeypatch):
+    hip = FakeHip(devices=2)
+    monkeypatch.setattr(servers.ctypes, "CDLL", lambda name: hip)
+
+    servers.keep_awake()
+    assert hip.held == [(0, 1), (1, 1)]
+
+
+def test_serve_keep_awake_holds_the_gpu_before_the_server_starts(monkeypatch):
+    calls = []
+    with (
+        patch("llamacpp_tuner.cli.servers.keep_awake", lambda: calls.append("awake")),
+        patch("llamacpp_tuner.cli.resolve_model", return_value=Path("m.gguf")),
+        patch("llamacpp_tuner.cli.run_server", lambda *a, **k: calls.append("server")),
+    ):
+        result = CliRunner().invoke(main, ["serve", "m.gguf", "--keep-awake"])
+
+    assert result.exit_code == 0 and calls == ["awake", "server"]
+
+
+def test_serve_keep_awake_without_rocm_is_a_clear_error(monkeypatch):
+    def missing(name: str):
+        raise OSError(name)
+
+    monkeypatch.setattr(servers.ctypes, "CDLL", missing)
+    with patch("llamacpp_tuner.cli.run_server") as run_server:
+        result = CliRunner().invoke(main, ["serve", "m.gguf", "--keep-awake"])
+
+    assert result.exit_code == 1 and "ROCm HIP runtime" in result.output
+    run_server.assert_not_called()
+
+
 def test_serve_jeeves_maps_common_args(tmp_path):
     with patch("llamacpp_tuner.cli.run_jeeves") as run_jeeves:
         result = CliRunner().invoke(

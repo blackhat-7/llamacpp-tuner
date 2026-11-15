@@ -359,7 +359,9 @@ def profile(args: str) -> dict:
     mmproj_tokens = ["--mmproj", str(p["mmproj"])] if p["mmproj"] else []
     mmproj_tokens += ["--no-mmproj"] if p["no_mmproj"] else []
     mmproj_tokens += ["--no-mmproj-offload"] if p["no_mmproj_offload"] else []
-    env_tokens = [token for item in p["env"] for token in ("--env", item)]
+    # Kept as-is on every edit: the settings page does not show them.
+    run_tokens = [token for item in p["env"] for token in ("--env", item)]
+    run_tokens += ["--keep-awake"] if p["keep_awake"] else []
     extra = (p["extra_args"] or "").split()
     slots = next(
         (v for flag, v in pairwise(extra) if flag in ("-np", "--parallel")), "1"
@@ -378,7 +380,7 @@ def profile(args: str) -> dict:
         "slots": slots,
         "model_tokens": model_tokens,
         "mmproj_tokens": mmproj_tokens,
-        "env_tokens": env_tokens,
+        "run_tokens": run_tokens,
     }
 
 
@@ -1421,7 +1423,7 @@ class LctApp(App[None]):
             raise ValueError(f"{values['mmproj']} is not a downloaded projector.")
         for flag, key in (("--ctx", "ctx"), ("--host", "host"), ("--port", "port")):
             args += [flag, values[key]] if values[key] else []
-        args += details["env_tokens"]
+        args += details["run_tokens"]
         return args + (["--extra-args", values["extra"]] if values["extra"] else [])
 
     def save_setting(self, key: str, value: str) -> bool:

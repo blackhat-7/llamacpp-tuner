@@ -79,6 +79,7 @@ qwen = """owner/model-GGUF --quant Q6_K --ctx 32768 \
 
 Use `--env NAME=VALUE` (repeatable) for backend variables such as `GGML_VK_SUBALLOCATION_BLOCK_SIZE`; they go into llama-server's environment.
 Use `--server PATH` to run a different llama-server build for one profile, for example a pull-request branch that adds a model.
+Use `--keep-awake` when the server's AMD GPU drives no display. Such a card powers down after a few idle seconds and moves a Vulkan server's model to system RAM, which makes it 10-20% slower. lct holds a 1-byte ROCm allocation on the card while the server runs, so the card can sleep again once the server stops. HIP servers already keep their card awake.
 
 `lct serve qwen` then expands to those arguments. Options typed after the alias replace the alias's value for that option; `--extra-args` is replaced as a whole.
 

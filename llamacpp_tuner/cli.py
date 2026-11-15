@@ -290,6 +290,12 @@ def pull(
     type=click.Path(exists=True, dir_okay=False, path_type=Path),
     help="llama-server binary to run instead of the installed one",
 )
+@click.option(
+    "--keep-awake",
+    is_flag=True,
+    help="Keep AMD GPUs powered while the server runs; an idle card with no "
+    "display otherwise suspends and moves a Vulkan server's model to RAM",
+)
 @BACKEND
 def serve(
     model: str,
@@ -304,6 +310,7 @@ def serve(
     extra_args: str,
     env: tuple[str, ...],
     server: Path | None,
+    keep_awake: bool,
     backend: str,
 ) -> None:
     """Run llama-server, overriding only explicitly supplied settings.
@@ -328,6 +335,8 @@ def serve(
     environment = dict(item.split("=", 1) for item in env)
 
     try:
+        if keep_awake:
+            servers.keep_awake()
         if backend == "jeeves":
             if quant or filename or mmproj or no_mmproj_offload:
                 raise click.UsageError(
@@ -392,7 +401,7 @@ def serve(
         run_server(server_args, env=environment, binary=server)
     except click.ClickException:
         raise
-    except (FileNotFoundError, ValueError) as error:
+    except (FileNotFoundError, ValueError, RuntimeError) as error:
         raise click.ClickException(str(error)) from error
     except subprocess.CalledProcessError as error:
         raise click.ClickException(
