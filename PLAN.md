@@ -5,6 +5,15 @@ Each line carries its own done-check. A task too big for one session gets split 
 
 ## Now
 
+### Two GPUs: the 4070 as the XTX engine's expert helper (branch `feat/dual-gpu-helper`; engine `opt12/nvhelper`)
+
+- [x] **A CUDA helper for the HIP engine.** Strata's `--expert-cache-device1` on the 4070 through a CUDA plugin. Done 2026-11-16: engine `4a79cf5a`; generate mode code/prose/edit +11/+20/+40% (fixed ranking), +9/+6/+32% adaptive with `--spec 6`; server +5/+1/+21%.
+- [x] **Better quality at today's speed.** Done 2026-11-16: mixD (2-bit `down` projections to IQ4_NL) + the 4070: perplexity 4.79 -> 4.15; server speed within 2% of today, prompt reads -15%. Profile `strata-swift-flash-next-mixd`, stack `local-flash-mixd`.
+- [ ] **The user picks the default stack** (`local-flash`, `local-flash-dual` or `local-flash-mixd`) after a day of real sessions. Done when `local-flash` points at the choice and the others are rollbacks.
+- [ ] **Prompt reads on the 4070 too.** mixD reads prompts 15% slower (bigger experts streamed). Let the 4070 compute its experts' rows for prompt chunks, as the peer tier does. Done when a 35K read is back at ~2,500 t/s.
+- [ ] **The 4070's tier in resident RAM mode.** Its swaps must exchange with the RAM copy (today they leave the CPU reading the SSD), so full 4-bit (perplexity 3.99, code 113 t/s) can adapt. Done when the full 4-bit run reads no expert from the file.
+- [ ] **Free the 4-bit download's unused bytes.** mixD reads only 30 layers' down tensors from the 91 GiB IQ4_XS shards; punch holes in the rest (offsets stay valid). Done when the shards use ~14 GB on disk and mixD still loads.
+
 - [x] **Keep-awake on by default.** `lct serve` holds AMD GPUs awake for every profile and stack; `--no-keep-awake` opts out; does nothing without ROCm. Done 2026-11-15: 122 tests; live `ornith-vk` with no flag logged the hold and stayed awake while idle.
 - [x] **Keep the XTX awake while lct serves on it.** The display-less XTX runtime-suspends after ~5 s idle and moves a Vulkan server's model to RAM (101 / 73 vs 129 / 82 t/s). A HIP context held by `lct serve` keeps it awake with no root (tested: awake while held, asleep ~8 s after). Done when a profile option holds it for the server's life, tests pass, and live `ornith-vk` stays awake while idle and sleeps after `lct down`. Done 2026-11-15: `lct serve --keep-awake` (profile `ornith-vk`); awake through 20 s idle gaps at 129-132 / 81 t/s (short / 200K); lct's hold is gone after `lct down`. Not yet seen: the card sleeping after a model server stops, because the driver kept it awake after an earlier teardown.
 - [x] **A 200K model for the XTX while gaming.** Best quality at 200K+ and 100+ t/s on the XTX alone. Done 2026-11-15: nothing reaches 100 t/s at 200K; `ornith-vk` (llama.cpp b12415 Vulkan, `-ub 256`) gives 129-140 / 102 / 84 t/s vs HIP 106 / 57 / 39; MTP and hipfire lose; table in `skills/tune-local-model/references/host-7900xtx.md`.
