@@ -144,6 +144,18 @@ def test_llama_server_prompt_progress_estimates_the_prompt_length():
     assert request.prompt == round(2098 / 0.24)
 
 
+def test_llama_server_generation_progress_shows_the_rate_before_the_end():
+    monitor = Monitor("ornith")
+    feed(
+        monitor,
+        SWARM_REQUEST_TIMINGS[0],
+        "1.22.726.101 I slot print_timing: id  0 | task 2 | n_gen =    208, tg =  68.72 t/s, tg_3s =  69.06 t/s",
+    )
+
+    request = monitor.active[0]
+    assert request.tokens == 208 and request.rate == pytest.approx(68.72)
+
+
 def test_live_samples_history_and_ranks_finished_requests_newest_first():
     server = Live()
     server.feed("side", SIDE_SLOTS)

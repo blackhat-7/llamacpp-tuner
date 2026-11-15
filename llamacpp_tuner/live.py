@@ -19,10 +19,12 @@ DONE = re.compile(
     r"done: ([\d,]+) tokens in ([\d.]+) s \(([\d.]+) tok/s\) \((\w+), cancel=\w+\)"
     r"(?:, expert cache ([\d.]+)% hit)?"
 )
-# llama-server logs a slot's start and end; timings arrive only at the end.
+# llama-server logs a slot's start and end, generation speed every few seconds, and
+# exact timings at the end.
 SLOTS = re.compile(r"n_slots = (\d+)")
 SLOT = re.compile(r"slot +(\w+): id +(\d+) \| task -?\d+ \| (.*)")
 PROGRESS = re.compile(r"prompt processing, n_tokens = +(\d+), progress = ([\d.]+)")
+GENERATING = re.compile(r"n_gen = +(\d+), tg = +([\d.]+) t/s")
 TIMING = re.compile(r"\s*(prompt eval|eval|total) time = +([\d.]+) ms / +(\d+) tokens")
 DRAFT = re.compile(r"draft acceptance = ([\d.]+)")
 
@@ -148,6 +150,8 @@ class Monitor:
         elif found := PROGRESS.match(text):
             request.read, progress = int(found[1]), float(found[2])
             request.prompt = round(request.read / progress) if progress else 0
+        elif found := GENERATING.match(text):
+            request.tokens, request.rate = int(found[1]), float(found[2])
         elif found := TIMING.match(text):
             seconds, tokens = float(found[2]) / 1000, int(found[3])
             if found[1] == "prompt eval":
