@@ -354,17 +354,24 @@ interleaved B D B D, median of 3 rounds each (`tmp/dual/serve/mixb1-2.out`, `mix
 - Untested here (needs sudo): the XTX's power profile is `BOOTUP_DEFAULT` at level `auto`; `COMPUTE` might cut clock
   ramps in bursty decode (`/sys/class/drm/card2/device/pp_power_profile_mode`).
 
-### Lead: Unsloth Dynamic v3.1 quants, abliterated (checked 2026-11-16, nothing downloaded)
+### Tested and dropped: Unsloth Dynamic v3.1 UD-IQ4_XS, abliterated (2026-11-17)
 
-- `unsloth/Qwen3.8-Flash-Next-GGUF` moved to Dynamic v3.1 on 2026-11-04 (Unsloth's claim: ~15% more accuracy and up
-  to 50% fewer tokens than other quants of the same size). It is the base model, not Swift 1.5.
-- `huihui-ai/Huihui-Qwen3.8-Flash-Next-abliterated-v2-GGUF` (the source of our `swift-IQ3_XXS`) also ships abliterated
-  Unsloth quants (`unsloth-UD-IQ4_XS`, `unsloth-UD-Q4_K_XL`, ...), but those were built on 2026-10-12 from Unsloth's
-  files before v3.1 (other shard sizes). For v3.1: Unsloth's own files + huihui-ai's `patch-unsloth` (2026-11-08, "the
-  latest version" of Unsloth's quants, 3.56 GB): `patch-unsloth-Qwen3.8-Flash-Next-dec.py --ablate-experts 2` swaps in
-  abliterated `ssm_out`, `attn_output` and `ffn_down_shexp` in each tensor's own quant type ("no warnings" strength;
-  0 and 1 keep some warnings). No routed expert changes. Strata checks Unsloth files by SHA256; patched files need that
-  check skipped (the card's note). Read the 9.7 KB script before running it.
+- Built: Unsloth's v3.1 UD-IQ4_XS (sha256 matched the Hub), abliterated in place with huihui-ai's patch
+  (`tmp/dual/unsloth/patch_inplace.py`: the 96 `ssm_out` / `attn_output` / `ffn_down_shexp` tensors, the bytes
+  their script writes, read back), packed with Strata's `tools/iq_pack.py --compat-bf16`, the base model's own drafter
+  (`tools/mtp_fetch.py` + `mtp_pack.py` + `mtp_rt.py`), a warm-up run for its own learned profile. Driver:
+  `tmp/dual/unsloth/chain.sh`.
+- Server, interleaved with mixB, median of 3 rounds, 2 runs each (`tmp/dual/serve/unsl1-2.out`, `mixb3-4.out`):
+  code 150 vs 167 t/s (-10%), prose 112 vs 128 (-13%), edit 147 vs 157 (-7%), 35K read 1,602 vs 2,337 t/s (-31%).
+- Agent replay, stopped after 3 of 8 runs: 1 passed vs mixB's 2 on the same runs. Task 1: both fixed `kill` and broke
+  Ctrl-C. Task 2: mixB passed with a small state file (36 turns, 32K tokens); Unsloth relaunched the server detached
+  with take-over logic (67 turns, 67K tokens, 18 edits) and failed the hidden test. Task 3: both passed. No sign of
+  the "fewer tokens" claim (fewer on task 1, double on task 2).
+- Not adopted (the user's call: slower everywhere, no better at tasks); its files were deleted (~109 GiB).
+- huihui-ai's ready-made abliterated Unsloth files (`unsloth-UD-IQ4_XS` etc. in their v2 repo) are from 2026-10-12, before v3.1; v3.1 takes Unsloth's own files plus their `patch-unsloth` (2026-11-08). Strata checks Unsloth files by SHA256 in `setup.py`; `iq_pack.py` does not.
+- Graded coding test for later candidates: `tmp/dual/codebench/codebench.py ARM` against the server on :6868 (greedy,
+  thinking off, EvalPlus's hidden tests; reference solutions pass 163/164 and 377/378). mixB: HumanEval+ 156/164,
+  MBPP+ 302/378.
 - Unsloth's own numbers against full precision (their text; ours are against the 4-bit model, not comparable):
 
 | quant | size | top-1 | mean KL |
@@ -377,9 +384,7 @@ interleaved B D B D, median of 3 rounds each (`tmp/dual/serve/mixb1-2.out`, `mix
   - UD-IQ3_XXS, 46.8 GiB: gate/up IQ2_S x26, IQ3_XXS x21, IQ4_XS x1; down IQ4_NL x45, Q2_0 x3. That is mixD's recipe
     at mixD's size (mixD: GSQ-RCO gate/up IQ2_XXS-IQ3_S, down IQ4_NL x48): a sidegrade plus a model change.
   - UD-IQ4_XS, 56.2 GiB: gate/up IQ3_XXS x28, IQ4_XS x17, IQ2_S x3; down Q5_0 x33, IQ4_NL x13, Q2_0 x2. mixB's size
-    (56.0) with more of the bytes in `down`; same speed class as mixB (both untested on the server).
+    (56.0) with more of the bytes in `down`; measured 7-13% slower than mixB on the server (above).
   - Dense weights: Unsloth Q6_K / Q8_0 (~3 GiB); the GSQ-RCO file BF16 1.3, Q6_K 0.8, IQ4_XS 0.4, Q4_K 0.3 GiB. The
     n-gram table (`per_layer_token_embd`, IQ4_NL 26.8 GiB) is the same in all of them.
   - The engine's expert kernels take every one of these types (`is_iq`, `iq_row_bytes` in `iq_kernels.cu`).
-- Before a test of UD-IQ4_XS: 87 GiB free disk (161 GB free on 2026-11-16 evening; keep the ukisai IQ4_XS shards); the
-  base model is not Swift, so judge it against mixB by the agent replay, not by KL; the drafter was fitted to Swift.

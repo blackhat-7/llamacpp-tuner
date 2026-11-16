@@ -106,3 +106,7 @@ Undo: `lct down local-flash && lct up local-flash-xtx`, or restore `tmp/aliases.
 ## 2026-11-16 evening: `local-flash` runs mixB + the 4070
 mixB halves mixD's KL to the 4-bit model (0.095 vs 0.18) for 4-16% less speed, still over the user's 100 t/s floor (prose 128); the agent replay tied at 5/8.
 Undo: `lct down local-flash && lct up local-flash-mixd`, or restore `tmp/aliases.toml.before-mixb-default-2026-11-16`.
+
+## 2026-11-17: Unsloth v3.1 UD-IQ4_XS (abliterated) not adopted
+Same expert size as mixB, but slower on the server (code -10%, prose -13%, 35K read -31%) and no better in the agent replay (1/3 vs 2/3 on the same runs; a heavier, failing design on task 2). It is the base model, not Swift.
+Files deleted; the tools to rebuild it are in `tmp/dual/unsloth/` (download, `patch_inplace.py`, `chain.sh`).
