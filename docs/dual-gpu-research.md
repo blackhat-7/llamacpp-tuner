@@ -318,9 +318,13 @@ need ~0.24 ms at 850 GB/s.
   was tuned in rounds 6-11 (`tmp/strata-opt/progress/`), and the x4 link (~3 us, 5.5 GB/s) rules out splitting the
   XTX's dense work with the 4070.
 - **Deeper drafts** (`--spec 8`, `tmp/dual/ab_s8a.out`): more tokens a window (code 4.15 -> 4.58, edit 5.78 -> 7.54)
-  but slower today (code -7.6%, edit -9.5%, prose +-0): 7- and 8-row windows cost 32.9 / 37.5 ms against 25.3 for 6
-  rows, because the fast dense kernels stop at 6 columns (`r4_launch`, `g11_mmvq`, `iq3s_r4`). At +2.5 ms a row
-  they would give about code +2.6% and edit +11%. Lead; stage profiles of 6- vs 8-row windows: `tmp/dual/ab_p8.out`.
+  but slower (code -7.6%, edit -9.5%, prose +-0): 8-row windows cost +38-49% over 6-row ones. Stage profiles
+  (`tmp/dual/ab_p8.out`, edit): of the +10.8 ms, ~5 ms is kernels with no fast 7-8 column path (qkv +1.75, head
+  +1.47, QSA q +0.84, z +0.77, out +0.50), the rest is real per-row work (experts, CPU rows, hyper-connection,
+  shared expert). With perfect 7-8 column kernels `--spec 8` would be about even on edit and code: not worth it.
+- **`STRATA_TSUM=1`** (upstream's transposed warp sums, default on RDNA4; only touches the 8-bit hyper-connection
+  read): code +1.5%, prose +0.7% priced, but not bit-exact here (prose windows change from window 3; upstream checked
+  1-4 rows). A rounding-level option, not adopted.
 
 ### Switching (the user's call; nothing switched yet)
 
