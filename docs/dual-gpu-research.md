@@ -326,17 +326,40 @@ need ~0.24 ms at 850 GB/s.
   read): code +1.5%, prose +0.7% priced, but not bit-exact here (prose windows change from window 3; upstream checked
   1-4 rows). A rounding-level option, not adopted.
 
-### Switching (the user's call; nothing switched yet)
+### Default since 2026-11-16: mixD + the 4070
 
-- Try: `lct down local-flash && lct up local-flash-mixd` (or `local-flash-dual`). Back: `lct down local-flash-mixd &&
-  lct up local-flash`. Clients see the same model name (`swift-1.5-iq3_xxs`) and port (:6868).
-- To make one the default, point profile `strata-swift-flash-next` in `tmp/aliases.toml` at
-  `Strata/strata-swift-mixd-dual.json` (or `-iq3_xxs-dual.json`); the old `strata-swift-iq3_xxs-tuned.json` stays the rollback.
-- The test configs keep their own disk tiers (`Strata-data/conv-disk-dual`, `conv-disk-mixd`, 8-16 GiB) so the user's
-  stored chats in `conv-disk` survive. A new engine binary drops a tier's stored chats anyway; once one config is the
-  default, point it at `conv-disk` with 32 GiB again and delete the test tiers.
-- mixD reads the IQ4_XS shards only for 30 layers' down tensors (~14 GB of 91 GiB); the rest (`tmp/models/ukisai...`)
-  can be freed if the full 4-bit and other mixes are not wanted.
-- Gaming on the 4070: stop the dual stack first (the helper holds ~10.5 GB of it); `ornith-vk` stays the gaming model.
+- `local-flash` (profile `strata-swift-flash-next`) now runs `Strata/strata-swift-mixd-dual.json` (the stack that was
+  `local-flash-mixd`). Clients see the same model name (`swift-1.5-iq3_xxs`) and port (:6868).
+- Rollback and gaming time: `lct down local-flash && lct up local-flash-xtx` (profile `strata-swift-flash-next-xtx`,
+  the old single-XTX `strata-swift-iq3_xxs-tuned.json`), or `ornith-vk`. The helper holds ~10.5 GB of the 4070, so
+  stop `local-flash` before gaming. Aliases backup: `tmp/aliases.toml.before-mixd-default-2026-11-16`.
+- `local-flash-dual` (same model as before + the 4070) stays as an option.
+- Each config keeps its own disk tier: mixD `Strata-data/conv-disk-mixd` (16 GiB), the XTX config `conv-disk`
+  (32 GiB), dual `conv-disk-dual`. A config started on another engine's tier would drop its stored chats.
+- **mixD needs the IQ4_XS download:** its 30 layers' down tensors are read from the ukisai IQ4_XS shards
+  (`tmp/models/ukisai%2FSwift-1.5-Qwen3.8-Flash-Next-GGUF/`, through the links in
+  `tmp/models/hybrid-swift-abl-iq4_xs/`). Do not delete them; only punch holes in the unused ranges (PLAN).
 - Untested here (needs sudo): the XTX's power profile is `BOOTUP_DEFAULT` at level `auto`; `COMPUTE` might cut clock
   ramps in bursty decode (`/sys/class/drm/card2/device/pp_power_profile_mode`).
+
+### Lead: Unsloth Dynamic v3.1 quants, abliterated (checked 2026-11-16, nothing downloaded)
+
+- `unsloth/Qwen3.8-Flash-Next-GGUF` moved to Dynamic v3.1 on 2026-11-04 (Unsloth's claim: ~15% more accuracy and up
+  to 50% fewer tokens than other quants of the same size). It is the base model, not Swift 1.5.
+- `huihui-ai/Huihui-Qwen3.8-Flash-Next-abliterated-v2-GGUF` (the source of today's `swift-IQ3_XXS`) also ships
+  abliterated Unsloth quants (`unsloth-UD-IQ4_XS` 87.2 GiB, `unsloth-UD-Q4_K_XL` 103.7 GiB and a `-V2` with a new
+  imatrix) and `patch-unsloth` (3.3 GiB) that turns any Unsloth quant abliterated: v2 changes no experts, only dense
+  weights. Strata checks Unsloth files by SHA256; patched files need that check skipped (the card's note).
+- Unsloth's own numbers against full precision (their text; ours are against the 4-bit model, not comparable):
+
+| quant | size | top-1 | mean KL |
+|---|---|---|---|
+| UD-IQ3_XXS | 78 GiB | 85.4% | 0.165 |
+| UD-IQ4_XS | 87.2 GiB | 89.6% | 0.084 |
+| UD-Q4_K_XL | 103.7 GiB | 92.3% | 0.047 |
+
+- Fit here (94 GiB RAM, 24 + 12 GB VRAM): UD-IQ4_XS is the full 4-bit class we measured at -28% speed (resident RAM
+  mode); UD-Q4_K_XL does not fit RAM. UD-IQ3_XXS is about mixD's total size and the one worth a test.
+- Before a test: ~80 GB free disk (59 GB now; the IQ4_XS shards are needed by mixD, see above); our engine predates
+  v3.1, so check the file loads; the base model is not Swift (judge by the agent replay, not KL; the drafter was
+  fitted to Swift).

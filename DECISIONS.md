@@ -98,3 +98,7 @@ Why things are the way they are. Append only. One entry, one to three lines. Add
 ## 2026-11-16: `STRATA_DISJOINT_ADAPT=1` in both dual configs
 The XTX's adaptive tier never promotes an expert the 4070 holds, so no slot holds a copy. Priced on own windows: code +1.7%, prose +1.8% (`tmp/dual/ab_kn2.out`).
 Undo by deleting the line, or the `.before-disjoint` configs; the full 4-bit config keeps it for its own reason (resident mode).
+
+## 2026-11-16: `local-flash` runs mixD + the 4070
+mixD (IQ4_NL `down` in all layers) halves the KL to the 4-bit model (0.35 -> 0.18) and is still faster than the old default (code +6%, edit +40%); the agent replay was at least as good. The user picked it ("for now"; Unsloth v3.1 is next).
+Undo: `lct down local-flash && lct up local-flash-xtx`, or restore `tmp/aliases.toml.before-mixd-default-2026-11-16`. mixD needs the ukisai IQ4_XS shards on disk.
