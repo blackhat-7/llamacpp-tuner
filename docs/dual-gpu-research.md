@@ -328,19 +328,29 @@ need ~0.24 ms at 850 GB/s.
   read): code +1.5%, prose +0.7% priced, but not bit-exact here (prose windows change from window 3; upstream checked
   1-4 rows). A rounding-level option, not adopted.
 
-### Default since 2026-11-16: mixD + the 4070
+### Default since 2026-11-16 evening: mixB + the 4070
 
-- `local-flash` (profile `strata-swift-flash-next`) now runs `Strata/strata-swift-mixd-dual.json` (the stack that was
-  `local-flash-mixd`). Clients see the same model name (`swift-1.5-iq3_xxs`) and port (:6868).
-- Rollback and gaming time: `lct down local-flash && lct up local-flash-xtx` (profile `strata-swift-flash-next-xtx`,
-  the old single-XTX `strata-swift-iq3_xxs-tuned.json`), or `ornith-vk`. The helper holds ~10.5 GB of the 4070, so
-  stop `local-flash` before gaming. Aliases backup: `tmp/aliases.toml.before-mixd-default-2026-11-16`.
-- `local-flash-dual` (same model as before + the 4070) stays as an option.
-- Each config keeps its own disk tier: mixD `Strata-data/conv-disk-mixd` (16 GiB), the XTX config `conv-disk`
-  (32 GiB), dual `conv-disk-dual`. A config started on another engine's tier would drop its stored chats.
-- **mixD needs the IQ4_XS download:** its 30 layers' down tensors are read from the ukisai IQ4_XS shards
+mixB (`Strata-data/packs/swift-abl-mixB`, config `Strata/strata-swift-mixb-dual.json`) against mixD on the server,
+interleaved B D B D, median of 3 rounds each (`tmp/dual/serve/mixb1-2.out`, `mixd6-7.out`):
+
+| | code | prose | edit | 35K read | RAM free after the bench |
+|---|---|---|---|---|---|
+| mixD | 184 | 133 | 189 | 2,536 | 24 GiB |
+| mixB | 168 (-9%) | 128 (-4%) | 158 (-16%) | 2,369 (-7%) | 14 GiB |
+
+- Agent replay (`tmp/ab-eval`, the same 8 slots; mixD's from the morning on engine `e7d42fa9`): both passed 5/8 hidden
+  checks. Without task 4 (mixB timed out there: its own Neovim test script never quit and the shell waited 30 min),
+  mixB took 33.4 min against mixD's 35.4: the agents' paths vary far more than the 4-16% speed difference.
+- So mixB (KL to the flat 4-bit model 0.095 vs 0.179, top-1 89.2 vs 85.4%) is the default `local-flash` (profile
+  `strata-swift-flash-next`). It loads and saves its own learned profile (`profiles/swift-1.5-mixb-learned.bin`) and
+  keeps its own disk tier (`conv-disk-mixb`, 16 GiB). Clients see the same model name (`swift-1.5-iq3_xxs`) and port.
+- Other stacks: `local-flash-mixd` (faster, KL 0.18), `local-flash-dual` (the old experts + the 4070),
+  `local-flash-xtx` (the old single-XTX config). Rollback: `lct down local-flash && lct up local-flash-mixd`; aliases
+  backups `tmp/aliases.toml.before-mixb-default-2026-11-16`, `.before-mixd-default-2026-11-16`.
+- Gaming time: stop `local-flash` first (the helper holds ~10 GB of the 4070), then `ornith-vk` or `local-flash-xtx`.
+- **mixB and mixD need the IQ4_XS download:** 30 layers' expert tensors are read from the ukisai IQ4_XS shards
   (`tmp/models/ukisai%2FSwift-1.5-Qwen3.8-Flash-Next-GGUF/`, through the links in
-  `tmp/models/hybrid-swift-abl-iq4_xs/`). Do not delete them; only punch holes in the unused ranges (PLAN).
+  `tmp/models/hybrid-swift-abl-iq4_xs/`). Do not delete them.
 - Untested here (needs sudo): the XTX's power profile is `BOOTUP_DEFAULT` at level `auto`; `COMPUTE` might cut clock
   ramps in bursty decode (`/sys/class/drm/card2/device/pp_power_profile_mode`).
 
@@ -368,5 +378,5 @@ need ~0.24 ms at 850 GB/s.
   - Dense weights: Unsloth Q6_K / Q8_0 (~3 GiB); the GSQ-RCO file BF16 1.3, Q6_K 0.8, IQ4_XS 0.4, Q4_K 0.3 GiB. The
     n-gram table (`per_layer_token_embd`, IQ4_NL 26.8 GiB) is the same in all of them.
   - The engine's expert kernels take every one of these types (`is_iq`, `iq_row_bytes` in `iq_kernels.cu`).
-- Before a test of UD-IQ4_XS: 87 GiB free disk (59 GB now; keep the ukisai IQ4_XS shards, mixD reads them); the base
-  model is not Swift, so judge it against mixB by the agent replay, not by KL; the drafter was fitted to Swift.
+- Before a test of UD-IQ4_XS: 87 GiB free disk (161 GB free on 2026-11-16 evening; keep the ukisai IQ4_XS shards); the
+  base model is not Swift, so judge it against mixB by the agent replay, not by KL; the drafter was fitted to Swift.

@@ -102,3 +102,7 @@ Undo by deleting the line, or the `.before-disjoint` configs; the full 4-bit con
 ## 2026-11-16: `local-flash` runs mixD + the 4070
 mixD (IQ4_NL `down` in all layers) halves the KL to the 4-bit model (0.35 -> 0.18) and is still faster than the old default (code +6%, edit +40%); the agent replay was at least as good. The user picked it ("for now"; Unsloth v3.1 is next).
 Undo: `lct down local-flash && lct up local-flash-xtx`, or restore `tmp/aliases.toml.before-mixd-default-2026-11-16`. mixD needs the ukisai IQ4_XS shards on disk.
+
+## 2026-11-16 evening: `local-flash` runs mixB + the 4070
+mixB halves mixD's KL to the 4-bit model (0.095 vs 0.18) for 4-16% less speed, still over the user's 100 t/s floor (prose 128); the agent replay tied at 5/8.
+Undo: `lct down local-flash && lct up local-flash-mixd`, or restore `tmp/aliases.toml.before-mixb-default-2026-11-16`.
