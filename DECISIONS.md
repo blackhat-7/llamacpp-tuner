@@ -94,3 +94,7 @@ Why things are the way they are. Append only. One entry, one to three lines. Add
 - **The quality option is mixD: GSQ-RCO gate/up with IQ4_NL `down` in the 30 layers that had Q2_0 (the user picks the default).** (2026-11-16) On Strata's quality set, full IQ4_XS experts cut perplexity 4.79 -> 3.99 but cost 28% speed; the 2-bit downs were 79% of that gap for +16.5% expert bytes (mixD 4.15), which the 4070 pays for. Gate/up stay the abliterated file's; downs come from `ukisai/Swift-1.5-Qwen3.8-Flash-Next-GGUF` IQ4_XS (routers byte-identical).
 - **`--spec 6` only with the 4070.** (2026-11-16) T5-T6 windows route to more cold experts; with the 4070 taking them, code drafts 4.1 tokens a window (+5.7%); without it, spec 6 loses (92 vs 135 t/s).
 
+
+## 2026-11-16: `STRATA_DISJOINT_ADAPT=1` in both dual configs
+The XTX's adaptive tier never promotes an expert the 4070 holds, so no slot holds a copy. Priced on own windows: code +1.7%, prose +1.8% (`tmp/dual/ab_kn2.out`).
+Undo by deleting the line, or the `.before-disjoint` configs; the full 4-bit config keeps it for its own reason (resident mode).

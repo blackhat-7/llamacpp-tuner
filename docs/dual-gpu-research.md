@@ -276,6 +276,14 @@ multilingual 2.94 -> 2.72).
 
 - Decode 70.9K s (75%), prompt reads 24.2K s (25%); 92.6% of prompt tokens came from the conversation cache.
 - Reads over 16K tokens: 590 requests, 12.8K s (half the read time); 357 of them reused nothing (fresh prompts).
+- The 358 reads over 16K that reused nothing took 9.6K s, 40% of all read time (median 54K tokens; 327 came long
+  after an engine start, so they are not restarts). A fresh claude-local session prompt is ~57K tokens (~28 s cold),
+  so these are prompts that share no cached prefix with earlier ones. Not Claude Code's per-session
+  `x-anthropic-billing-header` stamp: Strata's server already pins it (`pin_billing_stamp`, `serve/frontend.py`), and a
+  replay of two captured fresh sessions (`tmp/dual/capture/`) reused the whole system turn (8.8K of 11.1K tokens).
+  The working directory sits in the first user message, so the system text and tools match across sessions. Likely
+  sources: auto mode's safety checks (their own system prompt over the transcript; `LOCAL_HELPER_MODEL` sends them
+  to Claude) and sessions with another tool set.
 - So decode speed is the lever: the 4070's +6-34% decode is ~+5-25% engine time. Prompt-path work on the 4070
   (+~12% reads, est.) is worth ~3% of engine time; fusing the drafter's step (0.55 ms, ~16 small kernels, ~2.3x its
   memory floor: profile below) ~4%.
@@ -283,6 +291,36 @@ multilingual 2.94 -> 2.72).
 Drafter profile (mixD + 4070, free-running code, 1,500 tokens: 181 t/s, 4.66 tokens a step): a draft step is 0.546 ms
 of GPU time (draft head 0.104, experts 0.053, q+norm-rope 0.052, attention 0.035, the rest 12-35 us each); its weights
 need ~0.24 ms at 850 GB/s.
+
+### Engine `ac085da1`: review fixes, disjoint adapt, where the time goes now
+
+- **Review fixes** (one NVIDIA tier only; NVIDIA code only in HIP x86-64 Linux builds; the 4070's swaps run after the
+  XTX's, so it never loads what the XTX is loading; `--adapt-async 1` refused beside it; the launch reorder and the
+  tail-skip change apply only with the NVIDIA helper). Same speed, priced: code 177.9 -> 176.8, prose 136.4 -> 137.0.
+- **Knobs** (generate mode, own windows priced, 2 runs, `tmp/dual/ab_kn2.out`): `STRATA_DISJOINT_ADAPT=1` (the XTX
+  never promotes an expert the 4070 holds) code +1.7%, prose +1.8%, now in both dual configs; `--spec-min-p 0.2` +-0;
+  `--adapt-every 2` -1.7% / -1.0%.
+- **Server**, median of 3 (`tmp/dual/serve/*5.out`):
+
+| | code | prose | edit | perplexity |
+|---|---|---|---|---|
+| today `local-flash` | 163.2 | 125.7 | 141.2 | 4.79 |
+| `local-flash-dual` | 180.5 (+11%) | 140.0 (+11%) | 209.3 (+48%) | 4.79 |
+| `local-flash-mixd` | 173.2 (+6%) | 131.6 (+5%) | 197.9 (+40%) | 4.15 |
+
+- **Agent replay** (`tmp/ab-eval`, 5 tasks, 8 runs each): mixD + 4070 passed 5/8 hidden checks (2 full passes) in
+  45.6 min, no timeout; today 4/8 (1) in 65.8 min with one 30-min timeout. Too few runs to name a winner; mixD is at
+  least as good.
+- **Where a round goes** (`STRATA_VERIFY_PROFILE=1`, mixD + 4070, code; the profile adds ~20%, so read shares): dense
+  layer work 27%, the XTX's own experts 18%, hyper-connection reads 17%, XTX waiting for CPU / 4070 rows 11% (all in
+  the 36 GDN layers), shared expert 8%, the rest 19%. Prose windows are shorter: the CPU wait drops to 3% and the XTX
+  alone sets the pace. The drafter adds ~2.8 ms a round on top. No part is big enough for +20% alone; the XTX path
+  was tuned in rounds 6-11 (`tmp/strata-opt/progress/`), and the x4 link (~3 us, 5.5 GB/s) rules out splitting the
+  XTX's dense work with the 4070.
+- **Deeper drafts** (`--spec 8`, `tmp/dual/ab_s8a.out`): more tokens a window (code 4.15 -> 4.58, edit 5.78 -> 7.54)
+  but slower today (code -7.6%, edit -9.5%, prose +-0): 7- and 8-row windows cost 32.9 / 37.5 ms against 25.3 for 6
+  rows, because the fast dense kernels stop at 6 columns (`r4_launch`, `g11_mmvq`, `iq3s_r4`). At +2.5 ms a row
+  they would give about code +2.6% and edit +11%. Lead; stage profiles of 6- vs 8-row windows: `tmp/dual/ab_p8.out`.
 
 ### Switching (the user's call; nothing switched yet)
 
