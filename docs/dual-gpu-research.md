@@ -358,10 +358,13 @@ interleaved B D B D, median of 3 rounds each (`tmp/dual/serve/mixb1-2.out`, `mix
 
 - `unsloth/Qwen3.8-Flash-Next-GGUF` moved to Dynamic v3.1 on 2026-11-04 (Unsloth's claim: ~15% more accuracy and up
   to 50% fewer tokens than other quants of the same size). It is the base model, not Swift 1.5.
-- `huihui-ai/Huihui-Qwen3.8-Flash-Next-abliterated-v2-GGUF` (the source of today's `swift-IQ3_XXS`) also ships
-  abliterated Unsloth quants (`unsloth-UD-IQ4_XS` 87.2 GiB, `unsloth-UD-Q4_K_XL` 103.7 GiB and a `-V2` with a new
-  imatrix) and `patch-unsloth` (3.3 GiB) that turns any Unsloth quant abliterated: v2 changes no experts, only dense
-  weights. Strata checks Unsloth files by SHA256; patched files need that check skipped (the card's note).
+- `huihui-ai/Huihui-Qwen3.8-Flash-Next-abliterated-v2-GGUF` (the source of our `swift-IQ3_XXS`) also ships abliterated
+  Unsloth quants (`unsloth-UD-IQ4_XS`, `unsloth-UD-Q4_K_XL`, ...), but those were built on 2026-10-12 from Unsloth's
+  files before v3.1 (other shard sizes). For v3.1: Unsloth's own files + huihui-ai's `patch-unsloth` (2026-11-08, "the
+  latest version" of Unsloth's quants, 3.56 GB): `patch-unsloth-Qwen3.8-Flash-Next-dec.py --ablate-experts 2` swaps in
+  abliterated `ssm_out`, `attn_output` and `ffn_down_shexp` in each tensor's own quant type ("no warnings" strength;
+  0 and 1 keep some warnings). No routed expert changes. Strata checks Unsloth files by SHA256; patched files need that
+  check skipped (the card's note). Read the 9.7 KB script before running it.
 - Unsloth's own numbers against full precision (their text; ours are against the 4-bit model, not comparable):
 
 | quant | size | top-1 | mean KL |
