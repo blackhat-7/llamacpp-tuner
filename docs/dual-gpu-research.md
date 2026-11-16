@@ -233,7 +233,7 @@ Teacher-forced on Strata's fixed set (code, docs, English, multilingual, agent t
 | B: the 30 Q2_0-down layers fully 4-bit | 56.0 | 4.149 | 80% |
 | full IQ4_XS experts | 60.9 | 3.986 | 100% |
 
-Today's model picks another top token than the 4-bit one at 21% of positions (KL 0.35). mixD
+Today's model picks another top token than the 4-bit one at 21% of positions (KL 0.35); mixD at 15% (KL 0.18), and with the dual configs' tail skip + HC_Q8 at 15% (KL 0.18). mixD
 (`Strata-data/packs/swift-abl-mixD`, `mix_down.py`: v4 per-role shards, gate/up from the abliterated GGUF, down from
 the IQ4_XS shards) is the pick: E is 3-8% slower for 1% lower perplexity.
 
