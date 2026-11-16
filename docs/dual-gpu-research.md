@@ -223,19 +223,21 @@ decouple it fully. Keep PM4 graph replay off: its page faults kill the server ei
 Teacher-forced on Strata's fixed set (code, docs, English, multilingual, agent transcripts; 4,995 positions), the full
 4-bit hybrid as reference. Perplexity of the text, lower is better. Expert bytes vs today's 40.0 GiB.
 
-| experts | bytes | perplexity | of the 4-bit gain |
-|---|---|---|---|
-| today: GSQ-RCO "IQ3_XXS" (gate/up IQ2-IQ3, 30 layers Q2_0 down) | 40.0 GiB | 4.793 | 0% |
-| A: 8 all-2-bit layers fully 4-bit | 45.1 | 4.500 | 36% |
-| C: the 18 IQ4_NL-down layers fully 4-bit | 44.9 | 4.479 | 39% |
-| **D: only `down` to IQ4_NL in the 30 Q2_0 layers** | **46.6 (+16.5%)** | **4.153** | **79%** |
-| E: D + layers of A fully 4-bit | 50.0 | 4.114 | 84% |
-| B: the 30 Q2_0-down layers fully 4-bit | 56.0 | 4.149 | 80% |
-| full IQ4_XS experts | 60.9 | 3.986 | 100% |
+| experts | bytes | top-1 | KL | perplexity |
+|---|---|---|---|---|
+| today: GSQ-RCO "IQ3_XXS" (gate/up IQ2-IQ3, 30 layers Q2_0 down) | 40.0 GiB | 78.6% | 0.352 | 4.793 |
+| A: 8 all-2-bit layers fully 4-bit | 45.1 | 80.5% | 0.277 | 4.500 |
+| C: the 18 IQ4_NL-down layers fully 4-bit | 44.9 | 79.6% | 0.332 | 4.479 |
+| **D: only `down` to IQ4_NL in the 30 Q2_0 layers** | **46.6 (+16.5%)** | **85.4%** | **0.179** | **4.153** |
+| E: D + layers of A fully 4-bit | 50.0 | 87.2% | 0.142 | 4.114 |
+| B: the 30 Q2_0-down layers fully 4-bit | 56.0 | 89.2% | 0.095 | 4.149 |
+| full: ukisai IQ4_XS (gate/up IQ4_XS, down IQ4_NL, all layers) | 60.9 | reference | reference | 3.986 |
 
-Today's model picks another top token than the 4-bit one at 21% of positions (KL 0.35); mixD at 15% (KL 0.18), and with the dual configs' tail skip + HC_Q8 at 15% (KL 0.18). mixD
-(`Strata-data/packs/swift-abl-mixD`, `mix_down.py`: v4 per-role shards, gate/up from the abliterated GGUF, down from
-the IQ4_XS shards) is the pick: E is 3-8% slower for 1% lower perplexity.
+Rank by top-1 and KL (`quant_quality.py compare ... --segments`): the perplexity over all five segments is noisy (the
+agent segment), and it hid that B halves D's KL again. mixD (`Strata-data/packs/swift-abl-mixD`, `mix_down.py`: v4
+per-role shards, gate/up from the abliterated GGUF, down from the IQ4_XS shards) is the pick at today's speed; B
+(`swift-abl-mixB`, built) is the next candidate: +9.4 GiB of arena, server speed untested. The full 4-bit set does not
+fit RAM as an arena (resident mode: code 113 t/s). With the dual configs' tail skip + HC_Q8, mixD stays at 85.3% / 0.184.
 
 ### Speed of mixD + the 4070 (adaptive, `--spec 6`)
 
@@ -358,8 +360,13 @@ need ~0.24 ms at 850 GB/s.
 | UD-IQ4_XS | 87.2 GiB | 89.6% | 0.084 |
 | UD-Q4_K_XL | 103.7 GiB | 92.3% | 0.047 |
 
-- Fit here (94 GiB RAM, 24 + 12 GB VRAM): UD-IQ4_XS is the full 4-bit class we measured at -28% speed (resident RAM
-  mode); UD-Q4_K_XL does not fit RAM. UD-IQ3_XXS is about mixD's total size and the one worth a test.
-- Before a test: ~80 GB free disk (59 GB now; the IQ4_XS shards are needed by mixD, see above); our engine predates
-  v3.1, so check the file loads; the base model is not Swift (judge by the agent replay, not KL; the drafter was
-  fitted to Swift).
+- Their recipes, read from the file headers (`tmp/dual/unsloth/gguf_roles.py`, headers only; routed experts):
+  - UD-IQ3_XXS, 46.8 GiB: gate/up IQ2_S x26, IQ3_XXS x21, IQ4_XS x1; down IQ4_NL x45, Q2_0 x3. That is mixD's recipe
+    at mixD's size (mixD: GSQ-RCO gate/up IQ2_XXS-IQ3_S, down IQ4_NL x48): a sidegrade plus a model change.
+  - UD-IQ4_XS, 56.2 GiB: gate/up IQ3_XXS x28, IQ4_XS x17, IQ2_S x3; down Q5_0 x33, IQ4_NL x13, Q2_0 x2. mixB's size
+    (56.0) with more of the bytes in `down`; same speed class as mixB (both untested on the server).
+  - Dense weights: Unsloth Q6_K / Q8_0 (~3 GiB); the GSQ-RCO file BF16 1.3, Q6_K 0.8, IQ4_XS 0.4, Q4_K 0.3 GiB. The
+    n-gram table (`per_layer_token_embd`, IQ4_NL 26.8 GiB) is the same in all of them.
+  - The engine's expert kernels take every one of these types (`is_iq`, `iq_row_bytes` in `iq_kernels.cu`).
+- Before a test of UD-IQ4_XS: 87 GiB free disk (59 GB now; keep the ukisai IQ4_XS shards, mixD reads them); the base
+  model is not Swift, so judge it against mixB by the agent replay, not by KL; the drafter was fitted to Swift.
