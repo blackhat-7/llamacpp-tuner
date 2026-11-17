@@ -490,3 +490,9 @@ Baseline, generate mode: code 163-165, prose 133-135, edit 151-156 t/s. Server m
   131.3, edit 198.7 vs 196.5 (+1.1%), reads unchanged. Adopted: the link carries far less and nothing got worse.
 - **32K repeated** (new default first, 2 pairs): 115.9 vs 113.5 t/s. The 88 above was the cold-row stall.
 
+- **Shared expert on the 4070 again, on top of partial sums** (branch `opt13/psum-shexp` `ca36fe10`): still a loss,
+  prose -2 to -3%, code -5% (3 pairs). The 4070's shorter path still becomes the critical one once it takes the shared
+  expert's ~20 us a layer.
+- **Drafter stage profile** (`STRATA_MTP_PROFILE=1`, free-running code, 300 rounds): 3.58 steps a round, a step 0.545 ms
+  in 16 stages of 12-104 us (head 0.104, experts 0.053, q+norm-rope 0.052, the rest 12-35 us each); weights floor ~0.24
+  ms. The first draft (round graph) is 0.707 ms. Fusing ~10 stages for -0.15 ms a step would give ~+2%: a lead.
