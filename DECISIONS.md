@@ -112,7 +112,7 @@ Same expert size as mixB, but slower on the server (code -10%, prose -13%, 35K r
 Files deleted; the tools to rebuild it are in `tmp/dual/unsloth/` (download, `patch_inplace.py`, `chain.sh`).
 
 ## 2026-11-17: `local-flash` keeps the learned profile's top 5,000 experts in VRAM and adapts the rest faster
-`STRATA_ADAPT_PROTECT=5000` + `--adapt-swaps 384 --adapt-min-gain 3` (engine `opt13/dual` `537931a3`, installed as `41c5e667` with a per-request n-gram stall log): edit +24%, prose +2%, code 0 on the server (frozen profile, 2 x 3 rounds). Lossless: only which experts sit in VRAM. Without the protected core, 384 swaps cost code 5% (the cache follows whatever ran last).
+`STRATA_ADAPT_PROTECT=5000` + `--adapt-swaps 384 --adapt-min-gain 3` (engine `opt13/dual` `537931a3`, installed as `41c5e667` with a per-request n-gram stall log): edit +24%, code +1%, prose ±0 on the server (frozen profile, 4 runs vs 2, medians of 3 rounds). Lossless: only which experts sit in VRAM. Without the protected core, 384 swaps cost code 5% (the cache follows whatever ran last).
 Rollback: `Strata/strata-swift-mixb-dual.json.before-r13-2026-11-17`.
 
 ## 2026-11-17: no shared expert, prompt refill or hot-expert reorder on the 4070

@@ -469,3 +469,6 @@ Baseline, generate mode: code 163-165, prose 133-135, edit 151-156 t/s. Server m
   (up to 2,325 for a 35K prompt) take that prompt's most-routed experts of the same layer instead of their old ones
   (prefill counts the routed ids per expert). Generate mode code +4%, edit flat; server no clear gain on top of the
   protected core. Not adopted.
+- **All protected-core runs pooled** (frozen profile, 4 runs vs 2 base runs): code 173.4 vs 171.2 (+1%), prose 132.9 vs
+  132.8 (±0), edit 198.2 vs 160.3 (+24%). On top of it, `STRATA_NV_ADAPT_SWAPS=192` and `--adapt-min-gain 2.5
+  --adapt-swaps 512` were flat (`sv_g_*.out`): the placement knobs are saturated.
