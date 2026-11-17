@@ -110,3 +110,11 @@ Undo: `lct down local-flash && lct up local-flash-mixd`, or restore `tmp/aliases
 ## 2026-11-17: Unsloth v3.1 UD-IQ4_XS (abliterated) not adopted
 Same expert size as mixB, but slower on the server (code -10%, prose -13%, 35K read -31%) and no better in the agent replay (1/3 vs 2/3 on the same runs; a heavier, failing design on task 2). It is the base model, not Swift.
 Files deleted; the tools to rebuild it are in `tmp/dual/unsloth/` (download, `patch_inplace.py`, `chain.sh`).
+
+## 2026-11-17: `local-flash` keeps the learned profile's top 5,000 experts in VRAM and adapts the rest faster
+`STRATA_ADAPT_PROTECT=5000` + `--adapt-swaps 384 --adapt-min-gain 3` (engine `opt13/dual` `537931a3`): edit +24%, prose +2%, code 0 on the server (frozen profile, 2 x 3 rounds). Lossless: only which experts sit in VRAM. Without the protected core, 384 swaps cost code 5% (the cache follows whatever ran last).
+Rollback: `Strata/strata-swift-mixb-dual.json.before-r13-2026-11-17`.
+
+## 2026-11-17: no shared expert, prompt refill or hot-expert reorder on the 4070
+Each measured flat or worse: the 4070's per-layer round trip (~110 us) is already about as long as the XTX's expert phase, so more 4070 work lengthens the critical path. Branches `opt13/shexp-tested`, `opt13/refill-tested`.
+

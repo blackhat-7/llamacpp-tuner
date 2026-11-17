@@ -388,3 +388,84 @@ interleaved B D B D, median of 3 rounds each (`tmp/dual/serve/mixb1-2.out`, `mix
   - Dense weights: Unsloth Q6_K / Q8_0 (~3 GiB); the GSQ-RCO file BF16 1.3, Q6_K 0.8, IQ4_XS 0.4, Q4_K 0.3 GiB. The
     n-gram table (`per_layer_token_embd`, IQ4_NL 26.8 GiB) is the same in all of them.
   - The engine's expert kernels take every one of these types (`is_iq`, `iq_row_bytes` in `iq_kernels.cu`).
+
+## Round 13 (2026-11-17): what limits the dual setup, and what moves it
+
+Goal from the user: use the 4070 far more, up to 2x decode, with no quality loss (bit-exact or rounding-level only).
+Harness: `tmp/dual/r13/run.sh` (generate mode, the deployed mixB + 4070 config, follow texts, greedy, 600 tokens,
+±1.5%); server A/B `tmp/dual/serve/serve_ab.sh` (±8%). Engine work on branch `opt13/dual` in `Strata-wt/r12-nvhelper`.
+
+Baseline, generate mode: code 163-165, prose 133-135, edit 151-156 t/s. Server medians: code 174, prose 131, edit 158,
+35K read 2,390 t/s.
+
+### Where the time goes
+
+- **Real traffic is prose-like.** The live server's mixB log (350 requests, 194K tokens): half of all tokens decode
+  at 110-130 t/s, a third at 130-150, 14% faster. Token-weighted 130 t/s at ~95% XTX hits.
+- **The 4070 is latency-bound, not idle by choice.** Its card time per layer is 112 us on code (stage-in 16,
+  experts 66, rows back 29) and 88 us on prose; with the host's launch (~13 us), spin and row copy, its path from the
+  XTX's ring to flag M is about as long as the XTX's own expert phase. Busy ~25% of the time, but on the per-layer
+  critical path.
+- **Causal profile** (`STRATA_X_NV_DELAY_US` / `_XTX_DELAY_US` / `_CPU_DELAY_US`: 30 us more on one path per layer,
+  3 runs per arm, runs with an n-gram stall dropped): prose 134 -> XTX 127.3 (-5.3%), 4070 130.0 (-3.3%), host/CPU
+  130.0 (-3.3%); code 162.6 -> XTX 159.6 (-1.9%), 4070 160.9 (-1.0%), host 159.4 (-2.0%). 30 us a layer is 1.44 ms a
+  window, so a path that always set the pace would cost prose ~7.5%. Prose: the XTX sets the pace in ~3/4 of the
+  layers, flag M (CPU + 4070 rows) in ~1/2. Code: no path in more than ~1/3. The three paths are balanced, so shortening
+  one moves little; that is why every single-path change below came out flat.
+- **The host's copy of the 4070's rows** into the window's rows is 5 us a layer (prose) to 7 us (code): not worth a
+  buffer registered with both drivers.
+- **n-gram (PLE) stalls cost 10% when they hit.** A quarter of the prose runs came out at ~121 t/s instead of ~134 with
+  the host's layer-0 gather at ~2 ms a round instead of 0.1: the table's rows were cold (after a server run had evicted
+  them) and the prefetch during drafting did not finish. The live server shares RAM with a 10 GiB conversation cache,
+  so this is a real-world lever, not only bench noise (measuring it on the server: below).
+- Ruled out: clocks (the XTX holds ~3.0 GHz / 1249 MHz memory through decode, 86% busy; the 4070 runs P0); the
+  layer-0 n-gram (PLE) wait (2.2 ms in the stage profile, 0.15 ms in production: a profiler artifact); long context
+  (at 200K the indexer adds ~1.5 ms a window, ~6%).
+
+### Tried, no gain (all reverted; code kept on branch `opt13/shexp-tested`)
+
+- **Shared expert on the 4070** (`STRATA_NV_SHEXP`, ABI 6, rounding-level): prose -1%, code -2%. It saved the XTX only
+  ~15 us a layer and added 26 us to the 4070's critical path.
+- **Hot experts on the 4070** (upstream's `STRATA_PEER_HOT` order rebuilt as a profile file, 25% and 45%): flat. The
+  XTX's adaptive tier re-learns the hot set within a few rounds (~24 swaps a round).
+- `STRATA_NV_PRE_DRAIN=0` (launch order), `--pool-workers 13`, `--pcie-frac` 0.15 / 0.25 / 0.5 (0.15: prose -10%;
+  0.5: edit -11%): flat or worse. `STRATA_MTP_HIP_PRIO=1` and `STRATA_SH_STREAM=1` hang the verify graph at layer 9 on
+  this path (watchdog-released).
+
+### The adaptive tier: a content-dependent lever
+
+- Swaps are always spent in full (code: 3,456 = 96 x 36 adapt rounds). Copies overlap the windows
+  (`STRATA_ADAPT_LAG=2`) but compete for PCIe and DDR5: at 384 swaps code's CPU experts fall 2.07 -> 1.57 a layer yet
+  the round slows 16%. With no swaps at all code falls to 114 t/s.
+- `--adapt-swaps 384 --adapt-min-gain 3` (generate mode): edit 153.6 -> 174.6 (+13.5%, CPU experts 6.2 -> 4.0 a layer),
+  code +1.7%, prose +0.7%. `--adapt-every 2` is pathological on code (109 t/s). Generate mode now honours
+  `--adapt-min-gain` for the XTX tier (it hardcoded 1.5; serve mode always read the option).
+- **Server** (`local-flash-r13`, 2 interleaved pairs, medians of 3): edit 158 -> 175 / 182 (+13%), prose +1%, code
+  174 -> 166 (-5%), 35K reads unchanged. The bench rotates code, prose, edit, so code starts each request in a cache
+  adapted to edit. Not adopted: a trade, not a win.
+- **Protected core** (`STRATA_ADAPT_PROTECT=N`, engine `537931a3`: the loaded profile's first N pairs are never the
+  adaptive tier's victims), 384 swaps, min gain 3, server medians (base = 6 runs: code 169.5, prose 132.9, edit 159.1):
+  N=5000 code +3%, prose -4%, edit +26%; N=6500 +1% / -5% / +27%; N=5000 with 192 swaps -0.5% / -4% / +24%. Prose's
+  hit rate falls 92 -> 89.5% while edit's rises 75 -> 90%: the adaptable slots follow whatever ran last, and the bench
+  rotates code, prose, edit. Caveat: these A/Bs ran while the base arm rewrote the learned profile (next point).
+- **Mistake to avoid:** the base arm used the live `local-flash` config, whose engine saves its learned profile, so
+  bench traffic rewrote `profiles/swift-1.5-mixb-learned.bin` (06:09; no copy of the 03:02 file). It re-learns from real
+  traffic, but every later arm loaded a moving profile. Fixed: all test configs load
+  `profiles/swift-1.5-mixb-learned-frozen13.bin` and save to `-r13.bin`; the base arm is `local-flash-base13`.
+- **Resident RAM mode** (`--resident-experts`, the 4070's swaps off): RAM 75 -> 46 GB used, but decode -21% on code,
+  prose and edit (the RAM copy is no longer one pinned block: the 4070's fills go through staging). Not a way to keep
+  the n-gram table in RAM.
+- **Clean A/B on the frozen profile** (2 runs each, medians of 3 rounds; `tmp/dual/r13/sv_f_*.out`):
+
+| server | code | prose | edit | 35K read |
+|---|---|---|---|---|
+| base (`local-flash-base13`, engine ac085da1) | 171.2 | 132.8 | 160.3 | 2,605 |
+| protected core 5000 + `--adapt-swaps 384 --adapt-min-gain 3` | 171.7 (+0.3%) | 135.5 (+2.0%) | **198.7 (+24%)** | 2,549 |
+| the same + `STRATA_REFILL_PROMPT=1` | 175.6 (+2.6%) | 132.5 (-0.2%) | 200.1 (+25%) | 2,589 |
+
+  The earlier "prose -4%" was the moving profile, not the policy. Edit's XTX hit rate goes 75% -> 90%: the bench's edit
+  text routes far from the profile, and only the 2,300 unprotected slots move. Lossless: only which experts sit in VRAM.
+- **Prompt-informed refill** (`STRATA_REFILL_PROMPT=1`, tested on branch `opt13/refill-tested`): a prompt's lent slots
+  (up to 2,325 for a 35K prompt) take that prompt's most-routed experts of the same layer instead of their old ones
+  (prefill counts the routed ids per expert). Generate mode code +4%, edit flat; server no clear gain on top of the
+  protected core. Not adopted.
