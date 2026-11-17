@@ -118,3 +118,7 @@ Rollback: `Strata/strata-swift-mixb-dual.json.before-r13-2026-11-17`.
 ## 2026-11-17: no shared expert, prompt refill or hot-expert reorder on the 4070
 Each measured flat or worse: the 4070's per-layer round trip (~110 us) is already about as long as the XTX's expert phase, so more 4070 work lengthens the critical path. Branches `opt13/shexp-tested`, `opt13/refill-tested`.
 
+## 2026-11-17: the 4070 returns one weighted sum per token (`STRATA_NV_PSUM=1`)
+Engine `opt13/psum` `b62f6577`: 3-4x fewer bytes on the x4 link; generate mode prose +2.7%, code +4.8%, server +0-1% (noise); quality vs the 4-bit reference unchanged (KL 0.1019 vs 0.1006). Rounding-level: summation order only.
+Rollback: `Strata/strata-swift-mixb-dual.json.before-psum-2026-11-17`.
+

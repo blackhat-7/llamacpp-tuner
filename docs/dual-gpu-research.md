@@ -472,3 +472,21 @@ Baseline, generate mode: code 163-165, prose 133-135, edit 151-156 t/s. Server m
 - **All protected-core runs pooled** (frozen profile, 4 runs vs 2 base runs): code 173.4 vs 171.2 (+1%), prose 132.9 vs
   132.8 (±0), edit 198.2 vs 160.3 (+24%). On top of it, `STRATA_NV_ADAPT_SWAPS=192` and `--adapt-min-gain 2.5
   --adapt-swaps 512` were flat (`sv_g_*.out`): the placement knobs are saturated.
+- **Launch the 4070 at its claim** (`STRATA_NV_EARLY=1`, before the host builds the CPU jobs; the old
+  `STRATA_NV_PRE_DRAIN=0` still launched after them): generate mode, clean runs, prose +2.0%, code +3.1%; server, 3 runs
+  each on the frozen profile: code 175.8 vs 177.3, prose 132.2 vs 132.5, edit 196.2 vs 197.8 (noise). Kept opt-in.
+- **Long context with the new default** (generate mode, one run each): 200K 123.7 vs 122.4 t/s; 32K 88.0 vs 114.1, but
+  that run lost 4.7 ms a round to cold n-gram rows (host 1.4 in the other); repeated below.
+- **Per-token partial sums from the 4070** (`STRATA_NV_PSUM=1`, engine `opt13/psum` `b62f6577`): the router tail also
+  publishes the routing weights (mapped), the plugin sums each token's helper rows with them (one row per token over
+  the x4 link instead of one per routed expert, ~3-4x fewer bytes), and the host writes each sum onto the token's
+  heaviest helper row divided by that row's weight (the combine multiplies it back) and zeroes the token's other helper
+  rows, so the combine kernel is unchanged. Generate mode, 3 interleaved pairs: prose 134.8 -> 138.4 (+2.7%), code
+  171.3 -> 179.5 (+4.8%); host wait for the 4070 -23% (prose) / -33% (code), row copy 78 -> 40 ms a run.
+  Quality (`tmp/dual/r13/quality/psum_{on,off}.tsv`, real tiers, vs the 4-bit reference): KL 0.1019 vs 0.1006, top-1
+  88.67 vs 88.81%, perplexity 4.032 vs 4.074; per segment it goes both ways. On vs off flips 5.6% of greedy tokens
+  (KL 0.025), the same order as the helper itself did (2-6%): summation order, rounding-level.
+  Server, frozen profile, protected core, 3 runs each (`sv_s{0,1}_*.out`): code 178.7 vs 176.5 (+1.2%), prose 131.5 vs
+  131.3, edit 198.7 vs 196.5 (+1.1%), reads unchanged. Adopted: the link carries far less and nothing got worse.
+- **32K repeated** (new default first, 2 pairs): 115.9 vs 113.5 t/s. The 88 above was the cold-row stall.
+
