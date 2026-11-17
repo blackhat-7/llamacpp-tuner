@@ -2,7 +2,7 @@
 
 Handoff note. Rewritten at the end of every session, never appended to. Cap 40 lines. Next task: `PLAN.md`. Rules: `AGENTS.md`.
 
-**Last session:** 2026-11-17 (round 13, the two GPUs: causal profile of the per-layer paths; the 4070 is latency-bound, not idle by choice; **adopted a protected expert core + faster adaptation, engine `opt13/dual` `537931a3`: edit +24%, prose +2%, code 0 on the server**; details `docs/dual-gpu-research.md` "Round 13"). Before: 2026-11-16 (mixB + the 4070 became the default).
+**Last session:** 2026-11-17 (round 13, the two GPUs: causal profile of the per-layer paths; the 4070 is latency-bound, not idle by choice; **adopted a protected expert core + faster adaptation, engine `opt13/dual` `41c5e667`: edit +24%, prose +2%, code 0 on the server**; details `docs/dual-gpu-research.md` "Round 13"). Before: 2026-11-16 (mixB + the 4070 became the default).
 
 ## State
 
