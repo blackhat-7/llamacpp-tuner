@@ -496,3 +496,25 @@ Baseline, generate mode: code 163-165, prose 133-135, edit 151-156 t/s. Server m
 - **Drafter stage profile** (`STRATA_MTP_PROFILE=1`, free-running code, 300 rounds): 3.58 steps a round, a step 0.545 ms
   in 16 stages of 12-104 us (head 0.104, experts 0.053, q+norm-rope 0.052, the rest 12-35 us each); weights floor ~0.24
   ms. The first draft (round graph) is 0.707 ms. Fusing ~10 stages for -0.15 ms a step would give ~+2%: a lead.
+- **Prompt reads on the 4070, designed not built.** Mask the 4070's held experts (held there, not on the XTX) out of
+  the routed ids before `fused::group` (ids = E, weight 0: no rows, so no blob is read), skip them in the stream at
+  `prefill.cpp` 3396, send the XTX's own int8 `Xq` (3,200 B a token, 37.7 MB a 11,776-token chunk) + ids + weights to the
+  plugin, run `fused::group` + `experts_native` there (compile `moe_fused*.cu` into the plugin; it allocates per
+  token-block buffers), return one sum per token, add it with `moe_combine_peer` (kernels.cu 3170). The x4 return of
+  FP32 sums (120 MB, ~22 ms a layer) against the XTX's ~30-40 ms walk is the risk; saves ~216 MB of ring streaming a
+  layer. Est. +4-8% on long reads, ~0.5-1% of engine time (fresh long reads are ~10% of it). Risks: every layer waits on
+  the 4070; both cards must use one held-set snapshot per chunk (no 4070 swaps during a read); the fused kernels
+  `std::exit` on CUDA errors.
+
+### Round 13 conclusion
+
+- The three per-layer paths (XTX's own work, CPU experts, the 4070's round trip) are balanced, so moving work between
+  them moves little; the 4070 is latency-bound (x4 link + host relay per layer), ~21% busy in decode. 2x is not in reach
+  by rearranging work: it needs the XTX's critical path itself shorter.
+- Adopted (lossless / rounding-level): protected expert core + faster adaptation (edit +24%), per-token partial sums
+  from the 4070 (+1-5%). Server vs the session start: code ~171 -> ~179, prose ~133 -> ~132, edit ~160 -> ~199 t/s.
+- Leads left, largest first: the persistent pre-expert kernel on the XTX (+5% est.; needs the user's OK: a hung XTX can
+  still take Hyprland down while `AQ_DRM_DEVICES` lists it); a better drafter (prose accepts 68% a draft; self-
+  distillation gave +3%); drafter stage fusion (+2%); prompt reads on the 4070 (+4-8% on long reads); the n-gram stall
+  rate on the live server (logged per request since engine 41c5e667).
+
