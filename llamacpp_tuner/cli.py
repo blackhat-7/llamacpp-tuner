@@ -29,6 +29,7 @@ from llamacpp_tuner.downloader import (
 from llamacpp_tuner.jeeves import install_jeeves, run_jeeves
 from llamacpp_tuner.llama import install_llama, list_devices, run_server
 from llamacpp_tuner.logs import SOURCES
+from llamacpp_tuner.loom import run_loom
 from llamacpp_tuner.lora import adapter_base, import_lora
 from llamacpp_tuner.strata import run_strata
 from llamacpp_tuner.video import (
@@ -65,9 +66,9 @@ from llamacpp_tuner.video import (
 
 BACKEND = click.option(
     "--backend",
-    type=click.Choice(["llama", "jeeves", "strata", "comfyui"]),
+    type=click.Choice(["llama", "jeeves", "strata", "loom", "comfyui"]),
     default="llama",
-    help="llama.cpp, Jeeves's own PyTorch server, Strata, or ComfyUI for video",
+    help="llama.cpp, Jeeves's own PyTorch server, Strata, Loom, or ComfyUI for video",
 )
 # The profile the Video tab and 'lct video' start; 'lct setup --backend comfyui' adds it.
 VIDEO_PROFILE = "video"
@@ -180,6 +181,11 @@ def setup(
     try:
         if backend == "strata":
             raise click.UsageError("Strata installs with its own ./setup.sh.")
+        if backend == "loom":
+            raise click.UsageError(
+                "Install hrx-loom into a venv named venv, and fetch a model "
+                "package beside it with loom-fetch."
+            )
         if backend == "jeeves":
             click.echo(f"Jeeves: {install_jeeves(torch_index, force=force)}")
         elif backend == "comfyui":
@@ -319,8 +325,10 @@ def serve(
     MODEL is a GGUF path, a downloaded repository, or an alias from aliases.toml.
     With --backend jeeves, --ctx is Jeeves's --max-len and --extra-args go to
     its server. With --backend strata, MODEL is the strata-<model>.json its setup
-    wrote; context and files live in that config. With --backend comfyui, MODEL
-    is ComfyUI's base directory (models, input, output).
+    wrote; context and files live in that config. With --backend loom, MODEL is a
+    Loom model package directory; its preset (--extra-args '--preset=NAME') sets
+    context and drafting. With --backend comfyui, MODEL is ComfyUI's base
+    directory (models, input, output).
     """
     if quant and filename:
         raise click.UsageError("--quant and --file cannot be combined.")
@@ -375,6 +383,20 @@ def serve(
                 env=environment,
             )
             return
+        if backend == "loom":
+            if quant or filename or ctx or mmproj or no_mmproj or no_mmproj_offload:
+                raise click.UsageError(
+                    "Loom's model, context and drafter are set in its package preset."
+                )
+            listen = []
+            if host or port:
+                listen = [f"--listen={host or '127.0.0.1'}:{port or 8080}"]
+            run_loom(
+                Path(model).expanduser(),
+                listen + shlex.split(extra_args),
+                env=environment,
+            )
+            return
         if backend == "comfyui":
             if quant or filename or ctx or mmproj or no_mmproj or no_mmproj_offload:
                 raise click.UsageError(
@@ -411,7 +433,7 @@ def serve(
         run_server(server_args, env=environment, binary=server)
     except click.ClickException:
         raise
-    except (FileNotFoundError, ValueError) as error:
+    except (FileNotFoundError, ValueError, RuntimeError) as error:
         raise click.ClickException(str(error)) from error
     except subprocess.CalledProcessError as error:
         raise click.ClickException(

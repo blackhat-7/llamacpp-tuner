@@ -122,3 +122,13 @@ Each measured flat or worse: the 4070's per-layer round trip (~110 us) is alread
 Engine `opt13/psum` `b62f6577`: 3-4x fewer bytes on the x4 link; generate mode prose +2.7%, code +4.8%, server +0-1% (noise); quality vs the 4-bit reference unchanged (KL 0.1019 vs 0.1006). Rounding-level: summation order only.
 Rollback: `Strata/strata-swift-mixb-dual.json.before-psum-2026-11-17`.
 
+
+## 2026-11-22: Inkling-2-Mini runs on Loom for the one-GPU stack `local-inkling`
+On the XTX, llama.cpp runs this looped model at 30-34 t/s (~13,000 small ops per token; its drafter makes it slower). AMD's Loom runs the same GGUF at 111 t/s. Our tuned package `tmp/loom/kv8w4096` (8-bit KV, new attention kernels, drafter window 4096) gives 143 / 121 t/s short and 90 / 75 at 195K, 192K context, 0.3 GB RAM.
+Rollback: the shipped package `tmp/loom/Inkling-2-Mini` (f16 KV: 196K fits only without drafter or prefix cache).
+
+## 2026-11-22: lct refuses to start Loom under a 64 MiB memory-lock limit
+Loom pins 16 MiB through io_uring; under the 8 MiB default it reports ready, then fails every request. A capability on loom-serve cannot replace the limit: it loads its libraries through `$ORIGIN`, which Linux ignores for capability binaries. Fix: a file in `/etc/security/limits.d/`, then log in again.
+
+## 2026-11-22: `local-inkling` uses Loom's default wait mode, not the busy-wait spin
+Same speed through `lct` (140 / 121 vs 143 / 121 t/s short) and no CPU core spinning next to a game.

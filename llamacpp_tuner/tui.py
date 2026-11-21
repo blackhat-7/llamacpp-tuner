@@ -342,7 +342,7 @@ def profile(args: str) -> dict:
         elif p["backend"] == "strata":
             model = Path(p["model"]).expanduser()
             model, mmproj = (model if model.is_file() else None), None
-        elif p["backend"] == "comfyui":
+        elif p["backend"] in ("comfyui", "loom"):
             model = Path(p["model"]).expanduser()
             model, mmproj = (model if model.is_dir() else None), None
         else:

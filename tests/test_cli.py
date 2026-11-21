@@ -448,6 +448,36 @@ def test_serve_strata_runs_its_config(tmp_path):
     assert bad.exit_code != 0 and "run config" in bad.output
 
 
+def test_serve_loom_runs_its_package(tmp_path):
+    with patch("llamacpp_tuner.cli.run_loom") as run_loom:
+        result = CliRunner().invoke(
+            main,
+            ["serve", str(tmp_path), "--backend", "loom", "--host", "0.0.0.0"]
+            + ["--port", "6868", "--extra-args", "--preset=xtx --pool_backing=fixed"],
+        )
+        port_only = CliRunner().invoke(
+            main, ["serve", str(tmp_path), "--backend", "loom", "--port", "6900"]
+        )
+        bad = CliRunner().invoke(
+            main, ["serve", str(tmp_path), "--backend", "loom", "--ctx", "8192"]
+        )
+
+    assert result.exit_code == 0, result.output
+    assert port_only.exit_code == 0, port_only.output
+    assert run_loom.call_args_list[0].args == (
+        tmp_path,
+        ["--listen=0.0.0.0:6868", "--preset=xtx", "--pool_backing=fixed"],
+    )
+    assert run_loom.call_args_list[1].args == (tmp_path, ["--listen=127.0.0.1:6900"])
+    assert bad.exit_code != 0 and "preset" in bad.output
+
+
+def test_loom_has_no_lct_setup():
+    result = CliRunner().invoke(main, ["setup", "--backend", "loom"])
+
+    assert result.exit_code != 0 and "hrx-loom" in result.output
+
+
 def test_strata_needs_its_own_setup(tmp_path):
     missing = CliRunner().invoke(
         main, ["serve", str(tmp_path / "none.json"), "--backend", "strata"]
@@ -468,11 +498,13 @@ def test_pull_all_downloads_the_whole_repository():
     download.assert_called_once_with("o/r", force=False)
 
 
-def test_address_reads_llama_jeeves_and_strata_lines():
+def test_address_reads_each_backends_ready_line():
     assert servers.address("main: server is listening on http://h:1") == "http://h:1"
     assert servers.address('{"serving": "http://h:2", "block": 4}') == "http://h:2"
     strata = (
         "ready: http://h:3/v1  (OpenAI: /v1/chat/completions, context 131072 tokens)"
     )
     assert servers.address(strata) == "http://h:3"
+    loom = '{"event":"ready","address":"0.0.0.0:6868","models":1}'
+    assert servers.address(loom) == "http://0.0.0.0:6868"
     assert servers.address("loading model") == ""

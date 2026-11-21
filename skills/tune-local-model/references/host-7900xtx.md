@@ -73,6 +73,31 @@ Ornith-1.5 IQ4_XS (any qwen35moe 35B-A3B decodes the same), q8 KV, greedy, think
 - hipfire also resets the conversation above ~200K ("context full"), so each turn there re-reads the whole prompt.
 - Qwen3.8-27B mq4-xts + MTP on hipfire (q8 KV): code 121 / 98 / 88 and prose 82 / 64 / 58 t/s at short / 100K / 148K; it fits only ~155–185K, so not 200K. hipfire install and models: `tmp/model-hunt/hipfire-*` (built with `PATH=/usr/bin:$PATH CC=/usr/bin/cc CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER=/usr/bin/cc`; Nix's rustup links Nix glibc, which cannot load ROCm).
 - 3-fact recall at depth: 3/3 for every setup above.
+
+### Inkling-2-Mini (26B-A3B looped MoE) on the XTX alone (2026-11-22)
+
+UD-Q4_K_XL (16.4 GiB), greedy, decode t/s over all generated tokens (the model always thinks: `enable_thinking=false` does not stop it). Prompts `tmp/model-hunt/prompt_inkling_{1000,195000}.txt`, raw `results.jsonl` (labels `ink-*`).
+
+| setup | short code / prose | 195K code / prose | cold 195K read |
+|---|---|---|---|
+| **Loom tuned** `tmp/loom/kv8w4096`, preset `xtx-kv8-196k` (196,608 ctx, 8-bit KV, drafter and prefix cache on) | 143 / 121 | 90 / 75 | 2.3 min |
+| Loom tuned, drafter off (preset `xtx-nodraft`) | 110 / – | 73 / 73 | 2.2 min |
+| Loom 0.2.0 as shipped, preset `xtx-nodraft` (196,608 ctx, f16 KV) | 111 / 111 | 44 / 44 | 2.2 min |
+| Loom as shipped, drafter on, preset `xtx` (32K ctx; 196K does not fit) | 143 / 117 | – | – |
+| llama.cpp Unsloth b12588 ROCm, DSpark n3, q8 KV, `-ub 64`, 204,800 ctx | 57 / 39 (temp 1.0: 44 / 31) | 29 / 22 | 18 min |
+| llama.cpp, any backend or build, no drafter | 30–34 | – | – |
+
+- Loom is AMD's engine (`hrx-loom`, source ROCm/hrx-system) in `tmp/loom` (venv, packages, `serve-*.log`). The package `loom-fun/unsloth-Inkling-2-Mini-loom` was tuned on Strix Halo and runs on gfx1100 unchanged. Its programs are `.loom` source compiled at load, so they can be edited. Its completion spin holds one CPU core.
+- Tuning (2026-11-22), all in `tmp/loom/kv8w4096`:
+  - Global KV in int8 with one f16 scale per 32 values (q8_0 style). The format is in `tmp/loom/kv8-format.md`; `Inkling-2-Mini-kv8/kv8_tools/transform.py` regenerates it.
+  - New decode attention kernel `g_ink_attn_split_v2` that loads each key once for all 3 query heads. At 195K it reads 855 GB/s with f16 (was 541) and 750 GB/s with int8. Decode and verify both use it.
+  - The drafter attends only to the last 4,096 tokens: 13.45 → 0.19 ms per pass at 195K, with acceptance unchanged. 64K drafter on: 114 / 104.
+  - Kernels and benches are in `tmp/loom/attn-bench/`.
+- Serving the tuned package needs `sudo prlimit --pid <shell pid> --memlock=unlimited:unlimited` first; the 8 MB default fails the load. It uses 25.17 of 25.75 GB at 196K.
+- The prefix cache reuses a growing chat (a 64K follow-up starts in 2 s, not 29 s), but not a new question on the same document.
+- The shipped package fits 196K only with f16 KV, no drafter and the prefix cache off.
+- Not integrated: `attn-bench/spa_p4.loom`, a verify kernel that shares K/V loads across 2 tokens (~0.2 ms/layer less at 195K, about +8%).
+- llama.cpp is bound by ~13,000 small GPU ops per token. Reading a 195K prompt ran at 180 t/s.
 - **With no display on it, the idle XTX runtime-suspends after ~5 s** (`/sys/bus/pci/devices/0000:03:00.0/power/control` = `auto`, `runtime_status` = `suspended`). Suspend moves the model from VRAM to GTT (21.6 GB). On the next request the card wakes (+~2 s) and moves the model back, but ~0.6 GB stays in GTT. Measured afterwards: 101 t/s short (129 fresh), 73 at 200K (82 fresh). Fix: `lct serve` holds the card while the server runs (default since 2026-11-15; `--no-keep-awake` turns it off): 129-132 t/s across 20 s idle gaps, 81 at 200K. HIP processes hold the card on their own. While suspended, reads of its power sysfs files fail with EBUSY.
 
 ## Qwen3.8-Flash-Next (125B-A6B MoE, qwen4exp) — overnight long-context runs on Strata

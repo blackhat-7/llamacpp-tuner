@@ -124,6 +124,19 @@ lct serve PostHog/jeeves --backend jeeves --ctx 4096 --port 6871 --extra-args '-
 
 `--ctx` becomes Jeeves's `--max-len`; `--extra-args` go to `python -m inference.serve`. It answers `POST /v1/systemone`, not the OpenAI API.
 
+### Loom
+
+[Loom](https://github.com/ROCm/hrx-system) is AMD's inference engine. `--backend loom` runs `loom-serve` on a Loom model package, a directory with a `model.json` card. The package's preset sets context, drafting and memory. lct expects `loom-serve` in a venv named `venv` beside the package.
+
+```bash
+uv venv --python 3.12 ~/loom/venv && uv pip install --python ~/loom/venv/bin/python "hrx-loom[hf]==0.2.0"
+~/loom/venv/bin/loom-fetch huggingface:loom-fun/unsloth-Inkling-2-Mini-loom:chat --output=$HOME/loom/Inkling-2-Mini
+lct serve ~/loom/Inkling-2-Mini --backend loom --port 6868 --extra-args '--preset=chat --device=amdgpu'
+```
+
+- Loom pins 16 MiB for its I/O, so it needs a memory-lock limit above Linux's 8 MiB default. Add `<user> - memlock unlimited` to a file in `/etc/security/limits.d/` and log in again. lct refuses to start Loom below 64 MiB.
+- It serves the OpenAI API (`/v1/chat/completions`, `/v1/models`) under the package's model id only. There is no `/v1/messages`.
+
 ### Agent logs
 
 `lct logs export` prints your prompts and the briefs your agents gave subagents, from the local logs of Claude Code, Pi, opencode and Codex, as JSONL: one row per message with `src`, `kind` (`human`, `delegate` or `subagent_first`), `project`, `session`, `model`, `agent` and `text`. Use it to mine fine-tuning data.
