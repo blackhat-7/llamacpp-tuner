@@ -27,11 +27,14 @@ def run_loom(package: Path, args: list[str], env: dict[str, str] | None = None) 
         raise FileNotFoundError(
             f"loom-serve is missing: install hrx-loom into the venv {binary.parents[1]}."
         )
-    limit, _ = resource.getrlimit(resource.RLIMIT_MEMLOCK)
-    if limit != resource.RLIM_INFINITY and limit < MIN_MEMLOCK:
+    _, ceiling = resource.getrlimit(resource.RLIMIT_MEMLOCK)
+    if ceiling != resource.RLIM_INFINITY and ceiling < MIN_MEMLOCK:
         raise RuntimeError(
-            f"Loom needs a memory-lock limit of at least 64 MiB; this session has "
-            f"{limit // 1024**2} MiB. Add '<user> - memlock unlimited' to a file in "
+            f"Loom needs to lock 64 MiB of memory; this session's hard limit is "
+            f"{ceiling // 1024**2} MiB. Add '<user> hard memlock 65536' to a file in "
             "/etc/security/limits.d/ and log in again."
         )
+    # Only the hard limit is raised system-wide; the soft limit, which is what other
+    # programs run under, stays at the default. Raise it for this server alone.
+    resource.setrlimit(resource.RLIMIT_MEMLOCK, (ceiling, ceiling))
     run_process([str(binary), f"--model={package}", *args], env=env, cwd=package.parent)

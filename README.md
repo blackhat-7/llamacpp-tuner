@@ -134,7 +134,7 @@ uv venv --python 3.12 ~/loom/venv && uv pip install --python ~/loom/venv/bin/pyt
 lct serve ~/loom/Inkling-2-Mini --backend loom --port 6868 --extra-args '--preset=chat --device=amdgpu'
 ```
 
-- Loom pins 16 MiB for its I/O, so it needs a memory-lock limit above Linux's 8 MiB default. Add `<user> - memlock unlimited` to a file in `/etc/security/limits.d/` and log in again. lct refuses to start Loom below 64 MiB.
+- Loom pins 16 MiB for its I/O, more than Linux's 8 MiB default memory-lock limit. Raise only the hard limit (the ceiling a program may raise itself to): add `<user> hard memlock 65536` to a file in `/etc/security/limits.d/` and log in again. Other programs keep the 8 MiB soft limit; lct raises it for the Loom server alone. lct refuses to start Loom while the hard limit is below 64 MiB.
 - It serves the OpenAI API (`/v1/chat/completions`, `/v1/models`) under the package's model id only. There is no `/v1/messages`.
 
 ### Agent logs
