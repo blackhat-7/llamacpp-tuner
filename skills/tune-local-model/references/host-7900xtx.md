@@ -98,6 +98,7 @@ UD-Q4_K_XL (16.4 GiB), greedy, decode t/s over all generated tokens (the model a
 - The shipped package fits 196K only with f16 KV, no drafter and the prefix cache off.
 - Not integrated: `attn-bench/spa_p4.loom`, a verify kernel that shares K/V loads across 2 tokens (~0.2 ms/layer less at 195K, about +8%).
 - llama.cpp is bound by ~13,000 small GPU ops per token. Reading a 195K prompt ran at 180 t/s.
+- Details, files, how to rebuild the package and open leads: `docs/inkling-loom-research.md`.
 - **With no display on it, the idle XTX runtime-suspends after ~5 s** (`/sys/bus/pci/devices/0000:03:00.0/power/control` = `auto`, `runtime_status` = `suspended`). Suspend moves the model from VRAM to GTT (21.6 GB). On the next request the card wakes (+~2 s) and moves the model back, but ~0.6 GB stays in GTT. Measured afterwards: 101 t/s short (129 fresh), 73 at 200K (82 fresh). Fix: `lct serve` holds the card while the server runs (default since 2026-11-15; `--no-keep-awake` turns it off): 129-132 t/s across 20 s idle gaps, 81 at 200K. HIP processes hold the card on their own. While suspended, reads of its power sysfs files fail with EBUSY.
 
 ## Qwen3.8-Flash-Next (125B-A6B MoE, qwen4exp) — overnight long-context runs on Strata
