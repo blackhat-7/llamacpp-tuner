@@ -5,7 +5,9 @@ writes one. lct expects loom-serve in a venv named venv beside the package.
 The package's preset sets context, drafting and memory; lct only starts it.
 """
 
+import os
 import resource
+import subprocess
 from pathlib import Path
 
 from llamacpp_tuner.llama import run_process
@@ -13,6 +15,26 @@ from llamacpp_tuner.llama import run_process
 # Loom pins 16 MiB of I/O buffers through io_uring. Under Linux's 8 MiB default it
 # still reports ready, then fails every request.
 MIN_MEMLOCK = 64 * 1024**2
+
+
+def _allow_locking() -> None:
+    """Let this process, and the server it starts, lock MIN_MEMLOCK of memory."""
+    _, ceiling = resource.getrlimit(resource.RLIMIT_MEMLOCK)
+    if ceiling == resource.RLIM_INFINITY or ceiling >= MIN_MEMLOCK:
+        resource.setrlimit(resource.RLIMIT_MEMLOCK, (MIN_MEMLOCK, ceiling))
+        return
+    # Only root may raise the ceiling. prlimit changes this process alone, until it
+    # exits, so no system file has to allow more for every program.
+    limit = f"--memlock={MIN_MEMLOCK}:{MIN_MEMLOCK}"
+    try:
+        subprocess.run(
+            ["sudo", "prlimit", "--pid", str(os.getpid()), limit], check=True
+        )
+    except (OSError, subprocess.CalledProcessError) as error:
+        raise RuntimeError(
+            "Loom needs to lock 64 MiB of memory, and only root can let this server "
+            "lock more than 8 MiB. 'sudo prlimit' was refused or failed."
+        ) from error
 
 
 def run_loom(package: Path, args: list[str], env: dict[str, str] | None = None) -> None:
@@ -27,14 +49,5 @@ def run_loom(package: Path, args: list[str], env: dict[str, str] | None = None) 
         raise FileNotFoundError(
             f"loom-serve is missing: install hrx-loom into the venv {binary.parents[1]}."
         )
-    _, ceiling = resource.getrlimit(resource.RLIMIT_MEMLOCK)
-    if ceiling != resource.RLIM_INFINITY and ceiling < MIN_MEMLOCK:
-        raise RuntimeError(
-            f"Loom needs to lock 64 MiB of memory; this session's hard limit is "
-            f"{ceiling // 1024**2} MiB. Add '<user> hard memlock 65536' to a file in "
-            "/etc/security/limits.d/ and log in again."
-        )
-    # Only the hard limit is raised system-wide; the soft limit, which is what other
-    # programs run under, stays at the default. Raise it for this server alone.
-    resource.setrlimit(resource.RLIMIT_MEMLOCK, (ceiling, ceiling))
+    _allow_locking()
     run_process([str(binary), f"--model={package}", *args], env=env, cwd=package.parent)

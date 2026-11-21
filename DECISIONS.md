@@ -127,8 +127,9 @@ Rollback: `Strata/strata-swift-mixb-dual.json.before-psum-2026-11-17`.
 On the XTX, llama.cpp runs this looped model at 30-34 t/s (~13,000 small ops per token; its drafter makes it slower). AMD's Loom runs the same GGUF at 111 t/s. Our tuned package `tmp/loom/kv8w4096` (8-bit KV, new attention kernels, drafter window 4096) gives 143 / 121 t/s short and 90 / 75 at 195K, 192K context, 0.3 GB RAM.
 Rollback: the shipped package `tmp/loom/Inkling-2-Mini` (f16 KV: 196K fits only without drafter or prefix cache).
 
-## 2026-11-22: Loom's memory-lock limit is raised for its server alone
-Loom pins 16 MiB through io_uring; under the 8 MiB default it reports ready, then fails every request. Only the hard limit goes up system-wide (`<user> hard memlock 65536` in `/etc/security/limits.d/`); lct raises the soft limit for the Loom server only, so nothing else may lock more than before. `unlimited` would let any program pin all RAM. A capability on loom-serve fails: it loads its libraries through `$ORIGIN`, which Linux ignores for capability binaries.
+## 2026-11-22: lct asks sudo to raise Loom's memory-lock limit at each start
+Loom pins 16 MiB through io_uring; under Linux's 8 MiB default it reports ready, then fails every request, and only root can raise a process's ceiling. lct runs `sudo prlimit` on its own process just before it starts Loom: one approval per start, that server only, nothing on disk.
+Rejected: a line in `/etc/security/limits.d/` (the user wants no system-file edits; `unlimited` lets any program pin all RAM) and a capability on loom-serve (its `$ORIGIN` libraries do not load under capabilities).
 
 ## 2026-11-22: `local-inkling` uses Loom's default wait mode, not the busy-wait spin
 Same speed through `lct` (140 / 121 vs 143 / 121 t/s short) and no CPU core spinning next to a game.
