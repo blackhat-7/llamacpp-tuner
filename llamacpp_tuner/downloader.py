@@ -282,4 +282,5 @@ def resolve_repository(model: str) -> Path:
 
 
 def list_downloaded_models() -> list[Path]:
-    return sorted(get_models_dir().rglob("*.gguf"))
+    # is_file() follows links, so a link to a deleted shard is left out, not listed.
+    return sorted(path for path in get_models_dir().rglob("*.gguf") if path.is_file())

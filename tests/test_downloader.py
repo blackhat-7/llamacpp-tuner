@@ -154,6 +154,15 @@ def test_lists_nested_downloads(monkeypatch, tmp_path):
     assert downloader.list_downloaded_models() == [model]
 
 
+def test_listing_skips_links_to_deleted_files(monkeypatch, tmp_path):
+    monkeypatch.setattr(downloader, "get_models_dir", lambda: tmp_path)
+    model = tmp_path / "model.gguf"
+    model.touch()
+    (tmp_path / "gone.gguf").symlink_to(tmp_path / "deleted.gguf")
+
+    assert downloader.list_downloaded_models() == [model]
+
+
 def test_model_files_groups_shards_and_skips_projectors():
     from huggingface_hub import ModelInfo
     from huggingface_hub.hf_api import RepoSibling
