@@ -28,9 +28,14 @@ def start(package, limits, sudo=None):
         patch("llamacpp_tuner.loom.resource.getrlimit", return_value=limits),
         patch("llamacpp_tuner.loom.resource.setrlimit") as setrlimit,
         patch("llamacpp_tuner.loom.subprocess.run", side_effect=sudo) as run,
+        patch("llamacpp_tuner.loom._free_port", return_value=41000),
+        patch("llamacpp_tuner.loom.make_server") as make_server,
+        patch("llamacpp_tuner.loom.threading.Thread"),
         patch("llamacpp_tuner.loom.run_process") as run_process,
     ):
-        run_loom(package, ["--preset=xtx"], env={"A": "1"})
+        run_loom(package, ["--preset=xtx"], env={"A": "1"}, host="0.0.0.0", port=6868)
+    # Clients reach the translator on the public port; Loom listens privately.
+    make_server.assert_called_once_with("0.0.0.0", 6868, "127.0.0.1:41000")
     return setrlimit, run, run_process
 
 
@@ -45,6 +50,7 @@ def test_run_loom_serves_the_package_with_its_venv(tmp_path):
     assert run_process.call_args.args[0] == [
         str(binary),
         f"--model={package}",
+        "--listen=127.0.0.1:41000",
         "--preset=xtx",
     ]
     assert run_process.call_args.kwargs == {"env": {"A": "1"}, "cwd": tmp_path}

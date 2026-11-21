@@ -133,3 +133,7 @@ Rejected: a line in `/etc/security/limits.d/` (the user wants no system-file edi
 
 ## 2026-11-22: `local-inkling` uses Loom's default wait mode, not the busy-wait spin
 Same speed through `lct` (140 / 121 vs 143 / 121 t/s short) and no CPU core spinning next to a game.
+
+## 2026-11-22: lct translates Anthropic's Messages API for Loom and queues its generations
+claude-local needs `/v1/messages` and reads the context window from `meta.n_ctx`; Loom has neither. `messages.py` (stdlib only) serves both on the public port and forwards the rest; no LiteLLM-style dependency, and no client change on the Mac.
+Two overlapping generations make Loom reserve 4 GB more, fail and drop its model until restart (reproduced), so the translator sends generations one at a time. Token counting runs beside a generation safely.

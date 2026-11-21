@@ -388,13 +388,12 @@ def serve(
                 raise click.UsageError(
                     "Loom's model, context and drafter are set in its package preset."
                 )
-            listen = []
-            if host or port:
-                listen = [f"--listen={host or '127.0.0.1'}:{port or 8080}"]
             run_loom(
                 Path(model).expanduser(),
-                listen + shlex.split(extra_args),
+                shlex.split(extra_args),
                 env=environment,
+                host=host or "127.0.0.1",
+                port=port or 8080,
             )
             return
         if backend == "comfyui":

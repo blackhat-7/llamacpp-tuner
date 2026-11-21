@@ -135,7 +135,8 @@ lct serve ~/loom/Inkling-2-Mini --backend loom --port 6868 --extra-args '--prese
 ```
 
 - Loom pins 16 MiB for its I/O, but Linux lets a program lock only 8 MiB, and only root can raise that. So lct runs `sudo prlimit` on its own process just before it starts Loom: one approval per start, for that server only, and nothing is written to system files.
-- It serves the OpenAI API (`/v1/chat/completions`, `/v1/models`) under the package's model id only. There is no `/v1/messages`.
+- Loom serves only the OpenAI API, under the package's model id. lct runs Loom on a private port and serves the public one itself: it adds Anthropic's `/v1/messages` and `/v1/messages/count_tokens` (for Claude Code) and llama.cpp's `meta.n_ctx` in `/v1/models`, and forwards everything else.
+- Loom generates one sequence at a time and drops its model when two generations overlap, so lct sends it one at a time and queues the rest.
 
 ### Agent logs
 

@@ -464,11 +464,10 @@ def test_serve_loom_runs_its_package(tmp_path):
 
     assert result.exit_code == 0, result.output
     assert port_only.exit_code == 0, port_only.output
-    assert run_loom.call_args_list[0].args == (
-        tmp_path,
-        ["--listen=0.0.0.0:6868", "--preset=xtx", "--pool_backing=fixed"],
-    )
-    assert run_loom.call_args_list[1].args == (tmp_path, ["--listen=127.0.0.1:6900"])
+    first, second = run_loom.call_args_list
+    assert first.args == (tmp_path, ["--preset=xtx", "--pool_backing=fixed"])
+    assert (first.kwargs["host"], first.kwargs["port"]) == ("0.0.0.0", 6868)
+    assert (second.kwargs["host"], second.kwargs["port"]) == ("127.0.0.1", 6900)
     assert bad.exit_code != 0 and "preset" in bad.output
 
 
@@ -505,6 +504,6 @@ def test_address_reads_each_backends_ready_line():
         "ready: http://h:3/v1  (OpenAI: /v1/chat/completions, context 131072 tokens)"
     )
     assert servers.address(strata) == "http://h:3"
-    loom = '{"event":"ready","address":"0.0.0.0:6868","models":1}'
+    loom = "lct: Loom at 127.0.0.1:41000; listening on http://0.0.0.0:6868"
     assert servers.address(loom) == "http://0.0.0.0:6868"
     assert servers.address("loading model") == ""
