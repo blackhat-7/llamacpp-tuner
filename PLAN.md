@@ -6,7 +6,7 @@ Each line carries its own done-check. A task too big for one session gets split 
 ## Now
 
 - [x] **Reproducible repo.** Engine changes, run configs and profiles move from `tmp/` and unpushed branches into `engines/`, `profiles.toml` and `experiments/`; engines become `llamacpp_tuner/backends/` (`docs/architecture.md`). Done 2026-11-22: Strata rebuilt from v0.2.9 + 33 patches (tree = live source), Loom byte-identical, llama.cpp/ROCr pinned; 150 tests; `embed` restarted through the new code; isolated review's 10 findings fixed. `inkling`'s restart through the new code is left to the session benchmarking the XTX.
-- [ ] **Publish the Strata drafter.** After `uv run hf auth login`: `engines/strata/publish-drafter.sh ~/Documents/projects/Strata-data/mtp/rt-sd2-swift`, then commit the download line it writes into `engines/strata/README.md`. Done when a fresh `hf download` matches the local sha256.
+- [x] **Publish the Strata drafter.** Done 2026-11-22: `illusion7/strata-flash-next-mtp-sd2` at `28526684` with both licenses and NOTICE (`engines/strata/publish-drafter.sh`); a fresh token-free download of the 4 files matches the local sha256; the pinned command is in `engines/strata/README.md`.
 
 ### Two GPUs: the 4070 as the XTX engine's expert helper (branch `feat/dual-gpu-helper`; engine `opt12/nvhelper`)
 

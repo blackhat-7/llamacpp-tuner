@@ -164,8 +164,7 @@ Profiles and vocabulary:
   config: in git under `bench/strata-compare/share/`; `build.sh` copies it.
 - `mtp/rt-sd2-swift` (787 MB drafter): Basalt's MTP drafter with its dense part refit to Swift by self-distillation
   (round 9, `docs/flash-next-speed-research.md`; the fit scripts are in `experiments/flash-next/mtpfit/`).
-  <!-- drafter-source -->Not published yet: `engines/strata/publish-drafter.sh DIR` uploads it to Hugging Face with the
-  license files Swift's and Qwen's licenses require, and writes the download command here.<!-- /drafter-source -->
+  <!-- drafter-source -->Download: `uv run hf download illusion7/strata-flash-next-mtp-sd2 dense.bin dense.txt draft_vocab.bin experts.bin --revision 285266844f78118e26ba1dd489639ad323510d05 --local-dir "$LCT_HOME/strata/data/mtp/rt-sd2-swift"`.<!-- /drafter-source -->
 
 ## Make a new change
 

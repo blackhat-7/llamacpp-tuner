@@ -96,8 +96,9 @@ for name in weights:
     if name in remote and remote[name] != local:
         raise SystemExit(f"{name}: the Hub has {remote[name]}, the local file is {local}")
 
+# File names, not --include: the hf CLI reads any name after a pattern as a file and then ignores --include.
 command = (
-    f"`uv run hf download {repo_id} --revision {revision} --include '*.bin' dense.txt "
+    f"`uv run hf download {repo_id} dense.bin dense.txt draft_vocab.bin experts.bin --revision {revision} "
     '--local-dir "$LCT_HOME/strata/data/mtp/rt-sd2-swift"`'
 )
 text = readme.read_text()
