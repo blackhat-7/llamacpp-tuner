@@ -116,7 +116,7 @@ Ranked by expected gain *est.*; each needs bitwise parity checks.
   (inside the end-of-ring padding) indexes one past the end. Elsewhere that is a silent over-read; Arch builds
   ROCm with `-D_GLIBCXX_ASSERTIONS`, so it aborts: `std::vector<unsigned long>::operator[] ... Assertion
   '__n < this->size()'`. HIP calls it on every copy (`DmaCopyStatus` → `DmaEngineIsFree` → `PendingBytes`).
-  - Reproduced without Strata: `tmp/strata-tuning/rocr-fix/sdma_stress2.cpp` (varied async copies) aborted the
+  - Reproduced without Strata: `engines/rocr/tools/sdma_stress2.cpp` (varied async copies) aborted the
     stock runtime twice (after ~16.5 M and ~8 M copies); the backtrace frames resolve to exactly that chain.
   - Fix: one line, `data_.resize(convert(size) + 1)` (`rocr-7.2.4-blit-sdma-oob.patch`). Built with Arch's
     own flags into `~/rocm/rocr-7.2.4-fix` (`build.sh`); the run config puts that `lib` first in `lib_dirs`.

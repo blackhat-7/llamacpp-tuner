@@ -82,6 +82,8 @@ qwen = """owner/model-GGUF --quant Q6_K --ctx 32768 \
 embed = "Qwen/Qwen3-Embedding-0.6B-GGUF --file Qwen3-Embedding-0.6B-Q8_0.gguf --server ${LCT_HOME}/llama.cpp-b12415-vk/llama-server --port 6870"
 ```
 
+The repo's own profiles listen on `0.0.0.0` with no API key, for a private network such as a tailnet. Elsewhere, give them `--host 127.0.0.1` or an `--api-key` in `--extra-args`.
+
 Use `--env NAME=VALUE` (repeatable) for backend variables such as `GGML_VK_SUBALLOCATION_BLOCK_SIZE`; they go into llama-server's environment.
 Use `--server PATH` to run a different llama-server build for one profile, for example a pull-request branch that adds a model.
 `lct serve` keeps AMD GPUs powered while the server runs; `--no-keep-awake` turns that off for one profile. An AMD card that drives no display otherwise powers down after ~5 idle seconds and moves a Vulkan server's model to system RAM, which makes it 10-20% slower. lct holds a 1-byte ROCm allocation on each AMD card while the server runs, so the cards can sleep again once it stops. Without ROCm it does nothing.
