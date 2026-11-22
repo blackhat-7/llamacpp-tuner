@@ -70,21 +70,17 @@ Not integrated: **span-v2**, a verify kernel that shares K/V loads across the 2 
 against the old span kernel; 0.92-0.96 ms vs 1.13 ms a layer for two v2 rows at 195K (*est.* +8% at 195K). It is
 slower than v2 for a single token, so it would serve only verify spans.
 
-### Files (this PC only; `tmp/` is gitignored)
+### Files
 
-- `tmp/loom/kv8w4096`: the served package (8-bit KV, v2 for decode and verify, drafter window 4,096). Presets
-  `xtx-kv8-196k` (196,608 context, drafter, prefix cache, `max_tokens` 32,768) and `xtx-nodraft`; the original
-  card is `model.json.orig`. Also `Inkling-2-Mini` (as shipped), `Inkling-2-Mini-kv8`, `-attn`, `-f16ref`.
-- `tmp/loom/kv8_tools/transform.py SRC DST`: rewrites `llm.loom` with the 8-bit planes and both v2 swaps (it reads
-  `tmp/loom/attn-bench/g_ink_attn_split_v2_kv8.loom`). `tmp/loom/attn-bench/dsp_window.py LLM W` prints the
-  windowed drafter kernel. `gen_v2.py` and `gen_span.py` generate the kernels; `run.sh`, `e2e.sh` benchmark them.
-- Rebuild: `loom-fetch` the package at the revision in `model.json` `origins`, run `transform.py`, splice in the
-  `dsp_window.py` kernel for W=4096, copy the presets from `kv8w4096/model.json`.
+- `engines/loom/build.sh` rebuilds the served package `$LCT_HOME/loom/kv8w4096` (`tmp/loom/kv8w4096` here) from the
+  pinned upstream package. `engines/loom/README.md` lists the pins, each change, and how to check a build.
+- `experiments/inkling-loom/`: kernel generators (`gen_v2.py`, `gen_span.py`; span-v2 is `kernels/spa_p4.loom`),
+  kernel tests and benchmarks, and the end-to-end session tools. Its README says how to run each.
 - Raw results: `tmp/model-hunt/results.jsonl`, labels `ink-*`. Prompts: `tmp/model-hunt/prompt_inkling_{1000,64000,195000}.txt`.
 
 ## Serving through lct
 
-- `lct serve --backend loom` (`llamacpp_tuner/loom.py`) runs Loom on a private port. `llamacpp_tuner/messages.py`
+- `lct serve --backend loom` (`llamacpp_tuner/backends/loom.py`) runs Loom on a private port. `llamacpp_tuner/messages.py`
   serves the public one: Anthropic's `/v1/messages` and `/v1/messages/count_tokens` translated to Loom's chat API
   (streaming, tool calls, thinking; Claude Code's `output_config.effort` becomes `reasoning_effort`), `/v1/models`
   with llama.cpp's `meta.n_ctx` (claude-local's context window), and everything else forwarded. It announces its

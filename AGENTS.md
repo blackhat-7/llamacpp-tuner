@@ -5,14 +5,20 @@
 
 ## What this is
 
-`lct` is a small Python wrapper around llama.cpp. It does six things:
+`lct` is a small Python tool that serves local models through several engines. It does six things:
 
-1. find, download or build `llama-server`
+1. set up engines: llama.cpp, Strata, Loom, Jeeves, ComfyUI (`llamacpp_tuner/backends/`, one module each)
 2. download an exact GGUF quantization and optional projector, or import a fine-tuned LoRA (`lct import`)
-3. start `llama-server` with explicit pass-through arguments, directly or from a saved alias; `lct up/down/ps` run several detached at once (stacks)
+3. start a server with explicit pass-through arguments, directly or from a saved profile; `lct up/down/ps` run several detached at once (stacks)
 4. list downloaded GGUF files
 5. make and edit video clips with MiniMax H3 on ComfyUI (`lct video`; ComfyUI runs as the `video` profile)
 6. offer a terminal UI (`lct tui`) for the above plus `llama-bench` runs
+
+The repo also rebuilds every engine change we serve. Layout and the optimization workflow: `docs/architecture.md`.
+
+- `profiles.toml`: the profiles and stacks this machine serves, paths as `${LCT_HOME}/...`.
+- `engines/<engine>/`: pin, patches or kernels, `build.sh`, README. `experiments/`: research tools, any method.
+- `tmp/` (`$LCT_HOME`): downloads, builds, logs, scratch. Never the only copy of something a profile needs.
 
 Model recommendations and tuning methodology belong in `skills/`, not Python heuristics.
 
@@ -50,6 +56,7 @@ uv run lct tui         # the terminal UI
 - Do not add dependencies unless the standard library or an existing dependency cannot do the job.
 - **Never run long GPU benchmarks unprompted.** The host has crashed under sustained load. Short model loads are fine.
 - Never weaken a test, type or check to get green.
+- **Adopt = reproducible.** A change is adopted only when `engines/` rebuilds it and `profiles.toml` points at it, with a `DECISIONS.md` line. Experiment any way you like first.
 
 ## Writing rules
 

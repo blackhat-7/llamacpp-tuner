@@ -137,3 +137,17 @@ Same speed through `lct` (140 / 121 vs 143 / 121 t/s short) and no CPU core spin
 ## 2026-11-22: lct translates Anthropic's Messages API for Loom and queues its generations
 claude-local needs `/v1/messages` and reads the context window from `meta.n_ctx`; Loom has neither. `messages.py` (stdlib only) serves both on the public port and forwards the rest; no LiteLLM-style dependency, and no client change on the Mac.
 Two overlapping generations make Loom reserve 4 GB more, fail and drop its model until restart (reproduced), so the translator sends generations one at a time. Token counting runs beside a generation safely.
+
+## 2026-11-22: Profiles live in `profiles.toml` in git, with paths as `${LCT_HOME}/...`
+The profiles a machine serves must survive a fresh clone; `tmp/aliases.toml` was the only copy. lct expands `${LCT_HOME}` on read and writes cache-dir paths back that way, so TUI edits and `lct import` keep the file portable.
+With `LCT_HOME` set, or for an installed lct, profiles stay in `$LCT_HOME/aliases.toml` (tests use this). The old file is `tmp/aliases.toml.before-profiles-2026-11-22`.
+
+## 2026-11-22: Engine changes live in `engines/<engine>/`: an exact pin, our changes, `build.sh`
+Patches against the upstream tag (`git format-patch`) instead of a pushed fork: one repo to clone, diffs to review, no second remote to keep alive. Builds install under `$LCT_HOME`; a changed build gets a new name, so profiles roll back by path.
+An optimization counts as adopted only when its engine folder rebuilds it and a profile points at the output (`docs/architecture.md`).
+
+## 2026-11-22: Engines are modules in `llamacpp_tuner/backends/`, listed in `BACKENDS`
+Five engines in two months each touched `cli.py`, `servers.py` and setup. Now each module has `serve`, `setup` and `address`, and shared types live in `backends/base.py`; a new engine is one module and one registry line.
+
+## 2026-11-22: Strata run configs live in `$LCT_HOME/strata/configs/`; lct finds the Strata checkout from the config's `cwd`
+Configs no longer have to sit inside the checkout. On this PC they are symlinks to the configs in `~/Documents/projects/Strata/`, so nothing there moved.

@@ -1,6 +1,10 @@
 # lct
 
-A small wrapper for finding/building llama.cpp, downloading exact GGUF artifacts, and starting `llama-server`.
+A small tool that downloads exact model files and serves them through local engines: llama.cpp, Strata, Loom,
+Jeeves and ComfyUI (video). It runs several servers at once from saved profiles and has a terminal UI.
+
+The repo also rebuilds every engine change we serve: `engines/` holds the patches, kernels and build scripts, and
+`profiles.toml` the profiles. How the pieces fit and how to add an optimization: [`docs/architecture.md`](docs/architecture.md).
 
 Model selection and tuning live in reusable Agent Skills instead of Python heuristics:
 
@@ -70,22 +74,23 @@ lct serve /models/model.gguf --extra-args "-ngl all"
 lct models
 ```
 
-Save frequently used `serve` arguments as aliases in `aliases.toml` in the lct cache directory (see below):
+Save frequently used `serve` arguments as profiles. In a clone they live in `profiles.toml` at the repo root (in git); with `LCT_HOME` set, or for an installed lct, in `aliases.toml` in the cache directory (see below). Write paths inside the cache directory as `${LCT_HOME}/...`; lct fills it in when it reads the file and writes such paths back that way, so the file works on any machine:
 
 ```toml
 qwen = """owner/model-GGUF --quant Q6_K --ctx 32768 \
   --extra-args '-ngl all -fa on -ctk q8_0 -ctv q8_0'"""
+embed = "Qwen/Qwen3-Embedding-0.6B-GGUF --file Qwen3-Embedding-0.6B-Q8_0.gguf --server ${LCT_HOME}/llama.cpp-b12415-vk/llama-server --port 6870"
 ```
 
 Use `--env NAME=VALUE` (repeatable) for backend variables such as `GGML_VK_SUBALLOCATION_BLOCK_SIZE`; they go into llama-server's environment.
 Use `--server PATH` to run a different llama-server build for one profile, for example a pull-request branch that adds a model.
 `lct serve` keeps AMD GPUs powered while the server runs; `--no-keep-awake` turns that off for one profile. An AMD card that drives no display otherwise powers down after ~5 idle seconds and moves a Vulkan server's model to system RAM, which makes it 10-20% slower. lct holds a 1-byte ROCm allocation on each AMD card while the server runs, so the cards can sleep again once it stops. Without ROCm it does nothing.
 
-`lct serve qwen` then expands to those arguments. Options typed after the alias replace the alias's value for that option; `--extra-args` is replaced as a whole.
+`lct serve qwen` then expands to those arguments. Options typed after the profile name replace the profile's value for that option; `--extra-args` is replaced as a whole.
 
 ### Several servers at once
 
-A `[stacks]` table in `aliases.toml` names profiles that run together, such as a GPU chat model, a CPU side model and a CPU embedding model:
+A `[stacks]` table in the profiles file names profiles that run together, such as a GPU chat model, a CPU side model and a CPU embedding model:
 
 ```toml
 [stacks]
@@ -127,6 +132,8 @@ lct serve PostHog/jeeves --backend jeeves --ctx 4096 --port 6871 --extra-args '-
 ### Loom
 
 [Loom](https://github.com/ROCm/hrx-system) is AMD's inference engine. `--backend loom` runs `loom-serve` on a Loom model package, a directory with a `model.json` card. The package's preset sets context, drafting and memory. lct expects `loom-serve` in a venv named `venv` beside the package.
+
+`lct setup --backend loom` (from a clone) runs `engines/loom/build.sh`: it installs Loom, fetches the Inkling-2-Mini package and applies our changes (8-bit KV cache, a faster attention kernel, a 4,096-token drafter window) into `loom/kv8w4096` in the cache directory, which the `inkling` profile serves. By hand, for the package as shipped:
 
 ```bash
 uv venv --python 3.12 ~/loom/venv && uv pip install --python ~/loom/venv/bin/python "hrx-loom[hf]==0.2.0"
@@ -183,6 +190,18 @@ It is keyboard-driven and never traps you in a text box: `1`–`5` switch pages,
 Profiles are the same aliases `lct serve <name>` uses. All output streams into the log at the bottom; server lines start with the profile name. Drag the `Output` rule with the mouse to resize the log.
 
 `serve` changes only options explicitly supplied; all others remain llama.cpp defaults. Use `--mmproj PATH` for a local vision model. Repository pulls download an unambiguous projector automatically unless `--no-mmproj` is given.
+
+### Engines with our changes
+
+`engines/` rebuilds the engine builds the profiles in `profiles.toml` use; each folder's README gives the pin, the changes and the checks ([`engines/README.md`](engines/README.md)):
+
+```bash
+uv run lct setup --backend strata          # engines/strata/build.sh: Strata v0.2.9 + our patches, run configs
+uv run lct setup --backend loom            # engines/loom/build.sh: the tuned Inkling-2-Mini package
+engines/llama.cpp/build.sh b12415-vk       # a named llama.cpp build that a profile points at
+```
+
+They target the hardware they were tuned on (an RX 7900 XTX, plus an RTX 4070 as Strata's helper); each README says which variables change that. Research tools live in [`experiments/`](experiments/README.md).
 
 A source checkout stores files in `tmp/`; an installed package uses `${XDG_CACHE_HOME:-~/.cache}/lct`. Set `LCT_HOME` to override either location.
 
