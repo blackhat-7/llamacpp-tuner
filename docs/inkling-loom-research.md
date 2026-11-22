@@ -101,6 +101,13 @@ kernel tests (a negative control each) in `experiments/inkling-loom/r2/`.
    round. TTFT 8K / 64K / 187K: 2.57 / 28.75 / 128.0 s -> 2.06 / 22.06 / 94.7 s. Global attention is ~28% of a
    64K read and ~53% of a 187K one, so a faster attention kernel is the next prefill lever.
 
+Quality, `experiments/inkling-loom/r2/quality/qa.py` (18 tasks with hidden checks: 6 Python functions run against
+asserts, a C++ LRU compiled and run, the code edit, 10 short reasoning questions; greedy, same session): round 1
+(`kv8w4096`) 17/18, round 2 (`kv8-r2`) 17/18. Both fail the same task the same way (the C++ answer omits `typename`
+before a dependent type), so no sign of degradation; the round 2 run took 87 s for 16,452 tokens vs 96 s for 13,131.
+Dense and MoE changes are bit-identical, attention and prefill change rounding only (kernel tests within one q8
+step / 2e-4), and the drafter cannot change output: the model verifies every token.
+
 Measured, not adopted:
 - **Reduced draft vocabulary** (32,768 most frequent tokens, 99.67% coverage on Inkling's own output): the draft
   head read drops 259 -> 42.5 MB a draft step (*est.* ~0.85 ms of a d3 step). Its kernel test passes, but the
