@@ -1,0 +1,43 @@
+{
+  "xtx": {
+    "service": "chat",
+    "variant": "gguf",
+    "programs": "source",
+    "execution": {
+      "rows": 1,
+      "context_capacity": 32768,
+      "prefill_capacity": 2048,
+      "max_tokens": 4096,
+      "draft_depth": 1,
+      "cache_target_bytes": 0
+    }
+  },
+  "xtx-nodraft": {
+    "service": "chat",
+    "variant": "gguf",
+    "programs": "source",
+    "execution": {
+      "rows": 1,
+      "context_capacity": 196608,
+      "prefill_capacity": 512,
+      "max_tokens": 4096,
+      "draft_depth": 0,
+      "cache_target_bytes": 0,
+      "prefix_cache_capacity": 1
+    }
+  },
+  "xtx-kv8-196k": {
+    "service": "chat",
+    "variant": "gguf",
+    "programs": "source",
+    "execution": {
+      "rows": 1,
+      "context_capacity": 196608,
+      "prefill_capacity": 512,
+      "max_tokens": 32768,
+      "draft_depth": 1,
+      "cache_target_bytes": 0,
+      "prefix_cache_capacity": 1
+    }
+  }
+}

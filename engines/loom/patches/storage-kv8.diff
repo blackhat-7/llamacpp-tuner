@@ -1,0 +1,26 @@
+--- a/program/storage.loom
++++ b/program/storage.loom
+@@ -1,4 +1,4 @@
+-// KV geometry: 16 planes (K and V per attention layer) of pool x 2048 bytes (F16 KV heads x head_dim).
++// KV geometry: 16 planes (K and V per attention layer) of pool x 1088 bytes (KV8: 8 heads x 128 int8 codes, then 32 f16 scales per 32-dim block).
+ // Recurrent slots: 174227456 bytes each (gated delta-net state of every recurrent layer; 4 = none).
+ // logits:begin
+ // A declaration: the one definition (default false) is in llm.loom; a second config.def of the key links ambiguously (LINK/MATERIALIZE).
+@@ -48,7 +48,7 @@
+   %fork_slots = scalar.addi %twice_rows, %pins : i64
+   %slots = scf.select %pinned, %fork_slots, %rows : i64
+   %private_bytes = scalar.muli %slots, %row_stride : i64
+-  %kv_position_bytes = scalar.constant 2048 : i64
++  %kv_position_bytes = scalar.constant 1088 : i64
+   %plane_count = scalar.constant 16 : i64
+   %plane_bytes = scalar.muli %pool, %kv_position_bytes : i64
+   %pool_bytes = scalar.muli %plane_bytes, %plane_count : i64
+@@ -188,7 +188,7 @@
+   view.store %c0_i64, %geometry_view[9] : i64, view<13xi64>
+   view.store %plane_count, %geometry_view[10] : i64, view<13xi64>
+   view.store %plane_bytes, %geometry_view[11] : i64, view<13xi64>
+-  %block_bytes = scalar.constant 32768 : i64
++  %block_bytes = scalar.constant 17408 : i64
+   view.store %block_bytes, %geometry_view[12] : i64, view<13xi64>
+   // second cache region: the drafter's K/V planes (allocation 9), same page geometry
+   %draft_origins = scf.if %on -> (buffer) {

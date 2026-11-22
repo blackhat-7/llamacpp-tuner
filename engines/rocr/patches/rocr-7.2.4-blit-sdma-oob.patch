@@ -1,0 +1,15 @@
+diff --git a/projects/rocr-runtime/runtime/hsa-runtime/core/inc/amd_blit_sdma.h b/projects/rocr-runtime/runtime/hsa-runtime/core/inc/amd_blit_sdma.h
+index 7d820c8..f2f9db0 100644
+--- a/projects/rocr-runtime/runtime/hsa-runtime/core/inc/amd_blit_sdma.h
++++ b/projects/rocr-runtime/runtime/hsa-runtime/core/inc/amd_blit_sdma.h
+@@ -239,7 +239,9 @@ template <bool useGCR> class BlitSdma : public BlitSdmaBase {
+     // Indexed by wrapped command queue indices (offsets).
+     uint64_t& operator[](uint32_t index) { return data_[convert(index)]; }
+ 
+-    void resize(size_t size) { data_.resize(convert(size)); }
++    // One spare slot: convert() rounds up, so an index in the ring's last 7 bytes (the engine's read
++    // pointer inside the end-of-ring padding, read by PendingBytes) maps to convert(size).
++    void resize(size_t size) { data_.resize(convert(size) + 1); }
+ 
+     void fill(uint32_t start, uint32_t stop, uint64_t value) {
+       for (uint32_t i = convert(start); i < convert(stop); i++) {
