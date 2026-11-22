@@ -1,0 +1,576 @@
+diff --git a/skills/loom-port-llm/starter/vision/add_vision.py b/skills/loom-port-llm/starter/vision/add_vision.py
+index ae3e183..73492eb 100644
+--- a/skills/loom-port-llm/starter/vision/add_vision.py
++++ b/skills/loom-port-llm/starter/vision/add_vision.py
+@@ -15,6 +15,7 @@ MARKERS = {
+     "qwen3vl_merger": ("<|vision_start|>", "<|vision_end|>"),
+     "qwen2.5vl_merger": ("<|vision_start|>", "<|vision_end|>"),
+     "muse-glimmer": ("<|image_start|>", "<|image_end|>"),
++    "inkling2v": ("<|content_image|>", ""),   # the chat program gives the image its own message block
+ }
+ # Kits whose chat program renders whole conversations: image requests use the generic per-message renderer;
+ # the generation prompt and the output parser's first state come from (generic state -> kit state map) or
+diff --git a/skills/loom-port-llm/starter/vision/build_vision.py b/skills/loom-port-llm/starter/vision/build_vision.py
+index edbd405..4a5cb69 100644
+--- a/skills/loom-port-llm/starter/vision/build_vision.py
++++ b/skills/loom-port-llm/starter/vision/build_vision.py
+@@ -163,8 +163,9 @@ def write_component(pkg, card, vcfg, vc, max_rows=None):
+     open(os.path.join(prog, "vision_prepare.loom"), "w").write(GC.prepare_program(vc, (side, side), vc["out_row"], max_rows))
+     open(os.path.join(prog, "vision_stages.loom"), "w").write(GC.stages_library())
+     # scratch at the largest size (bytes), for the memory forecast
+-    T = max_rows * F["merge"] ** 2; Tp = -(-T // 256) * 256; Mp = -(-max_rows // 64) * 64
+-    scratch = sum((Tp if r == "Tp" else Mp) * w * b for r, w, b in EN.buffer_exprs(vc).values()) + 4096 * (f * max_rows ** 0.5 + 64) * 3 * 2
++    T = max_rows * F["merge"] ** 2
++    rows = dict(Tp=-(-T // 256) * 256, T1p=-(-(T + 1) // 256) * 256, Mp=-(-max_rows // 64) * 64)
++    scratch = sum(rows[r] * w * b for r, w, b in EN.buffer_exprs(vc).values()) + 4096 * (f * max_rows ** 0.5 + 64) * 3 * 2
+     open(os.path.join(prog, "vision_control.loom"), "w").write(GC.control_program(vc, vc["out_row"], max_rows, int(scratch)))
+     if vcfg.get("source") == "safetensors":   # the tower's tensors are in the checkpoint files the package already links (no projector file)
+         files = [{"path": f"parameter/{n}", "format": "safetensors"} for n in vcfg["parameter_files"]]
+diff --git a/skills/loom-port-llm/starter/vision/encoder.py b/skills/loom-port-llm/starter/vision/encoder.py
+index 4c3b39a..7a1b2f7 100644
+--- a/skills/loom-port-llm/starter/vision/encoder.py
++++ b/skills/loom-port-llm/starter/vision/encoder.py
+@@ -7,7 +7,7 @@ except ImportError:
+     gguf = None
+ import gen_vision as G
+ 
+-FAMILIES = ("gemma4v", "qwen3vl_merger", "qwen2.5vl_merger", "muse-glimmer")
++FAMILIES = ("gemma4v", "qwen3vl_merger", "qwen2.5vl_merger", "muse-glimmer", "inkling2v")
+ QWEN_VL = ("qwen3vl_merger", "qwen2.5vl_merger")   # 2x2-block token order, vision M-RoPE, 2x2 merge MLP
+ 
+ def _kv(r, k, default=None):
+@@ -17,7 +17,7 @@ def _kv(r, k, default=None):
+     v = [f.parts[i].tolist()[0] for i in f.data]
+     return v[0] if len(v) == 1 else v
+ 
+-GGML_FMT = {"F16": "f16", "BF16": "bf16", "F32": "f32"}
++GGML_FMT = {"F16": "f16", "BF16": "bf16", "F32": "f32", "Q8_0": "q8_0"}
+ 
+ def config(path):
+     r = gguf.GGUFReader(path)
+@@ -45,7 +45,9 @@ def config(path):
+     elif _kv(r, "clip.vision.n_wa_pattern", 0):
+         c["wa_pattern"] = _kv(r, "clip.vision.n_wa_pattern")
+         c["window"] = 112 // c["patch"]   # llama.cpp: 112 pixels (attn_window_size unset for this family)
+-    c["act"] = "silu" if _kv(r, "clip.use_silu") else "gelu_tanh"   # ViT FFN (llama.cpp clip.use_silu / use_gelu)
++    c["act"] = "silu" if _kv(r, "clip.use_silu") else "gelu_tanh"
++    # inkling2v: a CLS token (kept as row T, after the T grid rows, so the grid keeps its token order) and LayerScale
++    c["cls"] = "v.class_embd" in tens   # ViT FFN (llama.cpp clip.use_silu / use_gelu)
+     # DeepStack (Qwen3-VL): ViT layers whose merged output goes through its own merger (v.deepstack.N.*); each
+     # output row is the main projection followed by one projection per such layer (llama.cpp concatenates them
+     # along the feature dimension), and the text model adds slice k+1 to its hidden state after layer k.
+@@ -79,7 +81,7 @@ class Plan:
+         s.ops.append((kern, grid, args))
+ 
+ def build(c):
+-    """Returns Plan. Runtime scalars: %T (tokens), %Tp (padded), %gw, %gh, %M (merged tokens), %Mp (padded),
++    """Returns Plan. Runtime scalars: %T (tokens), %Tp (padded), %T1 (T + 1, inkling2v's CLS row) and %T1p, %gw, %gh, %M (merged tokens), %Mp (padded),
+     %n_pix (h*w*3). Buffers: pix u8 -> pixf, h, x, q, k, v, o, a, f, g, xs, x16, sc, m_in, m1, m2, out."""
+     p = Plan(c); fam = c["family"]; E, NH, D, FF, P = c["E"], c["NH"], c["D"], c["ffn"], c["patch"]
+     W = lambda n: ("W", n)          # weight reference
+@@ -106,6 +108,8 @@ def build(c):
+         pk_ = p.k(G.place_cols(c["out"], c["out_row"], k * c["out"])); p.launch(pk_, [S(rows)], [S(rows), B(xbuf), B("out")])
+     def add(xbuf, ybuf, rows, width):
+         ak = p.k(G.ew("add")); p.launch(ak, [S(f"{rows}*{width}")], [S(f"{rows}*{width}"), B(xbuf), B(ybuf), B(xbuf)])
++    if fam == "inkling2v":
++        return _inkling2v(c, p, lin, norm)
+     # --- pixels + patch embedding + positions ---
+     order = "block2" if fam in QWEN_VL else "raster"
+     def nmode(w):   # LayerNorm when the norm has a bias, else RMSNorm with weight (Qwen2.5-VL)
+@@ -198,14 +202,57 @@ def build(c):
+         lin("m2", h2, c["out"], "mm.2.weight", "out", "M")
+     return p
+ 
++def _inkling2v(c, p, lin, norm):
++    """llama.cpp tools/mtmd/models/inkling2v.cpp: patches (block2 order, so a 2x2 merge group is 4 adjacent rows) +
++    bilinear positions, CLS row last, pre-LayerNorm, LayerNorm blocks with biases, 2-D RoPE on the grid rows
++    (1-indexed; CLS stays at position 0 = unrotated), LayerScale on both branches; the merge reads the grid rows
++    as [M, 4E] (llama.cpp build_patch_merge_permute order), then mm.1 -> GELU(erf) -> mm.2."""
++    E, NH, D, FF, P = c["E"], c["NH"], c["D"], c["ffn"], c["patch"]
++    W = lambda n: ("W", n); B = lambda n: ("B", n); S = lambda n: ("S", n)
++    order = "block2"
++    pk = p.k(G.pad_pixels(c["mean"], c["std"], P * c["merge"]))
++    p.launch(pk, [S("n_pix")], [S("n_pix"), S("img_w"), S("img_h"), B("input"), B("pix"), B("pixf")])
++    pe = p.k(G.patch_embed(P, E, fmt_of(c, "v.patch_embd.weight"), order))
++    p.launch(pe, [S("T")], [S("T"), S("gw"), S("img_w"), B("pixf"), W("v.patch_embd.weight"), B("h")])
++    pk2 = p.k(G.pos_interp(E, c["pos_n"], order, align_corners=False))
++    p.launch(pk2, [S("T")], [S("T"), S("gw"), S("gh"), W("v.position_embd.weight"), B("h")])
++    ck = p.k(G.cls_row(E)); p.launch(ck, [S("1")], [S("T"), W("v.class_embd"), W("v.class_position_embd.weight"), B("h")])
++    norm("h", "h", "T1", E, "ln", "v.pre_ln.weight", "v.pre_ln.bias")
++    rk = p.k(G.rope("normal_halves", D, NH, E, 0, order))
++    ak = p.k(G.attention(D, NH, E, 0, 0, 0, D ** -0.5))
++    adds = p.k(G.bias_scale_add(E))
++    for i in range(c["layers"]):
++        b = f"v.blk.{i}."
++        norm("h", "x", "T1", E, "ln", b + "ln1.weight", b + "ln1.bias")
++        for nm, buf in (("attn_q", "q"), ("attn_k", "k"), ("attn_v", "v")):
++            lin("x", E, E, b + nm + ".weight", buf, "T1", bias=b + nm + ".bias")
++        for buf in ("q", "k"):
++            p.launch(rk, [S("T")], [S("T"), S("gw"), B(buf)])
++        p.launch(ak, [S("T1")], [S("T1"), S("gw"), B("q"), B("k"), B("v"), B("o")])
++        lin("o", E, E, b + "attn_out.weight", "a", "T1")
++        p.launch(adds, [S("T1")], [S("T1"), B("a"), W(b + "attn_out.bias"), W(b + "ls1.weight"), B("h")])
++        norm("h", "x", "T1", E, "ln", b + "ln2.weight", b + "ln2.bias")
++        lin("x", E, FF, b + "ffn_up.weight", "f", "T1", act="gelu_erf", bias=b + "ffn_up.bias")
++        lin("f", FF, E, b + "ffn_down.weight", "a", "T1")
++        p.launch(adds, [S("T1")], [S("T1"), B("a"), W(b + "ffn_down.bias"), W(b + "ls2.weight"), B("h")])
++    hid = c["tensors"]["mm.1.weight"]["shape"][1]
++    lin("h", 4 * E, hid, "mm.1.weight", "m1", "M", act="gelu_erf", bias="mm.1.bias")
++    lin("m1", hid, c["out"], "mm.2.weight", "out", "M", bias="mm.2.bias")
++    return p
++
+ def buffers(c, T, M):
+     """Element counts (f32 unless noted) per buffer for T tokens / M merged tokens (rows padded)."""
+-    Tp = -(-T // 256) * 256; Mp = -(-M // 64) * 64
+-    return {n: (Tp if r == "Tp" else Mp) * w for n, (r, w, _) in buffer_exprs(c).items()}
++    Tp = -(-T // 256) * 256; Mp = -(-M // 64) * 64; T1p = -(-(T + 1) // 256) * 256
++    return {n: {"Tp": Tp, "T1p": T1p, "Mp": Mp}[r] * w for n, (r, w, _) in buffer_exprs(c).items()}
+ 
+ def buffer_exprs(c):
+-    """name -> (rows variable 'Tp' | 'Mp', width in elements, bytes per element) for the command program."""
++    """name -> (rows variable 'Tp' | 'T1p' | 'Mp', width in elements, bytes per element) for the command program."""
+     E, FF = c["E"], c["ffn"]
++    if c["family"] == "inkling2v":   # T + 1 rows (CLS); separate q/k/v, no gate, clamp or shuffle buffers
++        hid = c["tensors"]["mm.1.weight"]["shape"][1]
++        return dict(h=("T1p", E, 4), x=("T1p", E, 4), q=("T1p", E, 4), k=("T1p", E, 4), v=("T1p", E, 4), o=("T1p", E, 4),
++                    a=("T1p", E, 4), f=("T1p", FF, 4), x16=("T1p", max(FF, 4 * E, hid), 2), sc=("T1p", 2, 4),
++                    m1=("Mp", hid, 4), out=("Mp", c["out"], 4))
+     mats = ["mm.0.weight", "mm.1.weight"] + [f"v.deepstack.{i}.fc1.weight" for i in c.get("deepstack", [])]
+     hid = max([c["tensors"][n]["shape"][1] for n in mats if n in c["tensors"]] + [1])
+     wide = max(FF, 3 * E, E * c["merge"] ** 2, hid, c["out"])
+diff --git a/skills/loom-port-llm/starter/vision/gen_chat_vision.py b/skills/loom-port-llm/starter/vision/gen_chat_vision.py
+index ad3e793..1fe832b 100644
+--- a/skills/loom-port-llm/starter/vision/gen_chat_vision.py
++++ b/skills/loom-port-llm/starter/vision/gen_chat_vision.py
+@@ -94,6 +94,30 @@ func.def @vision_glimmer_pick(%hf: f64, %hc: f64, %wf: f64, %wc: f64, %ar: f64,
+   func.return %h4, %w4, %d4, %f4 : f64, f64, f64, i1
+ }}
+ '''
++    if fam == "inkling2v":
++        # the size rounded up to f (the image is padded, not resized) while that is within tmax tokens, else resized
++        # to the usual rule (llama.cpp mtmd_image_preprocessor_inkling2v + calc_size_preserved_ratio, no minimum)
++        return f'''func.def @vision_geometry(%w: i32, %h: i32) -> (i32, i32, i32) {{
++  %fi = scalar.constant {f} : i32
++  %fm1 = scalar.constant {f - 1} : i32
++  %mx = scalar.constant {tmax * f * f} : i32
++  %wu = scalar.addi %w, %fm1 : i32
++  %hu = scalar.addi %h, %fm1 : i32
++  %wq = scalar.divui %wu, %fi : i32
++  %hq = scalar.divui %hu, %fi : i32
++  %aw = scalar.muli %wq, %fi : i32
++  %ah = scalar.muli %hq, %fi : i32
++  %area = scalar.muli %aw, %ah : i32
++  %fits = scalar.cmpi ule, %area, %mx : i32
++  %rw, %rh, %rrows = func.call @vision_geometry_resized(%w, %h) : (i32, i32) -> (i32, i32, i32)
++  %tw = scf.select %fits, %aw, %rw : i32
++  %th = scf.select %fits, %ah, %rh : i32
++  %rows0 = scalar.muli %wq, %hq : i32
++  %rows = scf.select %fits, %rows0, %rrows : i32
++  func.return %tw, %th, %rows : i32, i32, i32
++}}
++
++''' + geometry("resized", P, m, 0, tmax, half_even).replace("@vision_geometry(", "@vision_geometry_resized(", 1)
+     rnd = "scalar.roundevenf" if half_even else "scalar.roundf"
+     return f'''func.def @vision_geometry(%w: i32, %h: i32) -> (i32, i32, i32) {{
+   %ff = scalar.constant {float(f)} : f32
+diff --git a/skills/loom-port-llm/starter/vision/gen_component.py b/skills/loom-port-llm/starter/vision/gen_component.py
+index bc096ce..7b90e94 100644
+--- a/skills/loom-port-llm/starter/vision/gen_component.py
++++ b/skills/loom-port-llm/starter/vision/gen_component.py
+@@ -102,7 +102,8 @@ def copy_kernel():
+ '''
+ 
+ 
+-FILTER = {"gemma4v": "bicubic", "qwen3vl_merger": "bicubic", "qwen2.5vl_merger": "bicubic", "muse-glimmer": "lanczos"}
++FILTER = {"gemma4v": "bicubic", "qwen3vl_merger": "bicubic", "qwen2.5vl_merger": "bicubic", "muse-glimmer": "lanczos",
++          "inkling2v": "bicubic"}
+ 
+ 
+ def encoder_program(c, max_side=4096):
+@@ -137,7 +138,7 @@ command.def public @vision_encode() launch(%weights: buffer, %input: buffer, %ou
+   %T_up = index.add %T, %c255 : index
+   %T_t = index.div %T_up, %c256 : index
+   %Tp = index.mul %T_t, %c256 : index
+-  %M_up = index.add %M, %c63 : index
++{{cls}}  %M_up = index.add %M, %c63 : index
+   %M_t = index.div %M_up, %c64 : index
+   %Mp = index.mul %M_t, %c64 : index
+   %NH = index.constant {c["NH"]} : index
+@@ -145,7 +146,11 @@ command.def public @vision_encode() launch(%weights: buffer, %input: buffer, %ou
+   %n_pix = index.mul %img_px, %c3 : index
+   %max_rows = index.constant {max_side} : index
+   %hdr_bytes = index.constant 64 : offset
+-  %zero_o = index.constant 0 : offset''']
++  %zero_o = index.constant 0 : offset'''.replace("{cls}", '''  %T1 = index.add %T, %c1 : index
++  %T1_up = index.add %T1, %c255 : index
++  %T1_t = index.div %T1_up, %c256 : index
++  %T1p = index.mul %T1_t, %c256 : index
++''' if c.get("cls") else "")]
+     sizes = EN.buffer_exprs(c)
+     for name, (rows, width, bytes_per) in sizes.items():
+         L.append(f"  %{name}_w = index.constant {width} : index")
+@@ -177,7 +182,7 @@ command.def public @vision_encode() launch(%weights: buffer, %input: buffer, %ou
+     consts = {}
+     def scalar(expr):
+         """index SSA for a plan scalar expression."""
+-        if expr in ("T", "Tp", "M", "Mp", "gw", "gh", "n_pix", "NH"):
++        if expr in ("T", "Tp", "T1", "T1p", "M", "Mp", "gw", "gh", "n_pix", "NH", "img_h"):
+             return "%" + expr
+         if expr == "img_w":
+             return "%img_w"
+diff --git a/skills/loom-port-llm/starter/vision/gen_vision.py b/skills/loom-port-llm/starter/vision/gen_vision.py
+index 5de878b..6ad143f 100644
+--- a/skills/loom-port-llm/starter/vision/gen_vision.py
++++ b/skills/loom-port-llm/starter/vision/gen_vision.py
+@@ -1302,3 +1302,178 @@ $STORES
+         src = src.replace("    %col = index.div %i, %out_n : index", "    %o_v = index.div %i, %other : index\n    %col = index.rem %i, %other : index").replace("    %o = index.rem %i, %out_n : index\n", "")
+         src = src.replace("%oi = index.cast %o : index to i32", "%oi = index.cast %o_v : index to i32").replace("%dst_idx = index.madd %o, %cols, %col : index", "%dst_idx = index.madd %o_v, %other, %col : index").replace("%src_idx = index.madd %xi, %cols, %col : index", "%src_idx = index.madd %xi, %other, %col : index")
+     return name, src
++
++# ---- inkling2v: CLS row, layer-scaled residual adds, padded pixels ----
++def cls_row(E):
++    """y[row] = cls + cls_pos (the CLS token, kept as the last row so grid rows keep their token order)."""
++    name = f"v_cls_row_{E}"
++    return name, T('''kernel.def export("$NAME") @$NAME(%one: index) {
++  %c1 = index.constant 1 : index
++  %c256 = index.constant 256 : index
++  kernel.launch.config workgroups(%one, %c1, %c1) workgroup_size(%c256, %c1, %c1) : index
++} launch(%row_arg: index, %cls: buffer, %pos: buffer, %y: buffer) {
++  %row = index.assume %row_arg [range(%row_arg, 0, $MAXROWS)] : index
++  %c1 = index.constant 1 : index
++  %rows = index.add %row, %c1 : index
++  %lid = kernel.workitem.id<x> : index
++  %lane = index.assume %lid [range(%lid, 0, 255)] : index
++  %zero = index.constant 0 : offset
++  %c256 = index.constant 256 : index
++  %cE = index.constant $E : index
++  %cv = buffer.view %cls[%zero] : buffer -> view<$Exf32>
++  %pv = buffer.view %pos[%zero] : buffer -> view<$Exf32>
++  %yv = buffer.view %y[%zero] : buffer -> view<[%rows]x$Exf32>
++  %br = index.assume %row [lt(%row, %rows)] : index
++  scf.for %e = [%lane to %cE step %c256] {
++    %be = index.assume %e [lt(%e, %cE)] : index
++    %a = view.load %cv[%be] : view<$Exf32> -> f32
++    %b = view.load %pv[%be] : view<$Exf32> -> f32
++    %s = scalar.addf %a, %b : f32
++    view.store %s, %yv[%br, %be] : f32, view<[%rows]x$Exf32>
++  }
++  kernel.return
++}
++''', NAME=name, E=E, MAXROWS=MAXROWS)
++
++def bias_scale_add(N):
++    """h[r, c] += (x[r, c] + b[c]) * s[c]: a linear's bias, LayerScale and the residual add in one pass."""
++    name = f"v_bias_scale_add_{N}"
++    return name, T('''kernel.def export("$NAME") @$NAME(%rows: index) {
++  %c1 = index.constant 1 : index
++  %c256 = index.constant 256 : index
++  %cg = index.constant $CG : index
++  kernel.launch.config workgroups(%rows, %cg, %c1) workgroup_size(%c256, %c1, %c1) : index
++} launch(%rows_arg: index, %x: buffer, %bias: buffer, %scale: buffer, %h: buffer) {
++  %rows = index.assume %rows_arg [range(%rows_arg, 1, $MAXROWS)] : index
++  %c256 = index.constant 256 : index
++  %cols = index.constant $N : index
++  %row_id = kernel.workgroup.id<x> : index
++  %row = index.assume %row_id [lt(%row_id, %rows)] : index
++  %cg = kernel.workgroup.id<y> : index
++  %lid = kernel.workitem.id<x> : index
++  %c = index.madd %cg, %c256, %lid : index
++  %live = index.cmp ult, %c, %cols : index
++  scf.if %live {
++    %bc = index.assume %c [lt(%c, %cols)] : index
++    %zero = index.constant 0 : offset
++    %xv = buffer.view %x[%zero] : buffer -> view<[%rows]x$Nxf32>
++    %hv = buffer.view %h[%zero] : buffer -> view<[%rows]x$Nxf32>
++    %bv = buffer.view %bias[%zero] : buffer -> view<$Nxf32>
++    %sv = buffer.view %scale[%zero] : buffer -> view<$Nxf32>
++    %x0 = view.load %xv[%row, %bc] : view<[%rows]x$Nxf32> -> f32
++    %b0 = view.load %bv[%bc] : view<$Nxf32> -> f32
++    %s0 = view.load %sv[%bc] : view<$Nxf32> -> f32
++    %h0 = view.load %hv[%row, %bc] : view<[%rows]x$Nxf32> -> f32
++    %a = scalar.addf %x0, %b0 : f32
++    %r = scalar.fmaf %a, %s0, %h0 : f32
++    view.store %r, %hv[%row, %bc] : f32, view<[%rows]x$Nxf32>
++  }
++  kernel.return
++}
++''', NAME=name, N=N, CG=(N + 255) // 256, MAXROWS=MAXROWS)
++
++def pad_pixels(mean, std, align):
++    """inkling2v preprocessing (llama.cpp mtmd_image_preprocessor_inkling2v): an image whose size rounded up to
++    `align` is the processed size is not resized; it sits at the top left and the rest is the value -1 before
++    normalization. A larger image was resized to the processed size (`pix`, the resize passes' output).
++    input: the payload (device header [src_w, src_h, channels, pixel offset, ...] + pixels); output f32 [h, w, 3]."""
++    name = "v_pad_pixels_" + "_".join(f"{m:g}" for m in mean).replace(".", "p") + f"_a{align}"
++    a = [1.0 / 255.0 / s for s in std]; b = [-m / s for m, s in zip(mean, std)]
++    src = T('''kernel.def export("$NAME") @$NAME(%n: index) {
++  %c1 = index.constant 1 : index
++  %c256 = index.constant 256 : index
++  %c255 = index.constant 255 : index
++  %n_up = index.add %n, %c255 : index
++  %groups = index.div %n_up, %c256 : index
++  kernel.launch.config workgroups(%groups, %c1, %c1) workgroup_size(%c256, %c1, %c1) : index
++} launch(%n_arg: index, %img_w_arg: index, %img_h_arg: index, %input: buffer, %pix: buffer, %y: buffer) {
++  %n = index.assume %n_arg [range(%n_arg, 1, 268435456)] : index
++  %img_w = index.assume %img_w_arg [range(%img_w_arg, 1, 16384)] : index
++  %img_h = index.assume %img_h_arg [range(%img_h_arg, 1, 16384)] : index
++  %c0 = index.constant 0 : index
++  %c1 = index.constant 1 : index
++  %c3 = index.constant 3 : index
++  %c256 = index.constant 256 : index
++  %zero = index.constant 0 : offset
++  %hv = buffer.view %input[%zero] : buffer -> view<16xi32>
++  %sw32 = view.load %hv[0] : view<16xi32> -> i32
++  %sh32 = view.load %hv[1] : view<16xi32> -> i32
++  %cin32 = view.load %hv[2] : view<16xi32> -> i32
++  %pix32 = view.load %hv[3] : view<16xi32> -> i32
++  %swb = scalar.assume %sw32 [range(%sw32, 1, 16384)] : i32
++  %shb = scalar.assume %sh32 [range(%sh32, 1, 16384)] : i32
++  %cinb = scalar.assume %cin32 [range(%cin32, 3, 4)] : i32
++  %pixb = scalar.assume %pix32 [range(%pix32, 0, 2147483647)] : i32
++  %src_w = index.cast %swb : i32 to index
++  %src_h = index.cast %shb : i32 to index
++  %cin = index.cast %cinb : i32 to index
++  %pix_at = index.cast %pixb : i32 to index
++  %calign = index.constant $ALIGN : index
++  %calign1 = index.constant $ALIGNM1 : index
++  %wu = index.add %src_w, %calign1 : index
++  %wq = index.div %wu, %calign : index
++  %aw = index.mul %wq, %calign : index
++  %hu = index.add %src_h, %calign1 : index
++  %hq = index.div %hu, %calign : index
++  %ah = index.mul %hq, %calign : index
++  %same_w = index.cmp eq, %aw, %img_w : index
++  %same_h = index.cmp eq, %ah, %img_h : index
++  %padded = scalar.andi %same_w, %same_h : i1
++  %gid = kernel.workgroup.id<x> : index
++  %lid = kernel.workitem.id<x> : index
++  %i = index.madd %gid, %c256, %lid : index
++  %live = index.cmp ult, %i, %n : index
++  scf.if %live {
++    %bi = index.assume %i [lt(%i, %n)] : index
++    %ch = index.rem %bi, %c3 : index
++    %px = index.div %bi, %c3 : index
++    %x = index.rem %px, %img_w : index
++    %yy = index.div %px, %img_w : index
++    %in_x = index.cmp ult, %x, %src_w : index
++    %in_y = index.cmp ult, %yy, %src_h : index
++    %inside = scalar.andi %in_x, %in_y : i1
++    %minus_one = scalar.constant -1.0 : f32
++    %f = scf.if %padded -> (f32) {
++      %v = scf.if %inside -> (f32) {
++        %sp = index.madd %yy, %src_w, %x : index
++        %se0 = index.mul %sp, %cin : index
++        %se1 = index.add %se0, %ch : index
++        %se = index.add %se1, %pix_at : index
++        %pn = index.constant 2147483647 : index
++        %bse = index.assume %se [lt(%se, %pn)] : index
++        %sv = buffer.view %input[%zero] : buffer -> view<[%pn]xi8>
++        %raw = view.load %sv[%bse] : view<[%pn]xi8> -> i8
++        %u = scalar.extui %raw : i8 to i32
++        %uf = scalar.uitofp %u : i32 to f32
++        scf.yield %uf : f32
++      } else {
++        scf.yield %minus_one : f32
++      }
++      scf.yield %v : f32
++    } else {
++      %pv = buffer.view %pix[%zero] : buffer -> view<[%n]xi8>
++      %raw = view.load %pv[%bi] : view<[%n]xi8> -> i8
++      %u = scalar.extui %raw : i8 to i32
++      %uf = scalar.uitofp %u : i32 to f32
++      scf.yield %uf : f32
++    }
++    %is0 = index.cmp eq, %ch, %c0 : index
++    %is1 = index.cmp eq, %ch, %c1 : index
++    %a0 = scalar.constant $A0 : f32
++    %a1 = scalar.constant $A1 : f32
++    %a2 = scalar.constant $A2 : f32
++    %b0 = scalar.constant $B0 : f32
++    %b1 = scalar.constant $B1 : f32
++    %b2 = scalar.constant $B2 : f32
++    %a12 = scf.select %is1, %a1, %a2 : f32
++    %a = scf.select %is0, %a0, %a12 : f32
++    %b12 = scf.select %is1, %b1, %b2 : f32
++    %b = scf.select %is0, %b0, %b12 : f32
++    %r = scalar.fmaf %f, %a, %b : f32
++    %yv = buffer.view %y[%zero] : buffer -> view<[%n]xf32>
++    view.store %r, %yv[%bi] : f32, view<[%n]xf32>
++  }
++  kernel.return
++}
++''', NAME=name, ALIGN=align, ALIGNM1=align - 1, A0=repr(a[0]), A1=repr(a[1]), A2=repr(a[2]), B0=repr(b[0]), B1=repr(b[1]), B2=repr(b[2]))
++    return name, src
+diff --git a/skills/loom-port-llm/starter/vision/preprocess.py b/skills/loom-port-llm/starter/vision/preprocess.py
+index 98be6cc..55f059d 100644
+--- a/skills/loom-port-llm/starter/vision/preprocess.py
++++ b/skills/loom-port-llm/starter/vision/preprocess.py
+@@ -9,6 +9,8 @@ FAMILY = {
+     "qwen3vl_merger": dict(merge=2, tokens=(8, 4096),  filt="bicubic", half_even=True),
+     "qwen2.5vl_merger": dict(merge=2, tokens=(8, 4096), filt="bicubic", half_even=True),
+     "muse-glimmer":   dict(merge=2, tokens=(1, 4096),  filt="lanczos", half_even=False),
++    # llama.cpp allows 4096 tokens; 1024 here (llama.cpp --image-max-tokens 1024) keeps the encoder's scratch small
++    "inkling2v":      dict(merge=2, tokens=(1, 1024),  filt="bicubic", half_even=False, pad=True),
+ }
+ 
+ def target_size(w, h, patch, merge, tmin, tmax, half_even):
+@@ -68,6 +70,17 @@ def resize(img, w, h, filt):
+     return img
+ 
+ def preprocess(img_u8, family, patch):
+-    """uint8 [H, W, 3] -> float32 [h, w, 3] in [0, 1] at the processed size (normalization is the encoder's)."""
+-    F = FAMILY[family]; w, h = target_size(img_u8.shape[1], img_u8.shape[0], patch, F["merge"], *F["tokens"], F["half_even"])
++    """uint8 [H, W, 3] -> float32 [h, w, 3] in [0, 1] at the processed size (normalization is the encoder's).
++    inkling2v pads instead of resizing (llama.cpp mtmd_image_preprocessor_inkling2v): the image is rounded up to
++    patch x merge with -1 / 255 (-1 before normalization), unless that exceeds the token limit (then resized)."""
++    F = FAMILY[family]
++    if F.get("pad"):
++        f = patch * F["merge"]; h0, w0 = img_u8.shape[:2]; w, h = -(-w0 // f) * f, -(-h0 // f) * f
++        if w * h <= F["tokens"][1] * f * f:
++            out = np.full((h, w, 3), -1.0 / 255.0, np.float32)
++            out[:h0, :w0] = img_u8.astype(np.float32) / 255.0
++            return out
++        w, h = target_size(w0, h0, patch, F["merge"], 0, F["tokens"][1], False)
++        return resize(img_u8, w, h, F["filt"]).astype(np.float32) / 255.0
++    w, h = target_size(img_u8.shape[1], img_u8.shape[0], patch, F["merge"], *F["tokens"], F["half_even"])
+     return resize(img_u8, w, h, F["filt"]).astype(np.float32) / 255.0
+diff --git a/skills/loom-port-llm/starter/vision/ref_vit.py b/skills/loom-port-llm/starter/vision/ref_vit.py
+index a128b39..45f7de2 100644
+--- a/skills/loom-port-llm/starter/vision/ref_vit.py
++++ b/skills/loom-port-llm/starter/vision/ref_vit.py
+@@ -6,6 +6,8 @@ def load(path):
+     r = gguf.GGUFReader(path); W = {}; KV = {}
+     for t in r.tensors:
+         a = np.array(t.data)
++        if t.tensor_type.name not in ("F32", "F16", "BF16"):   # quantized (Q8_0): dequantize to F32
++            a = gguf.quants.dequantize(a, t.tensor_type)
+         if t.tensor_type.name == "BF16":
+             a = (a.view(np.uint16).astype(np.uint32) << 16).view(np.float32)
+         W[t.name] = a.astype(np.float32).reshape([int(x) for x in reversed(t.shape)]) if a.ndim == 1 or True else a
+@@ -222,8 +224,42 @@ def bilinear_hp(grid, oh, ow):
+     fy = (ys - y0)[:, None, None]; fx = (xs - x0)[None, :, None]; g = grid
+     return ((g[y0][:, x0] * (1 - fx) + g[y0][:, x1] * fx) * (1 - fy) + (g[y1][:, x0] * (1 - fx) + g[y1][:, x1] * fx) * fy).astype(np.float32)
+ 
++def inkling2v(W, KV, img, normalized=False):
++    """llama.cpp tools/mtmd/models/inkling2v.cpp. img: float32 [H, W, 3] at the processed size (padding included)."""
++    P = KV["clip.vision.patch_size"]; E = KV["clip.vision.embedding_length"]; NH = KV["clip.vision.attention.head_count"]
++    eps = KV.get("clip.vision.attention.layer_norm_epsilon", 1e-5); D = E // NH; m = KV.get("clip.vision.spatial_merge_size", 2)
++    x = img if normalized else (img - np.array(KV["clip.vision.image_mean"], np.float32)) / np.array(KV["clip.vision.image_std"], np.float32)
++    Hh, Ww = x.shape[0] // P, x.shape[1] // P
++    patches = x.reshape(Hh, P, Ww, P, 3).transpose(0, 2, 4, 1, 3).reshape(Hh * Ww, 3 * P * P)
++    h = patches @ W["v.patch_embd.weight"].reshape(E, -1).T
++    n = int(round(math.sqrt(W["v.position_embd.weight"].shape[0])))
++    pe = W["v.position_embd.weight"].reshape(n, n, E)
++    h = h + bilinear_hp(pe, Hh, Ww).reshape(Hh * Ww, E)
++    h = np.concatenate([(W["v.class_embd"] + W["v.class_position_embd.weight"]).reshape(1, E), h])   # CLS first, as llama.cpp
++    h = ln(h, W["v.pre_ln.weight"], W["v.pre_ln.bias"], eps)
++    ys = np.concatenate([[0.0], np.repeat(np.arange(Hh), Ww) + 1.0]); xs = np.concatenate([[0.0], np.tile(np.arange(Ww), Hh) + 1.0])
++    half = D // 2; inv = 10000.0 ** (-2.0 * np.arange(half // 2) / half)
++    def rope_norm(t, pos):  # adjacent pairs within t[..., :half]
++        ang = pos[:, None] * inv[None]; c, s_ = np.cos(ang).astype(np.float32), np.sin(ang).astype(np.float32)
++        a, b = t[..., 0::2], t[..., 1::2]; out = np.empty_like(t); out[..., 0::2] = a * c - b * s_; out[..., 1::2] = a * s_ + b * c; return out
++    def rope(t):
++        return np.concatenate([rope_norm(t[..., :half], xs), rope_norm(t[..., half:], ys)], -1)
++    nb = len({k.split(".")[2] for k in W if k.startswith("v.blk.")})
++    for li in range(nb):
++        p = f"v.blk.{li}."
++        cur = ln(h, W[p + "ln1.weight"], W[p + "ln1.bias"], eps)
++        q, k, v = (Lin(W, p + nm)(cur).reshape(-1, NH, D).transpose(1, 0, 2) for nm in ("attn_q", "attn_k", "attn_v"))
++        q, k = rope(q), rope(k)
++        sc = q @ k.transpose(0, 2, 1) / math.sqrt(D); sc -= sc.max(-1, keepdims=True); a = np.exp(sc); a /= a.sum(-1, keepdims=True)
++        h = h + Lin(W, p + "attn_out")((a @ v).transpose(1, 0, 2).reshape(-1, E)) * W[p + "ls1.weight"]
++        cur = ln(h, W[p + "ln2.weight"], W[p + "ln2.bias"], eps)
++        h = tr(f"layer_out-{li}", h + Lin(W, p + "ffn_down")(gelu_erf(Lin(W, p + "ffn_up")(cur))) * W[p + "ls2.weight"])
++    g = h[1:].reshape(Hh // m, m, Ww // m, m, E).transpose(0, 2, 1, 3, 4).reshape(-1, m * m * E)   # [dy][dx][c] per 2x2 group
++    return Lin(W, "mm.2")(gelu_erf(Lin(W, "mm.1")(g)))
++
+ ENCODERS = {"muse-glimmer": lambda W, KV, img: muse_glimmer(W, KV, img, normalized=True), "gemma4v": gemma4v, "qwen3vl_merger": lambda W, KV, img: qwen_vl(W, KV, img, normalized=True)}
+ ENCODERS["qwen2.5vl_merger"] = ENCODERS["qwen3vl_merger"]
++ENCODERS["inkling2v"] = lambda W, KV, img: inkling2v(W, KV, img, normalized=True)
+ 
+ if __name__ == "__main__":
+     W, KV = load(sys.argv[1]); pt = KV.get("clip.vision.projector_type") or KV.get("clip.projector_type")
+diff --git a/skills/loom-port-llm/starter/vision/test_encoder.py b/skills/loom-port-llm/starter/vision/test_encoder.py
+index efbe42f..7618c96 100644
+--- a/skills/loom-port-llm/starter/vision/test_encoder.py
++++ b/skills/loom-port-llm/starter/vision/test_encoder.py
+@@ -17,13 +17,17 @@ d = os.environ.get("VISION_TEST_DIR", os.path.join(__import__("tempfile").gettem
+ rng = np.random.default_rng(5)
+ # smooth synthetic image (u8)
+ yy, xx = np.mgrid[0:H, 0:Wd]; img = np.stack([(127 + 120 * np.sin(xx / 7.0)), (127 + 120 * np.cos(yy / 5.0)), ((xx + yy) % 256)], -1).astype(np.uint8)
+-vals = dict(T=T, Tp=-(-T // 256) * 256, M=M, Mp=-(-M // 64) * 64, gw=gw, gh=gh, img_w=Wd, n_pix=H * Wd * 3, NH=c["NH"])
++vals = dict(T=T, Tp=-(-T // 256) * 256, T1=T + 1, T1p=-(-(T + 1) // 256) * 256, M=M, Mp=-(-M // 64) * 64, gw=gw, gh=gh, img_w=Wd, img_h=H, n_pix=H * Wd * 3, NH=c["NH"])
+ def ev(expr):
+-    return int(eval(expr.replace("Tp", str(vals["Tp"])).replace("Mp", str(vals["Mp"])), {}, {k: v for k, v in vals.items()}))
++    return int(eval(expr, {}, dict(vals)))
+ raw = st_load.raw_weights([path], vis) if ST else {t.name: np.array(t.data).reshape(-1).view(np.int8) for t in gguf.GGUFReader(path).tensors}
+ cs = V.Case("t_encoder_" + c["family"].replace("-", "_"), d)
+ bufs = {n: cs.out((sz,), "f16" if n == "x16" else "f32") for n, sz in EN.buffers(c, T, M).items()}
+ bufs["pix"] = cs.arr(img.reshape(-1)); bufs["pixf"] = cs.out((H * Wd * 3,))
++if c["family"] == "inkling2v":   # padded, not resized: the source is smaller than the processed size (the encode payload)
++    img = img[: H - 11, : Wd - 17]
++    hdr = np.zeros(16, np.int32); hdr[:4] = (img.shape[1], img.shape[0], 3, 64)
++    bufs["input"] = cs.arr(np.concatenate([hdr.view(np.uint8), img.reshape(-1)]))
+ wts = {}; lits = {}
+ def arg(a):
+     kind, n = a
+@@ -36,9 +40,10 @@ def arg(a):
+     return lits[v]
+ for kern, grid, args in p.ops:
+     cs.launch(kern, [arg(g) for g in grid], [arg(a) for a in args])
+-pre = img.astype(np.float32) / 255.0
++import preprocess as PP
++pre = PP.preprocess(img, "inkling2v", P) if c["family"] == "inkling2v" else img.astype(np.float32) / 255.0
+ W_, KV = st_load.load([path], vis) if ST else R.load(path)
+-ref = {"gemma4v": R.gemma4v, "muse-glimmer": R.muse_glimmer}.get(c["family"], R.qwen_vl)(W_, KV, pre).astype(np.float32)
++ref = {"gemma4v": R.gemma4v, "muse-glimmer": R.muse_glimmer, "inkling2v": R.inkling2v}.get(c["family"], R.qwen_vl)(W_, KV, pre).astype(np.float32)
+ np.save(os.path.join(d, "ref.npy"), ref)
+ atol = float(sys.argv[4]) if len(sys.argv) > 4 else 0.05
+ RTOL = sys.argv[5] if len(sys.argv) > 5 else "5.0e-2"
+diff --git a/skills/loom-port-llm/starter/vision/tests/run_tests.sh b/skills/loom-port-llm/starter/vision/tests/run_tests.sh
+index 8f9e5a0..66b4041 100755
+--- a/skills/loom-port-llm/starter/vision/tests/run_tests.sh
++++ b/skills/loom-port-llm/starter/vision/tests/run_tests.sh
+@@ -5,7 +5,7 @@
+ here=$(cd "$(dirname "$0")" && pwd); T=${PY:-${LOOM_ROOT:-$HOME/loom}/.tools/bin/python}; bad=0
+ export VENV=${VENV:-${LOOM_ROOT:-$HOME/loom}/.venv}
+ cd "$here"
+-for t in test_basic test_gemm test_embed test_attn test_resize_hdr; do
++for t in test_basic test_gemm test_embed test_attn test_resize_hdr test_inkling; do
+   out=$("$T" "$t.py" 2>&1); echo "$out" | grep -E "^(PASS|FAIL|COMPILE)"; echo "$out" | grep -q -E "^(FAIL|COMPILE)" && bad=1
+ done
+ if [ -n "${1:-}" ]; then
+diff --git a/skills/loom-port-llm/starter/vision/tests/test_inkling.py b/skills/loom-port-llm/starter/vision/tests/test_inkling.py
+new file mode 100644
+index 0000000..b65a39b
+--- /dev/null
++++ b/skills/loom-port-llm/starter/vision/tests/test_inkling.py
+@@ -0,0 +1,28 @@
++"""inkling2v kernels vs NumPy: CLS row, bias + LayerScale + residual add, padded pixels (both paths)."""
++import os, sys, tempfile
++import numpy as np
++sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
++import gen_vision as G, vk_common as V, preprocess as PP
++d = os.environ.get("VISION_TEST_DIR", os.path.join(tempfile.gettempdir(), "loom_vision_tests")); os.makedirs(d, exist_ok=True)
++rng = np.random.default_rng(3); src = []; cases = []
++E, rows = 1024, 37
++nm, s = G.cls_row(E); src.append(s)
++h = rng.standard_normal((rows + 1, E)).astype(np.float32); a = rng.standard_normal(E).astype(np.float32); b = rng.standard_normal(E).astype(np.float32)
++ref = h.copy(); ref[rows] = a + b
++c = V.Case("t_" + nm, d); r = c.lit(rows); one = c.lit(1); y = c.arr(h); c.launch(nm, [one], [r, c.arr(a), c.arr(b), y]); c.expect(y, ref, 1e-6, 1e-6); cases.append(c)
++nm, s = G.bias_scale_add(E); src.append(s)
++x = rng.standard_normal((rows, E)).astype(np.float32); hh = rng.standard_normal((rows, E)).astype(np.float32); ls = rng.standard_normal(E).astype(np.float32) * 0.1
++c = V.Case("t_" + nm, d); r = c.lit(rows); y = c.arr(hh); c.launch(nm, [r], [r, c.arr(x), c.arr(b), c.arr(ls), y]); c.expect(y, hh + (x + b) * ls, 1e-5, 1e-5); cases.append(c)
++nm, s = G.pad_pixels([0.5] * 3, [0.5] * 3, 40); src.append(s)
++for k, (sw, sh, W, H, cin) in enumerate([(77, 53, 80, 80, 3), (120, 80, 80, 40, 4)]):   # padded; resized (pix is used)
++    img = rng.integers(0, 256, (sh, sw, cin), dtype=np.uint8); pix = rng.integers(0, 256, (H, W, 3), dtype=np.uint8)
++    hdr = np.zeros(16, np.int32); hdr[:4] = (sw, sh, cin, 64)
++    if -(-sw // 40) * 40 == W and -(-sh // 40) * 40 == H:
++        f = np.full((H, W, 3), -1.0, np.float32); f[:sh, :sw] = img[..., :3]
++    else:
++        f = pix.astype(np.float32)
++    ref = (f / 255.0 - 0.5) / 0.5
++    c = V.Case(f"t_{nm}_{k}", d); n = c.lit(H * W * 3); y = c.out((H * W * 3,))
++    c.launch(nm, [n], [n, c.lit(W), c.lit(H), c.arr(np.concatenate([hdr.view(np.uint8), img.reshape(-1)])), c.arr(pix.reshape(-1)), y])
++    c.expect(y, ref.reshape(-1), 1e-5, 1e-5); cases.append(c)
++V.run("\n".join(src), cases, d)

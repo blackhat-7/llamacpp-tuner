@@ -129,6 +129,28 @@ Measured, not adopted:
   kernel tests and benchmarks, and the end-to-end session tools. Its README says how to run each.
 - Raw results: `tmp/model-hunt/results.jsonl`, labels `ink-*`. Prompts: `tmp/model-hunt/prompt_inkling_{1000,64000,195000}.txt`.
 
+## Image input (2026-11-22 evening)
+
+Inkling-2-Mini is image-text-to-text (Unsloth ships `mmproj-*.gguf`, projector type `inkling2v`), but Loom's vision
+generator had no `inkling2v` family, so the upstream package was text-only. `kv8-r2v` = `kv8-r2` + an image component
+(`engines/loom/README.md` item 12):
+
+- Encoder: 23-layer ViT (hidden 1024, 16 heads) with a CLS row, learned positions (bilinear) plus 2-D RoPE,
+  LayerScale, 2x2 merge, projector mm.1 -> GELU -> mm.2 to 2304. Built as a new family in loom-skills' generator,
+  following llama.cpp's `tools/mtmd/models/inkling2v.cpp`; patches are padded, not resized, below the token limit.
+- Q8_0 projector (343 MB): the F16 one (0.64 GB) does not fit beside 196K context. Encoder rows vs llama.cpp's F16
+  encoder: per-row cosine min 0.998-0.9995, mean >= 0.9998 on a chart, a text image and a 1600x1200 photo.
+- Same request to Loom and llama.cpp (`--image-max-tokens 1024`): equal prompt token counts; the answers (chart
+  values, the text "BLUE TIGER 4729", shapes and colours) are right and nearly identical. Through lct's
+  `/v1/messages`: a text image read in 0.8 s; a screenshot returned by a Read tool call read correctly.
+- Cost: image rows only. Text output byte-identical to `kv8-r2`, short decode 192.8 / 144.8 / 175.1 vs 193.2 /
+  145.5 / 175.4 t/s; VRAM 25.21 GB peak text-only, 25.56 GB once an image loaded the projector; a 195K prompt after
+  an image still serves (102.6 s read, recall 3/3). ~1.8 s for a 117-row image, ~6 s for 972 rows.
+- Gotcha: an image as the very first request after start activates the image and text workspaces together and
+  fails (`RESOURCE_EXHAUSTED`); lct's Loom backend sends a 1-token text request before it reports ready.
+- Gap: in an image request, Loom's per-message renderer names a tool result only from the message's `name`, so
+  `messages.py` sets it (text requests render the same with or without it: 109 = 109 tokens).
+
 ## Serving through lct
 
 - `lct serve --backend loom` (`llamacpp_tuner/backends/loom.py`) runs Loom on a private port. `llamacpp_tuner/messages.py`

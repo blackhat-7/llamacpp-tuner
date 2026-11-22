@@ -159,3 +159,7 @@ Changes that pass kernel tests but have no end-to-end run (reduced draft head, `
 ## 2026-11-22: The Loom translator gives chat requests temperature 1 when the client names none
 Loom decodes greedily without a temperature, and greedy Inkling loops in its thinking: one Claude Code turn repeated six paragraphs 72 times until its 32,000-token cap. Claude Code, Hermes and Pi send none; both APIs and Inkling's GGUF say 1.
 Replayed at 1, that turn ended in 1.3-2.3K tokens (4 of 4 runs). Cost: decode 92 vs 153 t/s on that 66K turn, since fewer drafts match a sampled token. An explicit temperature passes through; the experiments send 0.
+
+## 2026-11-22: Inkling sees images: `kv8-r2v` adds Loom's image component to `kv8-r2`, with a Q8_0 projector
+The text programs stay as they are (round 1/2 tools anchor on them); only `control.loom` (a per-message renderer for image requests) and `g_embed` change, so text output is byte-identical.
+Q8_0 instead of F16 keeps the 196,608 context (F16 needs 0.64 GB, which does not fit at 195K); images are capped at 1,024 tokens to keep the encoder's workspace small.

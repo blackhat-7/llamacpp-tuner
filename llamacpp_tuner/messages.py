@@ -20,16 +20,34 @@ STOP_REASONS = {"stop": "end_turn", "length": "max_tokens", "tool_calls": "tool_
 TEMPERATURE = 1.0
 
 
-def _text(content: str | list[dict]) -> str:
+def _text(content: str | list[dict], images: bool = False) -> str:
+    """The text of the blocks; images become a note unless the model sees them."""
     if isinstance(content, str):
         return content
     parts = []
     for block in content:
         if block.get("type") == "text":
             parts.append(block["text"])
-        elif block.get("type") == "image":
+        elif block.get("type") == "image" and not images:
             parts.append("[image omitted: this model reads text only]")
     return "\n".join(parts)
+
+
+def _image(block: dict) -> dict:
+    source = block["source"]
+    if source.get("type") == "url":
+        url = source["url"]
+    else:
+        url = f"data:{source['media_type']};base64,{source['data']}"
+    return {"type": "image_url", "image_url": {"url": url}}
+
+
+def _parts(blocks: list[dict]) -> list[dict]:
+    return [
+        _image(b) if b["type"] == "image" else {"type": "text", "text": b["text"]}
+        for b in blocks
+        if b.get("type") in ("text", "image")
+    ]
 
 
 def _assistant(blocks: list[dict]) -> dict:
@@ -51,38 +69,61 @@ def _assistant(blocks: list[dict]) -> dict:
     return message
 
 
-def _user(blocks: list[dict]) -> list[dict]:
-    # Tool results answer the previous turn's calls, so they come first.
+def _user(blocks: list[dict], images: bool, names: dict[str, str]) -> list[dict]:
+    # Tool results answer the previous turn's calls, so they come first. Each names its
+    # tool: Loom's renderer for image requests cannot look the call up by id.
+    results = [b for b in blocks if b.get("type") == "tool_result"]
     messages = [
         {
             "role": "tool",
             "tool_call_id": b["tool_use_id"],
-            "content": _text(b["content"]),
+            **({"name": names[b["tool_use_id"]]} if b["tool_use_id"] in names else {}),
+            "content": _text(b["content"], images),
         }
-        for b in blocks
-        if b.get("type") == "tool_result"
+        for b in results
     ]
     rest = [b for b in blocks if b.get("type") != "tool_result"]
+    if images:
+        # OpenAI tool messages carry only text, so a tool's images (a Read of a
+        # screenshot) go in the user message that follows.
+        shown = [
+            block
+            for b in results
+            if isinstance(b["content"], list)
+            for block in b["content"]
+            if block.get("type") == "image"
+        ]
+        rest = shown + rest
+        if any(b.get("type") == "image" for b in rest):
+            messages.append({"role": "user", "content": _parts(rest)})
+            return messages
     if rest:
         messages.append({"role": "user", "content": _text(rest)})
     return messages
 
 
-def to_openai(body: dict) -> dict:
-    """The OpenAI chat request for an Anthropic Messages request."""
+def to_openai(body: dict, images: bool = False) -> dict:
+    """The OpenAI chat request for an Anthropic Messages request.
+
+    With images, image blocks become image parts; otherwise a note replaces them.
+    """
     messages = (
         [{"role": "system", "content": _text(body["system"])}]
         if body.get("system")
         else []
     )
+    names: dict[str, str] = {}  # tool call id -> tool name
     for message in body["messages"]:
         content = message["content"]
         if isinstance(content, str):
             messages.append({"role": message["role"], "content": content})
         elif message["role"] == "assistant":
             messages.append(_assistant(content))
+            names.update(
+                (b["id"], b["name"]) for b in content if b.get("type") == "tool_use"
+            )
         else:
-            messages.extend(_user(content))
+            messages.extend(_user(content, images, names))
     request: dict = {
         "model": body["model"],
         "messages": messages,
@@ -314,6 +355,24 @@ def make_server(host: str, port: int, upstream: str) -> ThreadingHTTPServer:
     # overlaps the first makes it reserve 4 GB more, fail and drop the model until
     # restarted. Claude Code sends side requests (titles) alongside its main one.
     generating = threading.Lock()
+    modalities: dict[str, bool] = {}
+
+    def sees_images() -> bool:
+        # Loom lists each model's input modalities; a text-only package rejects images.
+        if "image" not in modalities:
+            connection = http.client.HTTPConnection(
+                upstream_host, int(upstream_port), timeout=60
+            )
+            try:
+                connection.request("GET", "/v1/models")
+                catalog = json.loads(connection.getresponse().read())
+            finally:
+                connection.close()
+            modalities["image"] = any(
+                "image" in model.get("input_modalities", [])
+                for model in catalog.get("data", [])
+            )
+        return modalities["image"]
 
     class Handler(BaseHTTPRequestHandler):
         upstream_connection: http.client.HTTPConnection | None = None
@@ -367,14 +426,14 @@ def make_server(host: str, port: int, upstream: str) -> ThreadingHTTPServer:
 
         def _count(self, body: dict) -> None:
             # Loom counts a chat request's tokens and answers in Anthropic's shape.
-            request = {**to_openai(body), "stream": False}
+            request = {**to_openai(body, sees_images()), "stream": False}
             request.pop("stream_options", None)
             path = "/v1/chat/completions/input_tokens"
             response = self._upstream("POST", path, json.dumps(request).encode())
             self._send(response.status, json.loads(response.read()))
 
         def _message(self, body: dict) -> None:
-            request = to_openai(body)
+            request = to_openai(body, sees_images())
             response = self._upstream(
                 "POST", "/v1/chat/completions", json.dumps(request).encode()
             )

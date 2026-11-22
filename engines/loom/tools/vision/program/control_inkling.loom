@@ -1,0 +1,260 @@
+
+// ---- Inkling image requests (engines/loom/tools/vision) ----
+// The kit renders whole conversations in chat_begin, but the host takes image markers only from chat_message
+// fragments. A request with an image renders like llama.cpp's Inkling template instead: chat_begin renders the
+// tools block, the leading system messages and the thinking effort block (as format_chat_begin does), and
+// chat_message renders every later message, one block per content part:
+//   <|message_user|><|content_text|>TEXT<|end_message|>   <|message_user|><|content_image|>ROWS<|end_message|>
+// Requests without images keep format_chat_begin / format_chat_message unchanged.
+// Known gap: a tool result after an image names its tool only from the message's "name" (no tool_call_id lookup).
+// State: bit 61 = image request; bits 8.. = number of leading system messages.
+global.rodata.def @ink_ct_image = bytes("3c7c636f6e74656e745f696d6167657c3e")
+global.rodata.def @ink_vision_image_key = bytes("22696d6167655f75726c22")
+
+func.def @ink_vision_request(%request: buffer) -> (i1) {
+  %origin = index.constant 0 : offset
+  %end = buffer.length %request
+  %key = global.load @ink_vision_image_key : buffer
+  %at = func.call @find(%request, %origin, %end, %key) : (buffer, offset, offset, buffer) -> (offset)
+  %found = index.cmp ult, %at, %end : offset
+  func.return %found : i1
+}
+
+// Number of system messages before the first other message.
+func.def @ink_leading_system(%request: buffer) -> (i64) {
+  %origin = index.constant 0 : offset
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %zero64 = scalar.constant 0 : i64
+  %one64 = scalar.constant 1 : i64
+  %true = scalar.constant true : i1
+  %request_bytes = buffer.length %request
+  %request_length = index.cast %request_bytes : offset to i64
+  %messages_key = global.load @messages_key : buffer
+  %fm, %bm, %lm, %tm = func.call @json_lookup(%request, %zero64, %request_length, %messages_key) : (buffer, i64, i64, buffer) -> (i1, i64, i64, i64)
+  %elements, %etype, %ecount = func.call @members_range(%request, %bm, %lm) : (buffer, i64, i64) -> (buffer, i32, i64)
+  %bounded = scalar.assume %ecount [range(%ecount, 0, 2147483647)] : i64
+  %extent = index.cast %bounded : i64 to index
+  %records = buffer.view %elements[%origin] : buffer -> view<[%extent]x5xi64>
+  %role_key = global.load @role_key : buffer
+  %system_role = global.load @system : buffer
+  %count, %open = scf.for %i = [%c0 to %extent step %c1](%n = %zero64 : i64, %leading = %true : i1) -> (i64, i1) {
+    %mb = view.load %records[%i, 2] : view<[%extent]x5xi64> -> i64
+    %ml = view.load %records[%i, 3] : view<[%extent]x5xi64> -> i64
+    %role = func.call @ink_string(%request, %mb, %ml, %role_key) : (buffer, i64, i64, buffer) -> (buffer)
+    %is_system = func.call @equal(%role, %system_role) : (buffer, buffer) -> (i1)
+    %still = scalar.andi %leading, %is_system : i1
+    %next = scalar.addi %n, %one64 : i64
+    %n2 = scf.select %still, %next, %n : i64
+    scf.yield %n2, %still : i64, i1
+  }
+  func.return %count : i64
+}
+
+// One message in the kit's format; image parts become their own blocks with a marker. Returns (text, plan, images).
+func.def @ink_vision_message(%raw: buffer, %role: buffer, %content: buffer, %parts: buffer, %frames: buffer, %reasoning: buffer, %calls: buffer, %part_count: i64) -> (buffer, buffer, i64) {
+  %origin = index.constant 0 : offset
+  %zero64 = scalar.constant 0 : i64
+  %false = scalar.constant false : i1
+  %empty = global.load @empty : buffer
+  %system_role = global.load @system : buffer
+  %system = func.call @equal(%role, %system_role) : (buffer, buffer) -> (i1)
+  %user_role = global.load @user : buffer
+  %assistant_role = global.load @assistant : buffer
+  %tool_role = global.load @tool_role : buffer
+  %user = func.call @equal(%role, %user_role) : (buffer, buffer) -> (i1)
+  %assistant = func.call @equal(%role, %assistant_role) : (buffer, buffer) -> (i1)
+  %tool = func.call @equal(%role, %tool_role) : (buffer, buffer) -> (i1)
+  %known1 = scalar.ori %system, %user : i1
+  %known2 = scalar.ori %assistant, %tool : i1
+  %known = scalar.ori %known1, %known2 : i1
+  func.call @check(%known) : (i1)
+  %raw_bytes = buffer.length %raw
+  %raw_length = index.cast %raw_bytes : offset to i64
+  %name_key = global.load @ink_k_name : buffer
+  %name = func.call @ink_string(%raw, %zero64, %raw_length, %name_key) : (buffer, i64, i64, buffer) -> (buffer)
+  %msg_sys = global.load @ink_msg_sys : buffer
+  %msg_user = global.load @ink_msg_user : buffer
+  %msg_model = global.load @ink_msg_model : buffer
+  %msg_tool = global.load @ink_msg_tool : buffer
+  %speaker = scf.select %assistant, %msg_model, %msg_tool : buffer
+  %ordinary = scf.select %user, %msg_user, %msg_sys : buffer
+  %named = scalar.ori %assistant, %tool : i1
+  %head = scf.select %named, %speaker, %ordinary : buffer
+  %tail = scf.select %named, %name, %empty : buffer
+  %rtok = func.call @join(%head, %tail) : (buffer, buffer) -> (buffer)
+  %reasoning_bytes = buffer.length %reasoning
+  %has_reasoning = index.cmp ne, %reasoning_bytes, %origin : offset
+  %calls_bytes = buffer.length %calls
+  %has_calls = index.cmp ne, %calls_bytes, %origin : offset
+  %has_other = scalar.ori %has_reasoning, %has_calls : i1
+  %bare = scalar.cmpi eq, %has_other, %false : i1
+  %not_assistant = scalar.cmpi eq, %assistant, %false : i1
+  %allow_empty = scalar.ori %not_assistant, %bare : i1
+  %ct_text = global.load @ink_ct_text : buffer
+  %end_msg = global.load @ink_end_msg : buffer
+  %has_parts = scalar.cmpi ne, %part_count, %zero64 : i64
+  %blocks, %plan, %images = scf.if %has_parts -> (buffer, buffer, i64) {
+    %b, %p, %n = func.call @ink_vision_parts(%rtok, %content, %parts, %frames, %part_count) : (buffer, buffer, buffer, buffer, i64) -> (buffer, buffer, i64)
+    scf.yield %b, %p, %n : buffer, buffer, i64
+  } else {
+    %content_bytes = buffer.length %content
+    %nonempty = index.cmp ne, %content_bytes, %origin : offset
+    %emit = scalar.ori %nonempty, %allow_empty : i1
+    %b = scf.if %emit -> (buffer) {
+      %block = func.call @join4(%rtok, %ct_text, %content, %end_msg) : (buffer, buffer, buffer, buffer) -> (buffer)
+      scf.yield %block : buffer
+    } else {
+      scf.yield %empty : buffer
+    }
+    scf.yield %b, %empty, %zero64 : buffer, buffer, i64
+  }
+  %text = scf.if %assistant -> (buffer) {
+    %ct_think = global.load @ink_ct_think : buffer
+    %rblock = scf.if %has_reasoning -> (buffer) {
+      %v = func.call @join4(%rtok, %ct_think, %reasoning, %end_msg) : (buffer, buffer, buffer, buffer) -> (buffer)
+      scf.yield %v : buffer
+    } else {
+      scf.yield %empty : buffer
+    }
+    %end_sampling = global.load @ink_end_sampling : buffer
+    %all = func.call @join4(%rblock, %blocks, %calls, %end_sampling) : (buffer, buffer, buffer, buffer) -> (buffer)
+    scf.yield %all : buffer
+  } else {
+    scf.yield %blocks : buffer
+  }
+  func.return %text, %plan, %images : buffer, buffer, i64
+}
+
+// Content parts: text part -> RTOK<|content_text|>TEXT<|end_message|>, image -> RTOK<|content_image|>SENTINEL<|end_message|>.
+// Plan per image as vision_content's: [frame, frame count, marker offset (vision_locate), marker length, rows,
+// metadata offset, metadata length], then metadata [processed width, processed height].
+func.def @ink_vision_parts(%rtok: buffer, %content: buffer, %parts: buffer, %frames: buffer, %part_count: i64) -> (buffer, buffer, i64) {
+  %origin = index.constant 0 : offset
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c4 = index.constant 4 : index
+  %c8 = index.constant 8 : offset
+  %c28 = index.constant 28 : offset
+  %zero32 = scalar.constant 0 : i32
+  %eight32 = scalar.constant 8 : i32
+  %text_kind = scalar.constant 0 : i32
+  %bounded_count = scalar.assume %part_count [range(%part_count, 1, 4096)] : i64
+  %count = index.cast %bounded_count : i64 to index
+  %records = buffer.view %parts[%origin] : buffer -> view<[%count]x6xi32>
+  %empty = global.load @empty : buffer
+  %ct_text = global.load @ink_ct_text : buffer
+  %ct_image = global.load @ink_ct_image : buffer
+  %end_msg = global.load @ink_end_msg : buffer
+  %sentinel = global.load @vision_sentinel : buffer
+  %sentinel_length = buffer.length %sentinel
+  %sl64 = index.cast %sentinel_length : offset to i64
+  %sl32 = scalar.trunci %sl64 : i64 to i32
+  %images = scf.for %i = [%c0 to %count step %c1](%n = %c0 : index) -> (index) {
+    %kind = view.load %records[%i, 0] : view<[%count]x6xi32> -> i32
+    %is_text = scalar.cmpi eq, %kind, %text_kind : i32
+    %inc = scf.select %is_text, %c0, %c1 : index
+    %nn = index.add %n, %inc : index
+    scf.yield %nn : index
+  }
+  %record_bytes = index.scale %images, %c28 : index, offset -> offset
+  %meta_bytes = index.scale %images, %c8 : index, offset -> offset
+  %plan_bytes = index.add %record_bytes, %meta_bytes : offset
+  %plan = buffer.alloca<private> align(4) %plan_bytes : buffer
+  %frame_bytes = buffer.length %frames
+  %frame_words0 = index.cast %frame_bytes : offset to index
+  %frame_words = index.div %frame_words0, %c4 : index
+  %frame_view = buffer.view %frames[%origin] : buffer -> view<[%frame_words]xi32>
+  %text, %image_n = scf.for %i = [%c0 to %count step %c1](%acc = %empty : buffer, %image = %c0 : index) -> (buffer, index) {
+    %kind = view.load %records[%i, 0] : view<[%count]x6xi32> -> i32
+    %is_text = scalar.cmpi eq, %kind, %text_kind : i32
+    %block, %next_image = scf.if %is_text -> (buffer, index) {
+      %source32 = view.load %records[%i, 1] : view<[%count]x6xi32> -> i32
+      %length32 = view.load %records[%i, 2] : view<[%count]x6xi32> -> i32
+      %source64 = scalar.extui %source32 : i32 to i64
+      %length64 = scalar.extui %length32 : i32 to i64
+      %piece = func.call @json_range(%content, %source64, %length64) : (buffer, i64, i64) -> (buffer)
+      %b = func.call @join4(%rtok, %ct_text, %piece, %end_msg) : (buffer, buffer, buffer, buffer) -> (buffer)
+      scf.yield %b, %image : buffer, index
+    } else {
+      %frame32 = view.load %records[%i, 3] : view<[%count]x6xi32> -> i32
+      %frame_count32 = view.load %records[%i, 4] : view<[%count]x6xi32> -> i32
+      %frame_bound = scalar.assume %frame32 [range(%frame32, 0, 4095)] : i32
+      %frame = index.cast %frame_bound : i32 to index
+      %wi0 = index.mul %frame, %c4 : index
+      %hi0 = index.add %wi0, %c1 : index
+      %wi = index.assume %wi0 [lt(%wi0, %frame_words)] : index
+      %hi = index.assume %hi0 [lt(%hi0, %frame_words)] : index
+      %width = view.load %frame_view[%wi] : view<[%frame_words]xi32> -> i32
+      %height = view.load %frame_view[%hi] : view<[%frame_words]xi32> -> i32
+      %tw, %th, %rows = func.call @vision_geometry(%width, %height) : (i32, i32) -> (i32, i32, i32)
+      %bi = index.assume %image [range(%image, 0, 4095), lt(%image, %images)] : index
+      %rec = buffer.view %plan[%origin] : buffer -> view<[%images]x7xi32>
+      %mo0 = index.scale %bi, %c8 : index, offset -> offset
+      %mo1 = index.add %record_bytes, %mo0 : offset
+      %mo64 = index.cast %mo1 : offset to i64
+      %mo32 = scalar.trunci %mo64 : i64 to i32
+      view.store %frame32, %rec[%bi, 0] : i32, view<[%images]x7xi32>
+      view.store %frame_count32, %rec[%bi, 1] : i32, view<[%images]x7xi32>
+      view.store %zero32, %rec[%bi, 2] : i32, view<[%images]x7xi32>
+      view.store %sl32, %rec[%bi, 3] : i32, view<[%images]x7xi32>
+      view.store %rows, %rec[%bi, 4] : i32, view<[%images]x7xi32>
+      view.store %mo32, %rec[%bi, 5] : i32, view<[%images]x7xi32>
+      view.store %eight32, %rec[%bi, 6] : i32, view<[%images]x7xi32>
+      %meta = buffer.view %plan[%mo1] : buffer -> view<2xi32>
+      view.store %tw, %meta[0] : i32, view<2xi32>
+      view.store %th, %meta[1] : i32, view<2xi32>
+      %b = func.call @join4(%rtok, %ct_image, %sentinel, %end_msg) : (buffer, buffer, buffer, buffer) -> (buffer)
+      %ni = index.add %image, %c1 : index
+      scf.yield %b, %ni : buffer, index
+    }
+    %joined = func.call @join(%acc, %block) : (buffer, buffer) -> (buffer)
+    scf.yield %joined, %next_image : buffer, index
+  }
+  %images64 = index.cast %images : index to i64
+  func.return %text, %plan, %images64 : buffer, buffer, i64
+}
+
+func.def public @chat_begin(%request: buffer, %tools: buffer) -> (buffer, i64) {
+  %images = func.call @ink_vision_request(%request) : (buffer) -> (i1)
+  %text, %state = scf.if %images -> (buffer, i64) {
+    %lead = func.call @ink_leading_system(%request) : (buffer) -> (i64)
+    %t = func.call @ink_vision_begin(%request, %tools, %lead) : (buffer, buffer, i64) -> (buffer)
+    %shift = scalar.constant 8 : i64
+    %bits = scalar.shli %lead, %shift : i64
+    %flag = scalar.constant 2305843009213693952 : i64
+    %s = scalar.ori %bits, %flag : i64
+    scf.yield %t, %s : buffer, i64
+  } else {
+    %t, %s = func.call @format_chat_begin(%request, %tools) : (buffer, buffer) -> (buffer, i64)
+    scf.yield %t, %s : buffer, i64
+  }
+  func.return %text, %state : buffer, i64
+}
+
+func.def public @chat_message(%raw: buffer, %role: buffer, %content: buffer, %parts: buffer, %frames: buffer, %reasoning: buffer, %calls: buffer, %state: i64, %ordinal: i64, %fields: i64, %part_count: i64) -> (buffer, i64, buffer, i64) {
+  %zero64 = scalar.constant 0 : i64
+  %flag = scalar.constant 2305843009213693952 : i64
+  %masked = scalar.andi %state, %flag : i64
+  %images = scalar.cmpi ne, %masked, %zero64 : i64
+  %f, %n, %p, %c = scf.if %images -> (buffer, i64, buffer, i64) {
+    %shift = scalar.constant 8 : i64
+    %low = scalar.constant 4294967295 : i64
+    %shifted = scalar.shrui %state, %shift : i64
+    %lead = scalar.andi %shifted, %low : i64
+    %rendered = scalar.cmpi slt, %ordinal, %lead : i64
+    %f1, %p1, %c1 = scf.if %rendered -> (buffer, buffer, i64) {
+      %empty = global.load @empty : buffer
+      scf.yield %empty, %empty, %zero64 : buffer, buffer, i64
+    } else {
+      %text, %plan, %count = func.call @ink_vision_message(%raw, %role, %content, %parts, %frames, %reasoning, %calls, %part_count) : (buffer, buffer, buffer, buffer, buffer, buffer, buffer, i64) -> (buffer, buffer, i64)
+      func.call @vision_locate(%text, %plan, %count) : (buffer, buffer, i64)
+      scf.yield %text, %plan, %count : buffer, buffer, i64
+    }
+    scf.yield %f1, %state, %p1, %c1 : buffer, i64, buffer, i64
+  } else {
+    %f2, %n2, %p2, %c2 = func.call @format_chat_message(%raw, %role, %content, %parts, %frames, %reasoning, %calls, %state, %ordinal, %fields, %part_count) : (buffer, buffer, buffer, buffer, buffer, buffer, buffer, i64, i64, i64, i64) -> (buffer, i64, buffer, i64)
+    scf.yield %f2, %n2, %p2, %c2 : buffer, i64, buffer, i64
+  }
+  func.return %f, %n, %p, %c : buffer, i64, buffer, i64
+}

@@ -73,7 +73,7 @@ def test_request_becomes_an_openai_chat_request():
                 }
             ],
         },
-        {"role": "tool", "tool_call_id": "t1", "content": "hi"},
+        {"role": "tool", "tool_call_id": "t1", "name": "read", "content": "hi"},
         {"role": "user", "content": "Now summarize."},
     ]
     assert [t["function"]["name"] for t in request["tools"]] == ["read"]
@@ -344,3 +344,114 @@ def test_a_dead_model_server_gives_a_clean_error():
 
     assert failure.value.code == 503
     assert json.loads(failure.value.read())["error"]["type"] == "api_error"
+
+
+PNG = {"type": "base64", "media_type": "image/png", "data": "aGk="}
+
+
+def test_images_become_image_parts_when_the_model_sees_them():
+    body = {
+        "model": "m",
+        "messages": [
+            {
+                "role": "assistant",
+                "content": [
+                    {"type": "tool_use", "id": "t1", "name": "read", "input": {}}
+                ],
+            },
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "t1",
+                        "content": [
+                            {"type": "text", "text": "shot.png"},
+                            {"type": "image", "source": PNG},
+                        ],
+                    },
+                    {"type": "text", "text": "What is on it?"},
+                ],
+            },
+        ],
+    }
+
+    seen = to_openai(body, images=True)["messages"]
+    blind = to_openai(body)["messages"]
+
+    # A tool message carries only text, so the screenshot rides in the user turn.
+    assert seen[1:] == [
+        {"role": "tool", "tool_call_id": "t1", "name": "read", "content": "shot.png"},
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "image_url",
+                    "image_url": {"url": "data:image/png;base64,aGk="},
+                },
+                {"type": "text", "text": "What is on it?"},
+            ],
+        },
+    ]
+    assert (
+        blind[1]["content"] == "shot.png\n[image omitted: this model reads text only]"
+    )
+    assert blind[2] == {"role": "user", "content": "What is on it?"}
+
+
+class VisionLoom(FakeLoom):
+    """Lists image input and keeps the requests it gets."""
+
+    received: list[dict] = []
+
+    def do_GET(self):
+        self._json(
+            {
+                "data": [
+                    {
+                        "id": "m",
+                        "context_length": 196608,
+                        "input_modalities": ["text", "image"],
+                    }
+                ]
+            }
+        )
+
+    def do_POST(self):
+        length = int(self.headers["Content-Length"])
+        VisionLoom.received.append(json.loads(self.rfile.read(length)))
+        self._json(
+            {"choices": [{"finish_reason": "stop", "message": {"content": "A cat."}}]}
+        )
+
+
+def test_server_sends_images_when_the_model_lists_image_input():
+    loom = ThreadingHTTPServer(("127.0.0.1", 0), VisionLoom)
+    server = make_server("127.0.0.1", 0, f"127.0.0.1:{loom.server_address[1]}")
+    for s in (loom, server):
+        threading.Thread(target=s.serve_forever, daemon=True).start()
+    message = {
+        "model": "m",
+        "max_tokens": 9,
+        "messages": [{"role": "user", "content": [{"type": "image", "source": PNG}]}],
+    }
+    try:
+        reply = json.loads(
+            post(f"http://127.0.0.1:{server.server_address[1]}/v1/messages", message)
+        )
+    finally:
+        server.shutdown()
+        loom.shutdown()
+
+    assert reply["content"] == [{"type": "text", "text": "A cat."}]
+    assert VisionLoom.received[-1]["messages"] == [
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "image_url",
+                    "image_url": {"url": "data:image/png;base64,aGk="},
+                }
+            ],
+        }
+    ]

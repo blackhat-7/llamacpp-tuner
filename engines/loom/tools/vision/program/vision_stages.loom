@@ -1,0 +1,18 @@
+// Encoder stage per processed image size (shared by preparation and batching).
+func.decl import("prepare") @stage(%root: buffer, %tag: i64) -> (i32)
+func.decl import("prepare") @config_i64(%stage: i32, %key: buffer, %value: i64)
+global.rodata.def @vision_root = bytes("766973696f6e5f656e636f6465")
+global.rodata.def @vision_height_key = bytes("766973696f6e2e686569676874")
+global.rodata.def @vision_width_key = bytes("766973696f6e2e7769647468")
+
+func.def public @vision_stage(%height: i64, %width: i64) -> (i32) {
+  %root = global.load @vision_root : buffer
+  %one = scalar.constant 1 : i64
+  %stage = func.call @stage(%root, %one) : (buffer, i64) -> (i32)
+  %hk = global.load @vision_height_key : buffer
+  %wk = global.load @vision_width_key : buffer
+  func.call @config_i64(%stage, %hk, %height) : (i32, buffer, i64)
+  func.call @config_i64(%stage, %wk, %width) : (i32, buffer, i64)
+  func.return %stage : i32
+}
+

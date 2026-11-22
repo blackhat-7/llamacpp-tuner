@@ -1,6 +1,7 @@
 # Loom: the Inkling-2-Mini package
 
-`build.sh` makes `$LCT_HOME/loom/kv8-r2`, the package that profile `inkling` serves (preset `xtx-r2`). The previous
+`build.sh` makes `$LCT_HOME/loom/kv8-r2` and, from it, `$LCT_HOME/loom/kv8-r2v` (the same package with image input),
+which profile `inkling` serves (preset `xtx-r2`). The previous
 build, `kv8w4096` (changes 1-5 only, preset `xtx-kv8-196k`), is the rollback: check out commit `d8fe34f` and build.
 Numbers below are from `docs/inkling-loom-research.md` (7900 XTX, decode t/s).
 
@@ -46,6 +47,18 @@ it leave:
 10. `tools/spec/dynspan.py --lengths 2 --thresholds 90 --shift 3`: with draft depth 3, a step verifies 2 tokens
     instead of 4 while the recent first-draft miss rate is high (prose), else the full span (code, edits).
 11. Preset `xtx-r2`: `xtx-kv8-196k` with draft depth 3 and prompt chunk 1,024.
+
+12. Image input, `kv8-r2v` (`tools/vision/vision.py`): Inkling's `inkling2v` encoder (23-layer ViT with a CLS row,
+    learned positions plus 2-D RoPE, 2x2 merge, two-layer projector) as a new family in Loom's vision generator
+    (`patches/loom-skills-inkling2v.diff` against loom-skills `618f89e`; `tools/vision/gen_programs.py` regenerates
+    `tools/vision/program/`). The text programs are not regenerated: `control.loom` renders requests with an image
+    through a per-message renderer (`program/control_inkling.loom`), and `g_embed` takes projected image rows.
+    The projector is Q8_0 (343 MB, quantized from the pinned F16; the F16 one, 0.64 GB, does not fit beside 196K
+    context). Images are capped at 1,024 tokens. Encoder rows match llama.cpp's F16 encoder at cosine 0.998-0.9995;
+    answers on a chart, a text image and a photo are right and match llama.cpp's; text output is byte-identical
+    and text speed unchanged; a 195K prompt after an image peaks at 25.56 of 25.75 GB.
+    lct sends one 1-token text request at start: an image as the very first request activates both workspaces
+    together, which does not fit.
 
 All together, short code / prose / edit 141 / 121 / 133 to 193 / 146 / 176 t/s; 64K code / prose 114 / 104 to
 148 / 108; 195K 90 / 75 to 104 / 82; 195K recall 3/3.

@@ -58,16 +58,41 @@ def _free_port() -> int:
         return probe.getsockname()[1]
 
 
+def _warm(upstream: str, model: str) -> None:
+    """Generate one token, so Loom activates the text model before any image request.
+
+    An image as the first request activates the image component and the text model
+    together; their two workspaces do not fit beside a 196K context on 24 GB.
+    """
+    body = {
+        "model": model,
+        "max_tokens": 1,
+        "messages": [{"role": "user", "content": "Hi"}],
+    }
+    request = urllib.request.Request(
+        f"http://{upstream}/v1/chat/completions",
+        json.dumps(body).encode(),
+        {"Content-Type": "application/json"},
+    )
+    with urllib.request.urlopen(request, timeout=600) as r:
+        r.read()
+
+
 def _serve_when_ready(server: ThreadingHTTPServer, upstream: str, address: str) -> None:
-    """Answer clients once Loom lists its model, so 'ready' means ready."""
+    """Answer clients once Loom lists its model and has served one token, so 'ready' means ready."""
     while True:
         try:
             with urllib.request.urlopen(f"http://{upstream}/v1/models", timeout=5) as r:
-                if json.load(r).get("data"):
+                models = json.load(r).get("data")
+                if models:
                     break
         except OSError:
             pass  # Loom is still starting
         time.sleep(1)
+    try:
+        _warm(upstream, models[0]["id"])
+    except OSError as error:
+        print(f"lct: Loom's warm-up request failed: {error}", flush=True)
     # address() below finds the public address in this line.
     print(f"lct: Loom at {upstream}; listening on {address}", flush=True)
     server.serve_forever()

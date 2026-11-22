@@ -36,6 +36,7 @@ Each line carries its own done-check. A task too big for one session gets split 
 - [ ] **Dynamic spans over more lengths.** Padding tokens now skip the experts, so odd spans can pay. Done when static step costs at depths 1-7 are measured and `dynspan.py --lengths ...` on a depth-7 preset is compared with `xtx-r2`.
 - [ ] **`--sconv` and span-v2.** `dense_edit.py --sconv` passes its kernel tests; span-v2 (`experiments/inkling-loom/kernels/spa_p4.loom`) predates round 2. Done when each is measured end to end against `kv8-r2`.
 - [ ] **The drafter's KV as a 4K ring.** It stores the whole context but reads 4K. Done when 262,144 context loads with the drafter and prefix cache on and 195K speed holds (the freed ~0.8 GB would also allow a 1,536-2,048 prompt chunk).
+- [x] **Image input for Inkling.** Done 2026-11-22: `inkling2v` encoder as a Loom vision family, package `kv8-r2v` (Q8_0 projector, 196K context kept, text speed and output unchanged); `messages.py` passes Claude images and tool-result screenshots.
 - [ ] **Inkling's quality on our own tasks.** Only reports so far. Done when `tmp/ab-eval` (or forseti) scores it beside the 27B and Flash-Next.
 
 - [x] **Keep-awake on by default.** `lct serve` holds AMD GPUs awake for every profile and stack; `--no-keep-awake` opts out; does nothing without ROCm. Done 2026-11-15: 122 tests; live `ornith-vk` with no flag logged the hold and stayed awake while idle.
