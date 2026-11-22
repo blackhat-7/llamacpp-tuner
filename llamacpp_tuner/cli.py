@@ -9,29 +9,31 @@ import signal
 import sqlite3
 import subprocess
 import time
-import tomllib
 from collections.abc import Callable
 from pathlib import Path
 
 import click
 
 from llamacpp_tuner import __version__, servers
-from llamacpp_tuner.cache import get_aliases_path, get_models_dir
+from llamacpp_tuner.backends import BACKENDS
+from llamacpp_tuner.backends.base import ServeOptions, UnsupportedOptionError
+from llamacpp_tuner.backends.comfyui import data_dir
+from llamacpp_tuner.cache import get_models_dir, get_profiles_path
 from llamacpp_tuner.downloader import (
     download_mmproj,
     download_model,
     download_repository,
-    get_mmproj_path,
     list_downloaded_models,
-    resolve_model,
     resolve_repository,
 )
-from llamacpp_tuner.jeeves import install_jeeves, run_jeeves
-from llamacpp_tuner.llama import install_llama, list_devices, run_server
 from llamacpp_tuner.logs import SOURCES
-from llamacpp_tuner.loom import run_loom
 from llamacpp_tuner.lora import adapter_base, import_lora
-from llamacpp_tuner.strata import run_strata
+from llamacpp_tuner.profiles import (
+    ProfileError,
+    expand_names,
+    load_profiles,
+    write_profiles,
+)
 from llamacpp_tuner.video import (
     ASPECTS,
     FILES,
@@ -43,19 +45,16 @@ from llamacpp_tuner.video import (
     UPSCALE_SHORT_SIDE,
     cancel,
     canvas,
-    data_dir,
     download_files,
     frame_count,
     h3_graph,
     has_audio,
-    install_comfyui,
     join,
     missing_files,
     missing_for,
     model_path,
     output_dir,
     probe,
-    run_comfyui,
     stage,
     stage_tail,
     stage_video,
@@ -66,7 +65,7 @@ from llamacpp_tuner.video import (
 
 BACKEND = click.option(
     "--backend",
-    type=click.Choice(["llama", "jeeves", "strata", "loom", "comfyui"]),
+    type=click.Choice(list(BACKENDS)),
     default="llama",
     help="llama.cpp, Jeeves's own PyTorch server, Strata, Loom, or ComfyUI for video",
 )
@@ -74,90 +73,32 @@ BACKEND = click.option(
 VIDEO_PROFILE = "video"
 
 
-def _read_aliases_file() -> dict:
-    path = get_aliases_path()
-    if not path.is_file():
-        return {}
-    try:
-        return tomllib.loads(path.read_text())
-    except tomllib.TOMLDecodeError as error:
-        raise click.ClickException(f"Invalid {path}: {error}") from error
-
-
-def load_aliases() -> dict[str, str]:
-    """Read serve aliases, each mapping a name to 'serve' arguments."""
-    aliases = _read_aliases_file()
-    aliases.pop("stacks", None)
-    for name, value in aliases.items():
-        if not isinstance(value, str):
-            raise click.ClickException(
-                f"Alias '{name}' in {get_aliases_path()} must be a string of serve arguments."
-            )
-    return aliases
-
-
-def load_stacks() -> dict[str, list[str]]:
-    """Read the [stacks] table: a name for a set of profiles started together."""
-    stacks = _read_aliases_file().get("stacks", {})
-    for name, members in stacks.items():
-        if not (isinstance(members, list) and all(isinstance(m, str) for m in members)):
-            raise click.ClickException(
-                f"Stack '{name}' in {get_aliases_path()} must be a list of profile names."
-            )
-    return stacks
-
-
-def write_aliases(aliases: dict[str, str]) -> None:
-    """Replace every alias, keeping stacks. Rewriting the file drops its comments."""
-    stacks = load_stacks()
-    lines = [
-        f"{json.dumps(key)} = {json.dumps(value)}\n" for key, value in aliases.items()
-    ]
-    if stacks:
-        lines.append("\n[stacks]\n")
-        lines += [
-            f"{json.dumps(key)} = {json.dumps(value)}\n"
-            for key, value in stacks.items()
-        ]
-    get_aliases_path().write_text("".join(lines))
-
-
-def expand_names(names: tuple[str, ...]) -> list[str]:
-    """Turn stack and profile names into profile names, in order, without repeats."""
-    aliases, stacks = load_aliases(), load_stacks()
-    profiles: list[str] = []
-    for name in names:
-        for profile in stacks.get(name, [name]):
-            if profile not in aliases:
-                raise click.ClickException(f"Unknown profile or stack: {profile}")
-            if profile not in profiles:
-                profiles.append(profile)
-    return profiles
-
-
-def pick_projector(model: str, mmproj: Path | None, no_mmproj: bool) -> Path | None:
-    """Use an explicit projector, else a repository's downloaded one."""
-    if mmproj or no_mmproj or model.lower().endswith(".gguf"):
-        return mmproj
-    return get_mmproj_path(model)
-
-
-class _AliasGroup(click.Group):
+class _ProfileGroup(click.Group):
     def parse_args(self, ctx: click.Context, args: list[str]) -> list[str]:
-        # Expand before parsing so options typed after an alias override its own.
-        if (
-            len(args) > 1
-            and args[0] == "serve"
-            and (alias := load_aliases().get(args[1])) is not None
-        ):
-            args = ["serve", *shlex.split(alias), *args[2:]]
+        # Expand before parsing so options typed after a profile override its own.
+        try:
+            if (
+                len(args) > 1
+                and args[0] == "serve"
+                and (saved := load_profiles().get(args[1])) is not None
+            ):
+                args = ["serve", *shlex.split(saved), *args[2:]]
+        except ProfileError as error:
+            raise click.ClickException(str(error)) from error
         return super().parse_args(ctx, args)
 
+    def invoke(self, ctx: click.Context) -> object:
+        try:
+            return super().invoke(ctx)
+        except ProfileError as error:
+            raise click.ClickException(str(error)) from error
 
-@click.group(cls=_AliasGroup)
+
+@click.group(cls=_ProfileGroup)
 @click.version_option(version=__version__)
 def main() -> None:
-    """Download and serve GGUF models with llama.cpp."""
+    """Download models and serve them with llama.cpp, Strata, Loom, Jeeves or
+    ComfyUI."""
 
 
 @main.command()
@@ -176,41 +117,22 @@ def main() -> None:
 def setup(
     backend: str, force: bool, cmake_arg: tuple[str, ...], torch_index: str | None
 ) -> None:
-    """Find or download llama-server for this GPU (--cmake-arg builds it), or
-    install Jeeves, or ComfyUI with a 'video' profile."""
+    """Find or download llama-server for this GPU (--cmake-arg builds it), build
+    Strata or Loom from engines/, or install Jeeves, or ComfyUI with a 'video'
+    profile."""
     try:
-        if backend == "strata":
-            raise click.UsageError("Strata installs with its own ./setup.sh.")
-        if backend == "loom":
-            raise click.UsageError(
-                "Install hrx-loom into a venv named venv, and fetch a model "
-                "package beside it with loom-fetch."
-            )
-        if backend == "jeeves":
-            click.echo(f"Jeeves: {install_jeeves(torch_index, force=force)}")
-        elif backend == "comfyui":
-            click.echo(f"ComfyUI: {install_comfyui(torch_index, force=force)}")
-            aliases = load_aliases()
-            if VIDEO_PROFILE not in aliases:
+        click.echo(BACKENDS[backend].setup(force, cmake_arg, torch_index))
+        if backend == "comfyui":
+            profiles = load_profiles()
+            if VIDEO_PROFILE not in profiles:
                 data_dir().mkdir(parents=True, exist_ok=True)
                 args = [str(data_dir()), "--backend", "comfyui", "--port", "8188"]
-                write_aliases({**aliases, VIDEO_PROFILE: shlex.join(args)})
-                click.echo(f"Added profile '{VIDEO_PROFILE}' to {get_aliases_path()}")
+                write_profiles({**profiles, VIDEO_PROFILE: shlex.join(args)})
+                click.echo(f"Added profile '{VIDEO_PROFILE}' to {get_profiles_path()}")
             if missing := missing_files():
                 click.echo(f"Downloading {len(missing)} model files…")
                 download_files(missing)
             click.echo("Ready: lct video make 'a description'")
-        else:
-            binary = install_llama(force=force, extra_cmake_args=cmake_arg)
-            click.echo(f"llama-server: {binary}")
-            devices = list_devices(binary)
-            click.echo(devices)
-            if "(none)" in devices:
-                click.echo(
-                    "No GPU found: install your GPU driver (NVIDIA, or Vulkan for "
-                    "AMD/Intel), then run 'lct setup --force'.",
-                    err=True,
-                )
     except (OSError, RuntimeError, subprocess.CalledProcessError) as error:
         raise click.ClickException(str(error)) from error
 
@@ -322,7 +244,7 @@ def serve(
 ) -> None:
     """Run llama-server, overriding only explicitly supplied settings.
 
-    MODEL is a GGUF path, a downloaded repository, or an alias from aliases.toml.
+    MODEL is a GGUF path, a downloaded repository, or a profile name.
     With --backend jeeves, --ctx is Jeeves's --max-len and --extra-args go to
     its server. With --backend strata, MODEL is the strata-<model>.json its setup
     wrote; context and files live in that config. With --backend loom, MODEL is a
@@ -354,84 +276,22 @@ def serve(
         except RuntimeError as error:
             click.echo(f"Warning: {error}", err=True)
 
+    options = ServeOptions(
+        quant=quant,
+        filename=filename,
+        ctx=ctx,
+        host=host,
+        port=port,
+        mmproj=mmproj,
+        no_mmproj=no_mmproj,
+        no_mmproj_offload=no_mmproj_offload,
+        extra_args=extra_args,
+        server=server,
+    )
     try:
-        if backend == "jeeves":
-            if quant or filename or mmproj or no_mmproj_offload:
-                raise click.UsageError(
-                    "Jeeves takes a whole model directory, not a file or projector."
-                )
-            weights = resolve_repository(model)
-            jeeves_args = ["--model", str(weights)]
-            jeeves_args += ["--drafter", str(weights / "drafter_k4.safetensors")]
-            for flag, value in (("--max-len", ctx), ("--host", host), ("--port", port)):
-                if value is not None:
-                    jeeves_args.extend([flag, str(value)])
-            run_jeeves(jeeves_args + shlex.split(extra_args), env=environment)
-            return
-        if backend == "strata":
-            if quant or filename or ctx or mmproj or no_mmproj or no_mmproj_offload:
-                raise click.UsageError(
-                    "Strata's model, context and projector are set in its run config."
-                )
-            strata_args = []
-            for flag, value in (("--host", host), ("--port", port)):
-                if value is not None:
-                    strata_args.extend([flag, str(value)])
-            run_strata(
-                Path(model).expanduser(),
-                strata_args + shlex.split(extra_args),
-                env=environment,
-            )
-            return
-        if backend == "loom":
-            if quant or filename or ctx or mmproj or no_mmproj or no_mmproj_offload:
-                raise click.UsageError(
-                    "Loom's model, context and drafter are set in its package preset."
-                )
-            run_loom(
-                Path(model).expanduser(),
-                shlex.split(extra_args),
-                env=environment,
-                host=host or "127.0.0.1",
-                port=port or 8080,
-            )
-            return
-        if backend == "comfyui":
-            if quant or filename or ctx or mmproj or no_mmproj or no_mmproj_offload:
-                raise click.UsageError(
-                    "ComfyUI takes its base directory; models live in it."
-                )
-            comfy_args = []
-            for flag, value in (("--listen", host), ("--port", port)):
-                if value is not None:
-                    comfy_args.extend([flag, str(value)])
-            run_comfyui(
-                Path(model).expanduser(),
-                comfy_args + shlex.split(extra_args),
-                env=environment,
-            )
-            return
-
-        model_path = resolve_model(model, quant=quant, filename=filename)
-
-        selected_mmproj = pick_projector(model, mmproj, no_mmproj)
-        if no_mmproj_offload and not selected_mmproj:
-            raise click.UsageError(
-                "--no-mmproj-offload requires --mmproj or a downloaded repository projector."
-            )
-
-        server_args = ["-m", str(model_path)]
-        for flag, value in (("-c", ctx), ("--host", host), ("--port", port)):
-            if value is not None:
-                server_args.extend([flag, str(value)])
-        if selected_mmproj:
-            server_args.extend(["--mmproj", str(selected_mmproj)])
-            if no_mmproj_offload:
-                server_args.append("--no-mmproj-offload")
-        server_args.extend(shlex.split(extra_args))
-        run_server(server_args, env=environment, binary=server)
-    except click.ClickException:
-        raise
+        BACKENDS[backend].serve(model, options, environment)
+    except UnsupportedOptionError as error:
+        raise click.UsageError(str(error)) from error
     except (FileNotFoundError, ValueError, RuntimeError) as error:
         raise click.ClickException(str(error)) from error
     except subprocess.CalledProcessError as error:
@@ -476,9 +336,9 @@ def import_adapter(
 
     The base model's Hugging Face weights must be local: lct pull REPO --all.
     """
-    aliases = load_aliases()
+    profiles = load_profiles()
     out = get_models_dir() / "imported" / f"{name}-{quant}.gguf"
-    if not force and (name in aliases or out.exists()):
+    if not force and (name in profiles or out.exists()):
         raise click.ClickException(f"{name} already exists; --force replaces it.")
     try:
         base_dir = resolve_repository(base or adapter_base(adapter))
@@ -489,7 +349,7 @@ def import_adapter(
         raise click.ClickException(
             f"Exit code {error.returncode} from: {shlex.join(error.cmd)}"
         ) from error
-    write_aliases({**aliases, name: shlex.join([str(model)])})
+    write_profiles({**profiles, name: shlex.join([str(model)])})
     click.echo(f"Model: {model}\nProfile: {name} (lct serve {name})")
 
 
@@ -663,7 +523,7 @@ def _labels(
 
 def video_server() -> str:
     """The video profile's address; starts it first when it is not running."""
-    if VIDEO_PROFILE not in load_aliases():
+    if VIDEO_PROFILE not in load_profiles():
         raise click.ClickException(
             f"No '{VIDEO_PROFILE}' profile. Run 'lct setup --backend comfyui' first."
         )
@@ -986,7 +846,7 @@ def video_status() -> None:
     """Show whether ComfyUI, its model files and the video server are ready."""
     installed = (data_dir().parent / "venv" / "bin" / "python").is_file()
     click.echo(f"ComfyUI    {'installed' if installed else 'not installed'}")
-    profile = VIDEO_PROFILE in load_aliases()
+    profile = VIDEO_PROFILE in load_profiles()
     click.echo(f"Profile    {VIDEO_PROFILE if profile else 'missing'}")
     missing = missing_files()
     click.echo(

@@ -11,6 +11,7 @@ import sys
 from pathlib import Path
 from typing import NamedTuple
 
+from llamacpp_tuner.backends import BACKENDS
 from llamacpp_tuner.cache import get_servers_dir
 
 LCT = [sys.executable, "-m", "llamacpp_tuner.cli"]
@@ -80,15 +81,10 @@ def start(name: str) -> int:
 
 def address(line: str) -> str:
     """The address a server announces in a log line, if this is that line."""
-    if "listening on" in line:  # llama-server
-        return line.split("listening on")[-1].strip()
-    if line.startswith('{"serving": '):  # Jeeves
-        return json.loads(line)["serving"]
-    if line.startswith("ready: http"):  # Strata: "ready: http://host:port/v1  (...)"
-        return line.split()[1].removesuffix("/v1")
-    if "To see the GUI go to: " in line:  # ComfyUI
-        return line.split("go to: ")[-1].strip()
-    return ""
+    return next(
+        (found for backend in BACKENDS.values() if (found := backend.address(line))),
+        "",
+    )
 
 
 def url(name: str) -> str:

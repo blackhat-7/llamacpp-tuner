@@ -7,7 +7,7 @@ from unittest.mock import patch
 
 import pytest
 
-from llamacpp_tuner.loom import run_loom
+from llamacpp_tuner.backends.loom import run_loom
 
 MIB = 1024**2
 
@@ -25,13 +25,13 @@ def make_package(root):
 def start(package, limits, sudo=None):
     """run_loom with the given (soft, hard) memory-lock limits; nothing real runs."""
     with (
-        patch("llamacpp_tuner.loom.resource.getrlimit", return_value=limits),
-        patch("llamacpp_tuner.loom.resource.setrlimit") as setrlimit,
-        patch("llamacpp_tuner.loom.subprocess.run", side_effect=sudo) as run,
-        patch("llamacpp_tuner.loom._free_port", return_value=41000),
-        patch("llamacpp_tuner.loom.make_server") as make_server,
-        patch("llamacpp_tuner.loom.threading.Thread"),
-        patch("llamacpp_tuner.loom.run_process") as run_process,
+        patch("llamacpp_tuner.backends.loom.resource.getrlimit", return_value=limits),
+        patch("llamacpp_tuner.backends.loom.resource.setrlimit") as setrlimit,
+        patch("llamacpp_tuner.backends.loom.subprocess.run", side_effect=sudo) as run,
+        patch("llamacpp_tuner.backends.loom._free_port", return_value=41000),
+        patch("llamacpp_tuner.backends.loom.make_server") as make_server,
+        patch("llamacpp_tuner.backends.loom.threading.Thread"),
+        patch("llamacpp_tuner.backends.loom.run_process") as run_process,
     ):
         run_loom(package, ["--preset=xtx"], env={"A": "1"}, host="0.0.0.0", port=6868)
     # Clients reach the translator on the public port; Loom listens privately.

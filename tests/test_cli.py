@@ -1,13 +1,17 @@
 """Tests for the lct CLI."""
 
+import json
 import sys
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
 from click.testing import CliRunner
 
 from llamacpp_tuner import servers
-from llamacpp_tuner.cli import load_aliases, load_stacks, main, write_aliases
+from llamacpp_tuner.backends import strata
+from llamacpp_tuner.cli import main
+from llamacpp_tuner.profiles import load_profiles, load_stacks, write_profiles
 
 REAL_KEEP_AWAKE = servers.keep_awake  # conftest stubs the module's copy for every test
 
@@ -15,9 +19,13 @@ REAL_KEEP_AWAKE = servers.keep_awake  # conftest stubs the module's copy for eve
 def test_setup_reports_binary_and_devices():
     with (
         patch(
-            "llamacpp_tuner.cli.install_llama", return_value=Path("/bin/llama-server")
+            "llamacpp_tuner.backends.llama.install_llama",
+            return_value=Path("/bin/llama-server"),
         ),
-        patch("llamacpp_tuner.cli.list_devices", return_value="  Vulkan0: AMD GPU"),
+        patch(
+            "llamacpp_tuner.backends.llama.list_devices",
+            return_value="  Vulkan0: AMD GPU",
+        ),
     ):
         result = CliRunner().invoke(main, ["setup"])
 
@@ -29,10 +37,11 @@ def test_setup_reports_binary_and_devices():
 def test_setup_says_how_to_fix_a_missing_gpu():
     with (
         patch(
-            "llamacpp_tuner.cli.install_llama", return_value=Path("/bin/llama-server")
+            "llamacpp_tuner.backends.llama.install_llama",
+            return_value=Path("/bin/llama-server"),
         ),
         patch(
-            "llamacpp_tuner.cli.list_devices",
+            "llamacpp_tuner.backends.llama.list_devices",
             return_value="Available devices:\n  (none)",
         ),
     ):
@@ -67,10 +76,10 @@ def test_pull_accepts_any_quant():
 def test_serve_preserves_llama_defaults():
     with (
         patch(
-            "llamacpp_tuner.cli.resolve_model",
+            "llamacpp_tuner.backends.llama.resolve_model",
             return_value=Path("models/model-Q6_K.gguf"),
         ),
-        patch("llamacpp_tuner.cli.run_server") as run_server,
+        patch("llamacpp_tuner.backends.llama.run_server") as run_server,
     ):
         result = CliRunner().invoke(
             main,
@@ -97,8 +106,10 @@ def test_serve_runs_the_named_server_binary(tmp_path):
     binary = tmp_path / "llama-server"
     binary.write_text("")
     with (
-        patch("llamacpp_tuner.cli.resolve_model", return_value=Path("m.gguf")),
-        patch("llamacpp_tuner.cli.run_server") as run_server,
+        patch(
+            "llamacpp_tuner.backends.llama.resolve_model", return_value=Path("m.gguf")
+        ),
+        patch("llamacpp_tuner.backends.llama.run_server") as run_server,
     ):
         result = CliRunner().invoke(main, ["serve", "m.gguf", "--server", str(binary)])
         rejected = CliRunner().invoke(
@@ -113,10 +124,10 @@ def test_serve_runs_the_named_server_binary(tmp_path):
 def test_serve_adds_only_explicit_common_args():
     with (
         patch(
-            "llamacpp_tuner.cli.resolve_model",
+            "llamacpp_tuner.backends.llama.resolve_model",
             return_value=Path("models/model.gguf"),
         ),
-        patch("llamacpp_tuner.cli.run_server") as run_server,
+        patch("llamacpp_tuner.backends.llama.run_server") as run_server,
     ):
         result = CliRunner().invoke(
             main,
@@ -151,10 +162,10 @@ def test_serve_supports_explicit_projector(tmp_path):
 
     with (
         patch(
-            "llamacpp_tuner.cli.resolve_model",
+            "llamacpp_tuner.backends.llama.resolve_model",
             return_value=Path("models/model.gguf"),
         ),
-        patch("llamacpp_tuner.cli.run_server") as run_server,
+        patch("llamacpp_tuner.backends.llama.run_server") as run_server,
     ):
         result = CliRunner().invoke(
             main,
@@ -178,15 +189,15 @@ def test_serve_expands_alias_and_later_options_override(monkeypatch, tmp_path):
     aliases.write_text(
         "qwen = \"owner/repo --file model.gguf --ctx 4096 --extra-args '-ngl all -fa on'\"\n"
     )
-    monkeypatch.setattr("llamacpp_tuner.cli.get_aliases_path", lambda: aliases)
+    monkeypatch.setattr("llamacpp_tuner.profiles.get_profiles_path", lambda: aliases)
 
     with (
         patch(
-            "llamacpp_tuner.cli.resolve_model",
+            "llamacpp_tuner.backends.llama.resolve_model",
             return_value=Path("models/model.gguf"),
         ) as resolve,
-        patch("llamacpp_tuner.cli.get_mmproj_path", return_value=None),
-        patch("llamacpp_tuner.cli.run_server") as run_server,
+        patch("llamacpp_tuner.backends.llama.get_mmproj_path", return_value=None),
+        patch("llamacpp_tuner.backends.llama.run_server") as run_server,
     ):
         result = CliRunner().invoke(main, ["serve", "qwen", "--ctx", "8192"])
 
@@ -207,7 +218,7 @@ def test_serve_expands_alias_and_later_options_override(monkeypatch, tmp_path):
 def test_invalid_alias_file_is_a_user_error(monkeypatch, tmp_path):
     aliases = tmp_path / "aliases.toml"
     aliases.write_text("qwen = [\n")
-    monkeypatch.setattr("llamacpp_tuner.cli.get_aliases_path", lambda: aliases)
+    monkeypatch.setattr("llamacpp_tuner.profiles.get_profiles_path", lambda: aliases)
 
     result = CliRunner().invoke(main, ["serve", "qwen"])
 
@@ -243,7 +254,7 @@ def test_up_starts_a_stack_waits_and_down_stops_it(monkeypatch, tmp_path):
     aliases = tmp_path / "aliases.toml"
     aliases.write_text('a = "m.gguf"\nb = "m.gguf"\n\n[stacks]\nboth = ["a", "b"]\n')
     monkeypatch.setenv("LCT_HOME", str(tmp_path))
-    monkeypatch.setattr("llamacpp_tuner.cli.get_aliases_path", lambda: aliases)
+    monkeypatch.setattr("llamacpp_tuner.profiles.get_profiles_path", lambda: aliases)
     monkeypatch.setattr(
         "llamacpp_tuner.servers.LCT", [sys.executable, "-c", FAKE_SERVER]
     )
@@ -265,7 +276,7 @@ def test_up_starts_a_stack_waits_and_down_stops_it(monkeypatch, tmp_path):
 def test_up_rejects_unknown_names(monkeypatch, tmp_path):
     aliases = tmp_path / "aliases.toml"
     aliases.write_text('a = "m.gguf"\n[stacks]\nbad = ["a", "nope"]\n')
-    monkeypatch.setattr("llamacpp_tuner.cli.get_aliases_path", lambda: aliases)
+    monkeypatch.setattr("llamacpp_tuner.profiles.get_profiles_path", lambda: aliases)
 
     result = CliRunner().invoke(main, ["up", "bad"])
 
@@ -276,11 +287,11 @@ def test_up_rejects_unknown_names(monkeypatch, tmp_path):
 def test_writing_aliases_keeps_stacks(monkeypatch, tmp_path):
     aliases = tmp_path / "aliases.toml"
     aliases.write_text('a = "m.gguf"\n[stacks]\nall = ["a"]\n')
-    monkeypatch.setattr("llamacpp_tuner.cli.get_aliases_path", lambda: aliases)
+    monkeypatch.setattr("llamacpp_tuner.profiles.get_profiles_path", lambda: aliases)
 
-    write_aliases({"a": "m.gguf", "b": "n.gguf"})
+    write_profiles({"a": "m.gguf", "b": "n.gguf"})
 
-    assert load_aliases() == {"a": "m.gguf", "b": "n.gguf"}
+    assert load_profiles() == {"a": "m.gguf", "b": "n.gguf"}
     assert load_stacks() == {"all": ["a"]}
 
 
@@ -314,8 +325,10 @@ def test_system_reads_a_sleeping_gpu_as_idle(monkeypatch, tmp_path):
 
 def test_serve_passes_env_to_llama_server(monkeypatch):
     with (
-        patch("llamacpp_tuner.cli.resolve_model", return_value=Path("m.gguf")),
-        patch("llamacpp_tuner.cli.run_server") as run_server,
+        patch(
+            "llamacpp_tuner.backends.llama.resolve_model", return_value=Path("m.gguf")
+        ),
+        patch("llamacpp_tuner.backends.llama.run_server") as run_server,
     ):
         result = CliRunner().invoke(
             main, ["serve", "m.gguf", "--env", "A=1", "--env", "B=x=y"]
@@ -374,8 +387,13 @@ def test_serve_keeps_the_gpu_awake_unless_told_not_to(monkeypatch):
 
     monkeypatch.setattr(servers, "keep_awake", hold)
     with (
-        patch("llamacpp_tuner.cli.resolve_model", return_value=Path("m.gguf")),
-        patch("llamacpp_tuner.cli.run_server", lambda *a, **k: calls.append("server")),
+        patch(
+            "llamacpp_tuner.backends.llama.resolve_model", return_value=Path("m.gguf")
+        ),
+        patch(
+            "llamacpp_tuner.backends.llama.run_server",
+            lambda *a, **k: calls.append("server"),
+        ),
     ):
         default = CliRunner().invoke(main, ["serve", "m.gguf"])
         assert calls == ["awake", "server"]
@@ -392,8 +410,10 @@ def test_serve_still_runs_when_the_gpu_cannot_be_kept_awake(monkeypatch):
 
     monkeypatch.setattr(servers, "keep_awake", fail)
     with (
-        patch("llamacpp_tuner.cli.resolve_model", return_value=Path("m.gguf")),
-        patch("llamacpp_tuner.cli.run_server") as run_server,
+        patch(
+            "llamacpp_tuner.backends.llama.resolve_model", return_value=Path("m.gguf")
+        ),
+        patch("llamacpp_tuner.backends.llama.run_server") as run_server,
     ):
         result = CliRunner().invoke(main, ["serve", "m.gguf"])
 
@@ -402,7 +422,7 @@ def test_serve_still_runs_when_the_gpu_cannot_be_kept_awake(monkeypatch):
 
 
 def test_serve_jeeves_maps_common_args(tmp_path):
-    with patch("llamacpp_tuner.cli.run_jeeves") as run_jeeves:
+    with patch("llamacpp_tuner.backends.jeeves.run_jeeves") as run_jeeves:
         result = CliRunner().invoke(
             main,
             ["serve", str(tmp_path), "--backend", "jeeves", "--ctx", "2048"]
@@ -430,7 +450,7 @@ def test_serve_jeeves_maps_common_args(tmp_path):
 
 def test_serve_strata_runs_its_config(tmp_path):
     config = tmp_path / "strata-iq3_s.json"
-    with patch("llamacpp_tuner.cli.run_strata") as run_strata:
+    with patch("llamacpp_tuner.backends.strata.run_strata") as run_strata:
         result = CliRunner().invoke(
             main,
             ["serve", str(config), "--backend", "strata", "--host", "100.64.0.1"]
@@ -449,7 +469,7 @@ def test_serve_strata_runs_its_config(tmp_path):
 
 
 def test_serve_loom_runs_its_package(tmp_path):
-    with patch("llamacpp_tuner.cli.run_loom") as run_loom:
+    with patch("llamacpp_tuner.backends.loom.run_loom") as run_loom:
         result = CliRunner().invoke(
             main,
             ["serve", str(tmp_path), "--backend", "loom", "--host", "0.0.0.0"]
@@ -471,20 +491,55 @@ def test_serve_loom_runs_its_package(tmp_path):
     assert bad.exit_code != 0 and "preset" in bad.output
 
 
-def test_loom_has_no_lct_setup():
-    result = CliRunner().invoke(main, ["setup", "--backend", "loom"])
+@pytest.mark.parametrize("engine", ["strata", "loom"])
+def test_setup_runs_the_engines_build_script(monkeypatch, tmp_path, engine):
+    script = tmp_path / "engines" / engine / "build.sh"
+    script.parent.mkdir(parents=True)
+    script.write_text("")
+    monkeypatch.setattr(
+        "llamacpp_tuner.backends.base.get_checkout_dir", lambda: tmp_path
+    )
+    with patch("llamacpp_tuner.backends.base.subprocess.run") as run:
+        result = CliRunner().invoke(main, ["setup", "--backend", engine, "--force"])
 
-    assert result.exit_code != 0 and "hrx-loom" in result.output
+    assert result.exit_code == 0, result.output
+    assert run.call_args.args[0] == ["bash", str(script), "--force"]
+    assert run.call_args.kwargs["env"]["LCT_HOME"] == str(tmp_path)
 
 
-def test_strata_needs_its_own_setup(tmp_path):
+def test_setup_outside_a_checkout_says_to_clone_the_repository(monkeypatch):
+    monkeypatch.setattr("llamacpp_tuner.backends.base.get_checkout_dir", lambda: None)
+    with patch("llamacpp_tuner.backends.base.subprocess.run") as run:
+        result = CliRunner().invoke(main, ["setup", "--backend", "loom"])
+
+    assert result.exit_code == 1 and "engines/loom/build.sh" in result.output
+    assert "clone" in result.output
+    run.assert_not_called()
+
+
+def test_strata_needs_a_run_config(tmp_path):
     missing = CliRunner().invoke(
         main, ["serve", str(tmp_path / "none.json"), "--backend", "strata"]
     )
-    setup_result = CliRunner().invoke(main, ["setup", "--backend", "strata"])
 
-    assert missing.exit_code != 0 and "./setup.sh" in missing.output
-    assert setup_result.exit_code != 0 and "./setup.sh" in setup_result.output
+    assert missing.exit_code != 0 and "No Strata run config" in missing.output
+
+
+def test_strata_runs_from_the_configs_cwd(tmp_path):
+    checkout = tmp_path / "Strata"
+    (checkout / ".venv" / "bin").mkdir(parents=True)
+    (checkout / ".venv" / "bin" / "python").write_text("")
+    config = tmp_path / "configs" / "strata-x.json"
+    config.parent.mkdir()
+    config.write_text(json.dumps({"cwd": str(checkout)}))
+    with patch("llamacpp_tuner.backends.strata.run_process") as run_process:
+        strata.run_strata(config, ["--port", "6868"])
+
+    assert run_process.call_args.args[0][:2] == [
+        str(checkout / ".venv" / "bin" / "python"),
+        str(checkout / "serve" / "server.py"),
+    ]
+    assert run_process.call_args.kwargs["cwd"] == checkout
 
 
 def test_pull_all_downloads_the_whole_repository():

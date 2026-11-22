@@ -1,7 +1,7 @@
 [project]
 name = "llamacpp-tuner"
 version = "0.1.0"
-description = "Minimal llama.cpp model manager and server wrapper"
+description = "Download local models and serve them with llama.cpp, Strata, Loom, Jeeves or ComfyUI"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
@@ -19,6 +19,8 @@ build-backend = "hatchling.build"
 
 [tool.ruff]
 target-version = "py311"
+# Research scripts stay free-form; engines/ tools are linted like the package.
+extend-exclude = ["experiments"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "N", "W", "UP", "B", "C4", "SIM"]

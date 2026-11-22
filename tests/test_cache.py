@@ -23,3 +23,27 @@ def test_installed_package_uses_xdg_cache(monkeypatch, tmp_path):
     monkeypatch.setattr(cache, "_PROJECT_ROOT", tmp_path / "package")
 
     assert cache.get_cache_dir() == tmp_path / "lct"
+
+
+def test_checkout_keeps_profiles_in_the_repository(monkeypatch, tmp_path):
+    monkeypatch.delenv("LCT_HOME", raising=False)
+    monkeypatch.setattr(cache, "_PROJECT_ROOT", tmp_path)
+    (tmp_path / "pyproject.toml").touch()
+
+    assert cache.get_profiles_path() == tmp_path / "profiles.toml"
+
+
+def test_lct_home_keeps_profiles_in_the_cache_dir(monkeypatch, tmp_path):
+    monkeypatch.setenv("LCT_HOME", str(tmp_path / "home"))
+    monkeypatch.setattr(cache, "_PROJECT_ROOT", tmp_path)
+    (tmp_path / "pyproject.toml").touch()
+
+    assert cache.get_profiles_path() == tmp_path / "home" / "aliases.toml"
+
+
+def test_installed_package_keeps_profiles_in_the_cache_dir(monkeypatch, tmp_path):
+    monkeypatch.delenv("LCT_HOME", raising=False)
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
+    monkeypatch.setattr(cache, "_PROJECT_ROOT", tmp_path / "package")
+
+    assert cache.get_profiles_path() == tmp_path / "lct" / "aliases.toml"

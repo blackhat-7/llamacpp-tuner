@@ -5,8 +5,8 @@ import subprocess
 import tempfile
 from pathlib import Path
 
+from llamacpp_tuner.backends.llama import get_llama_binary
 from llamacpp_tuner.cache import get_llama_dir
-from llamacpp_tuner.llama import get_llama_binary
 
 
 def adapter_base(adapter: Path) -> str:

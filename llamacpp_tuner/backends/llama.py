@@ -3,15 +3,21 @@
 import json
 import os
 import platform
+import shlex
 import shutil
-import signal
 import subprocess
 import tempfile
 import urllib.request
 from collections.abc import Sequence
 from pathlib import Path
 
+from llamacpp_tuner.backends.base import (
+    ServeOptions,
+    UnsupportedOptionError,
+    run_process,
+)
 from llamacpp_tuner.cache import get_llama_dir
+from llamacpp_tuner.downloader import get_mmproj_path, resolve_model
 
 LLAMA_REPO_URL = "https://github.com/ggml-org/llama.cpp.git"
 # Every llama.cpp build is published as a prerelease, so "latest" finds none.
@@ -188,23 +194,51 @@ def run_server(
     run_process([str(binary), *args], env=env)
 
 
-def run_process(
-    command: list[str], env: dict[str, str] | None = None, cwd: Path | None = None
-) -> None:
-    """Run a server in the foreground until it exits or lct is stopped."""
-    with subprocess.Popen(
-        command, env={**os.environ, **env} if env else None, cwd=cwd
-    ) as server:
-        # Without this, a SIGTERM to lct kills only the wrapper and orphans
-        # the server, leaving the model resident in VRAM.
-        def shutdown(signum: int, frame: object) -> None:
-            server.terminate()
+def pick_projector(model: str, mmproj: Path | None, no_mmproj: bool) -> Path | None:
+    """Use an explicit projector, else a repository's downloaded one."""
+    if mmproj or no_mmproj or model.lower().endswith(".gguf"):
+        return mmproj
+    return get_mmproj_path(model)
 
-        for sig in (signal.SIGINT, signal.SIGTERM):
-            signal.signal(sig, shutdown)
-        code = server.wait()
 
-    # A negative code means the server was stopped by a signal, which is how
-    # a requested shutdown ends.
-    if code > 0:
-        raise subprocess.CalledProcessError(code, command)
+def serve(model: str, options: ServeOptions, env: dict[str, str]) -> None:
+    """Run llama-server for a GGUF path or a downloaded repository."""
+    model_path = resolve_model(model, quant=options.quant, filename=options.filename)
+    mmproj = pick_projector(model, options.mmproj, options.no_mmproj)
+    if options.no_mmproj_offload and not mmproj:
+        raise UnsupportedOptionError(
+            "--no-mmproj-offload requires --mmproj or a downloaded repository projector."
+        )
+    args = ["-m", str(model_path)]
+    for flag, value in (
+        ("-c", options.ctx),
+        ("--host", options.host),
+        ("--port", options.port),
+    ):
+        if value is not None:
+            args.extend([flag, str(value)])
+    if mmproj:
+        args.extend(["--mmproj", str(mmproj)])
+        if options.no_mmproj_offload:
+            args.append("--no-mmproj-offload")
+    args.extend(shlex.split(options.extra_args))
+    run_server(args, env=env, binary=options.server)
+
+
+def setup(force: bool, cmake_args: tuple[str, ...], torch_index: str | None) -> str:
+    """Find or download llama-server; CMake arguments build it instead."""
+    binary = install_llama(force=force, extra_cmake_args=cmake_args)
+    devices = list_devices(binary)
+    text = f"llama-server: {binary}\n{devices}"
+    if "(none)" in devices:
+        text += (
+            "\nNo GPU found: install your GPU driver (NVIDIA, or Vulkan for "
+            "AMD/Intel), then run 'lct setup --force'."
+        )
+    return text
+
+
+def address(line: str) -> str:
+    if "listening on" in line:
+        return line.split("listening on")[-1].strip()
+    return ""

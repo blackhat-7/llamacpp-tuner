@@ -14,7 +14,6 @@ from collections.abc import Callable
 from itertools import pairwise
 from pathlib import Path
 
-import click
 from huggingface_hub import ModelInfo
 from rich.color import Color, blend_rgb
 from rich.console import Console, ConsoleOptions, Group, RenderableType, RenderResult
@@ -40,14 +39,9 @@ from textual.widgets import (
 from textual.widgets.option_list import Option
 
 from llamacpp_tuner import servers
-from llamacpp_tuner.cli import (
-    VIDEO_PROFILE,
-    load_aliases,
-    load_stacks,
-    pick_projector,
-    serve,
-    write_aliases,
-)
+from llamacpp_tuner.backends.llama import get_llama_binary, pick_projector
+from llamacpp_tuner.cache import get_profiles_path
+from llamacpp_tuner.cli import VIDEO_PROFILE, serve
 from llamacpp_tuner.downloader import (
     list_downloaded_models,
     model_files,
@@ -57,7 +51,12 @@ from llamacpp_tuner.downloader import (
     search_repos,
 )
 from llamacpp_tuner.live import Live, Request
-from llamacpp_tuner.llama import get_llama_binary
+from llamacpp_tuner.profiles import (
+    ProfileError,
+    load_profiles,
+    load_stacks,
+    write_profiles,
+)
 from llamacpp_tuner.servers import LCT, child_env, interrupt
 from llamacpp_tuner.video import (
     ASPECTS,
@@ -1200,9 +1199,9 @@ class LctApp(App[None]):
 
     def refresh_profiles(self, select: str = "") -> None:
         try:
-            aliases, self.stacks = load_aliases(), load_stacks()
-        except click.ClickException as error:
-            self.fail(error.message)
+            aliases, self.stacks = load_profiles(), load_stacks()
+        except ProfileError as error:
+            self.fail(str(error))
             aliases, self.stacks = {}, {}
         self.profiles = {name: profile(args) for name, args in aliases.items()}
         self.render_profiles(select)
@@ -1375,7 +1374,9 @@ class LctApp(App[None]):
             for member in self.stacks[stack]:
                 mark, style = self.server_mark(member)
                 rows.append(("Profile", Text(mark + member, style=style)))
-            rows.append(("", Text("edit [stacks] in aliases.toml", style=MUTED)))
+            rows.append(
+                ("", Text(f"edit [stacks] in {get_profiles_path().name}", style=MUTED))
+            )
             for label, value in rows:
                 options.add_option(Option(setting_row(label, value), disabled=True))
             return
@@ -1432,7 +1433,7 @@ class LctApp(App[None]):
         values = {k: (old if k == "name" else details[k]) for k in SETTINGS}
         values[key] = value
         name = values["name"]
-        aliases = load_aliases()
+        aliases = load_profiles()
         try:
             if not name:
                 raise ValueError("A profile needs a name.")
@@ -1444,7 +1445,7 @@ class LctApp(App[None]):
         except ValueError as error:
             self.fail(str(error))
             return False
-        write_aliases(
+        write_profiles(
             {
                 (name if k == old else k): (args if k == old else v)
                 for k, v in aliases.items()
@@ -1457,7 +1458,7 @@ class LctApp(App[None]):
     def action_new(self) -> None:
         if self.page != "serve" or self.edit_target:
             return
-        aliases = load_aliases()
+        aliases = load_profiles()
         base = aliases.get(self.editing)
         if base is None and not self.models:
             self.fail("Download a model first.")
@@ -1466,7 +1467,7 @@ class LctApp(App[None]):
             f"profile-{i}" for i in range(1, 1000) if f"profile-{i}" not in aliases
         )
         first_model = shlex.quote(str(next(iter(self.models.values()), "")))
-        write_aliases({**aliases, name: base or first_model})
+        write_profiles({**aliases, name: base or first_model})
         self.refresh_profiles(select=name)
         self.open_editor(("serve", "name"), SETTINGS["name"], name)
 
@@ -1477,7 +1478,7 @@ class LctApp(App[None]):
             self.ask(question, lambda: self.delete_profile(name))
 
     def delete_profile(self, name: str) -> None:
-        write_aliases({k: v for k, v in load_aliases().items() if k != name})
+        write_profiles({k: v for k, v in load_profiles().items() if k != name})
         self.refresh_profiles()
         self.notify(f"Deleted {name}", timeout=2)
 

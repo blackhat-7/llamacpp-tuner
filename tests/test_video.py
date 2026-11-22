@@ -9,6 +9,7 @@ import pytest
 from click.testing import CliRunner
 
 from llamacpp_tuner import servers, video
+from llamacpp_tuner.backends import comfyui
 from llamacpp_tuner.cli import main
 
 
@@ -176,7 +177,7 @@ def test_wait_returns_the_saved_video_and_reports_errors(monkeypatch, tmp_path):
 
 
 def test_serve_comfyui_maps_host_and_port(tmp_path):
-    with patch("llamacpp_tuner.cli.run_comfyui") as run_comfyui:
+    with patch("llamacpp_tuner.backends.comfyui.run_comfyui") as run_comfyui:
         result = CliRunner().invoke(
             main,
             ["serve", str(tmp_path), "--backend", "comfyui", "--host", "0.0.0.0"]
@@ -199,7 +200,10 @@ def test_setup_comfyui_adds_the_video_profile_and_downloads_models(
 ):
     monkeypatch.setenv("LCT_HOME", str(tmp_path))
     with (
-        patch("llamacpp_tuner.cli.install_comfyui", return_value=Path("/venv/python")),
+        patch(
+            "llamacpp_tuner.backends.comfyui.install_comfyui",
+            return_value=Path("/venv/python"),
+        ),
         patch("llamacpp_tuner.cli.missing_files", return_value=["fl2va"]),
         patch("llamacpp_tuner.cli.download_files") as download,
     ):
@@ -284,7 +288,7 @@ def test_make_needs_exactly_one_prompt(tmp_path):
 
 def test_video_refuses_a_busy_gpu(monkeypatch):
     with (
-        patch("llamacpp_tuner.cli.load_aliases", return_value={"video": "x"}),
+        patch("llamacpp_tuner.cli.load_profiles", return_value={"video": "x"}),
         patch("llamacpp_tuner.cli.missing_for", return_value=[]),
         patch(
             "llamacpp_tuner.cli.servers.running", return_value={"strata-flash-next": 1}
@@ -391,11 +395,11 @@ def test_comfyui_starts_with_the_rocm_fix_node(tmp_path):
     python = tmp_path / "python"
     python.write_text("")
     with (
-        patch("llamacpp_tuner.video._python", return_value=python),
-        patch("llamacpp_tuner.video.run_process") as run_process,
-        patch("llamacpp_tuner.video.resource.setrlimit"),
+        patch("llamacpp_tuner.backends.comfyui._python", return_value=python),
+        patch("llamacpp_tuner.backends.comfyui.run_process") as run_process,
+        patch("llamacpp_tuner.backends.comfyui.resource.setrlimit"),
     ):
-        video.run_comfyui(tmp_path, ["--port", "8188"])
+        comfyui.run_comfyui(tmp_path, ["--port", "8188"])
 
     node = tmp_path / "custom_nodes" / "lct_rocm_fix.py"
     compile(node.read_text(), str(node), "exec")

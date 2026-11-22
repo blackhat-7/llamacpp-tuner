@@ -13,7 +13,7 @@ from huggingface_hub import ModelInfo
 from rich.console import Console
 from textual.widgets import Input, OptionList, RichLog, Static
 
-from llamacpp_tuner.cli import load_aliases, write_aliases
+from llamacpp_tuner.profiles import load_profiles, write_profiles
 from llamacpp_tuner.servers import LCT
 from llamacpp_tuner.tui import LctApp, bench_row, card_summary, video_command
 
@@ -63,7 +63,7 @@ def workspace(monkeypatch, tmp_path):
     monkeypatch.setenv("LCT_HOME", str(tmp_path))
     monkeypatch.setattr("llamacpp_tuner.tui.list_downloaded_models", lambda: [model])
     monkeypatch.setattr(
-        "llamacpp_tuner.cli.get_aliases_path", lambda: tmp_path / "aliases.toml"
+        "llamacpp_tuner.profiles.get_profiles_path", lambda: tmp_path / "aliases.toml"
     )
     yield model
     # Servers outlive the UI by design; do not let a failed test leak one.
@@ -74,7 +74,7 @@ def workspace(monkeypatch, tmp_path):
 
 @pytest.mark.parametrize("width", [40, 80, 120])
 def test_renders_every_page_at_common_widths(width, workspace):
-    write_aliases({"mine": f"{workspace} --ctx 4096", "gone": "owner/repo --quant Q4"})
+    write_profiles({"mine": f"{workspace} --ctx 4096", "gone": "owner/repo --quant Q4"})
 
     async def run() -> None:
         app = LctApp()
@@ -89,7 +89,7 @@ def test_renders_every_page_at_common_widths(width, workspace):
 
 
 def test_profile_row_shows_parallel_slots(workspace):
-    write_aliases(
+    write_profiles(
         {
             "swarm": f"{workspace} --ctx 131072 --extra-args '-ngl all -np 5'",
             "solo": f"{workspace} --ctx 4096",
@@ -109,7 +109,7 @@ def test_profile_row_shows_parallel_slots(workspace):
 
 
 def test_profile_list_fills_the_panel(workspace):
-    write_aliases({f"p{i}": f"{workspace} --ctx 4096" for i in range(40)})
+    write_profiles({f"p{i}": f"{workspace} --ctx 4096" for i in range(40)})
 
     async def run() -> None:
         app = LctApp()
@@ -138,7 +138,7 @@ def test_tab_moves_between_panes_and_pages_switch_after_search(workspace):
 
 
 def test_a_click_only_highlights_and_a_double_click_starts(monkeypatch, workspace):
-    write_aliases({"a": str(workspace), "b": str(workspace)})
+    write_profiles({"a": str(workspace), "b": str(workspace)})
     monkeypatch.setattr(
         "llamacpp_tuner.servers.LCT", [sys.executable, "-c", FAKE_SERVER]
     )
@@ -159,7 +159,7 @@ def test_a_click_only_highlights_and_a_double_click_starts(monkeypatch, workspac
 
 
 def test_enter_starts_and_stops_the_highlighted_profile(monkeypatch, workspace):
-    write_aliases({"mine": str(workspace)})
+    write_profiles({"mine": str(workspace)})
     monkeypatch.setattr(
         "llamacpp_tuner.servers.LCT", [sys.executable, "-c", FAKE_SERVER]
     )
@@ -190,7 +190,7 @@ def test_ctrl_c_quits_even_from_a_text_field(workspace):
 
 
 def test_quitting_leaves_the_server_and_a_new_ui_stops_it(monkeypatch, workspace):
-    write_aliases({"mine": str(workspace)})
+    write_profiles({"mine": str(workspace)})
     monkeypatch.setattr(
         "llamacpp_tuner.servers.LCT", [sys.executable, "-c", FAKE_SERVER]
     )
@@ -217,7 +217,7 @@ def test_quitting_leaves_the_server_and_a_new_ui_stops_it(monkeypatch, workspace
 
 
 def test_switching_pages_from_settings_does_not_crash(workspace):
-    write_aliases({"mine": str(workspace)})
+    write_profiles({"mine": str(workspace)})
 
     async def run() -> None:
         app = LctApp()
@@ -229,19 +229,19 @@ def test_switching_pages_from_settings_does_not_crash(workspace):
 
 
 def test_settings_edit_in_place_and_reject_unknown_models(workspace):
-    write_aliases({"mine": f"{workspace} --ctx 4096"})
+    write_profiles({"mine": f"{workspace} --ctx 4096"})
 
     async def run() -> None:
         app = LctApp()
         async with app.run_test(size=(100, 40)) as pilot:
             await edit(pilot, app, "ctx", "8192")
-            assert load_aliases() == {"mine": f"{workspace} --ctx 8192"}
+            assert load_profiles() == {"mine": f"{workspace} --ctx 8192"}
 
             await edit(pilot, app, "name", "renamed")
-            assert list(load_aliases()) == ["renamed"]
+            assert list(load_profiles()) == ["renamed"]
 
             await edit(pilot, app, "model", "nope.gguf")
-            assert load_aliases() == {"renamed": f"{workspace} --ctx 8192"}
+            assert load_profiles() == {"renamed": f"{workspace} --ctx 8192"}
             assert app.edit_target is not None
             await pilot.press("escape")
             assert app.edit_target is None
@@ -251,32 +251,32 @@ def test_settings_edit_in_place_and_reject_unknown_models(workspace):
 
 
 def test_new_copies_the_profile_and_delete_needs_y(workspace):
-    write_aliases({"mine": f"{workspace} --ctx 4096"})
+    write_profiles({"mine": f"{workspace} --ctx 4096"})
 
     async def run() -> None:
         app = LctApp()
         async with app.run_test(size=(100, 40)) as pilot:
             await pilot.press("n")
             await pilot.pause()
-            assert load_aliases()["profile-1"] == f"{workspace} --ctx 4096"
+            assert load_profiles()["profile-1"] == f"{workspace} --ctx 4096"
             assert app.focused is app.query_one("#editor-input")
 
             await pilot.press("escape", "shift+tab", "d", "x")
-            assert "profile-1" in load_aliases()
+            assert "profile-1" in load_profiles()
             await pilot.press("d", "y")
-            assert list(load_aliases()) == ["mine"]
+            assert list(load_profiles()) == ["mine"]
 
     asyncio.run(run())
 
 
 def test_missing_model_is_kept_when_other_settings_change(workspace):
-    write_aliases({"swift": "owner/repo --file m.gguf --ctx 4096"})
+    write_profiles({"swift": "owner/repo --file m.gguf --ctx 4096"})
 
     async def run() -> None:
         app = LctApp()
         async with app.run_test(size=(100, 40)) as pilot:
             await edit(pilot, app, "ctx", "8192")
-            assert load_aliases() == {"swift": "owner/repo --file m.gguf --ctx 8192"}
+            assert load_profiles() == {"swift": "owner/repo --file m.gguf --ctx 8192"}
 
     asyncio.run(run())
 
@@ -375,7 +375,7 @@ def test_benchmark_settings_edit_and_results_stream(monkeypatch, workspace, tmp_
 
 
 def test_enter_on_a_stack_starts_and_stops_all_of_it(monkeypatch, workspace):
-    write_aliases({"a": str(workspace), "b": str(workspace)})
+    write_profiles({"a": str(workspace), "b": str(workspace)})
     (workspace.parent / "aliases.toml").write_text(
         (workspace.parent / "aliases.toml").read_text()
         + '[stacks]\nboth = ["a", "b"]\n'
@@ -413,7 +413,7 @@ def test_dragging_the_output_rule_resizes_the_log(workspace):
 
 
 def test_running_servers_show_live_usage(monkeypatch, workspace):
-    write_aliases({"mine": str(workspace)})
+    write_profiles({"mine": str(workspace)})
     monkeypatch.setattr(
         "llamacpp_tuner.servers.LCT", [sys.executable, "-c", FAKE_SERVER]
     )
@@ -447,7 +447,7 @@ except KeyboardInterrupt:
 
 
 def test_live_page_shows_a_request_in_flight_then_served(monkeypatch, workspace):
-    write_aliases({"mine": str(workspace)})
+    write_profiles({"mine": str(workspace)})
     monkeypatch.setattr(
         "llamacpp_tuner.servers.LCT", [sys.executable, "-c", FAKE_STRATA]
     )
@@ -474,7 +474,7 @@ def test_live_page_shows_a_request_in_flight_then_served(monkeypatch, workspace)
 
 
 def test_stack_members_are_nested_once_and_start_alone(monkeypatch, workspace):
-    write_aliases({"a": str(workspace), "b": str(workspace), "solo": str(workspace)})
+    write_profiles({"a": str(workspace), "b": str(workspace), "solo": str(workspace)})
     (workspace.parent / "aliases.toml").write_text(
         (workspace.parent / "aliases.toml").read_text()
         + '[stacks]\nboth = ["a", "b"]\n'
@@ -508,13 +508,13 @@ def test_stack_members_are_nested_once_and_start_alone(monkeypatch, workspace):
 
 
 def test_editing_a_profile_keeps_its_env_and_keep_awake_opt_out(workspace):
-    write_aliases({"mine": f"{workspace} --ctx 4096 --env A=1 --no-keep-awake"})
+    write_profiles({"mine": f"{workspace} --ctx 4096 --env A=1 --no-keep-awake"})
 
     async def run() -> None:
         app = LctApp()
         async with app.run_test(size=(100, 40)) as pilot:
             await edit(pilot, app, "ctx", "8192")
-            assert load_aliases() == {
+            assert load_profiles() == {
                 "mine": f"{workspace} --ctx 8192 --env A=1 --no-keep-awake"
             }
 

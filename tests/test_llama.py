@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from llamacpp_tuner import llama
+from llamacpp_tuner.backends import base, llama
 
 
 def test_finds_system_binary_without_touching_cache(monkeypatch):
@@ -196,7 +196,7 @@ def test_run_server_terminates_child_on_signal(monkeypatch):
         llama, "get_llama_binary", lambda: Path("/usr/bin/llama-server")
     )
     monkeypatch.setattr(
-        llama.signal, "signal", lambda sig, handler: handlers.setdefault(sig, handler)
+        base.signal, "signal", lambda sig, handler: handlers.setdefault(sig, handler)
     )
 
     class FakeServer:
@@ -213,7 +213,7 @@ def test_run_server_terminates_child_on_signal(monkeypatch):
             self.terminated = True
 
         def wait(self):
-            handlers[llama.signal.SIGTERM](llama.signal.SIGTERM, None)
+            handlers[base.signal.SIGTERM](base.signal.SIGTERM, None)
             return -15
 
     server = FakeServer()
@@ -228,7 +228,7 @@ def test_run_server_reports_server_failure(monkeypatch):
     monkeypatch.setattr(
         llama, "get_llama_binary", lambda: Path("/usr/bin/llama-server")
     )
-    monkeypatch.setattr(llama.signal, "signal", lambda sig, handler: None)
+    monkeypatch.setattr(base.signal, "signal", lambda sig, handler: None)
 
     class FakeServer:
         def __enter__(self):

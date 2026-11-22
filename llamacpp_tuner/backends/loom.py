@@ -10,6 +10,7 @@ which adds the Anthropic API that Claude Code needs.
 import json
 import os
 import resource
+import shlex
 import socket
 import subprocess
 import threading
@@ -18,7 +19,12 @@ import urllib.request
 from http.server import ThreadingHTTPServer
 from pathlib import Path
 
-from llamacpp_tuner.llama import run_process
+from llamacpp_tuner.backends.base import (
+    ServeOptions,
+    UnsupportedOptionError,
+    build_engine,
+    run_process,
+)
 from llamacpp_tuner.messages import make_server
 
 # Loom pins 16 MiB of I/O buffers through io_uring. Under Linux's 8 MiB default it
@@ -62,7 +68,7 @@ def _serve_when_ready(server: ThreadingHTTPServer, upstream: str, address: str) 
         except OSError:
             pass  # Loom is still starting
         time.sleep(1)
-    # lct reads the address after "listening on", as in llama-server's log.
+    # address() below finds the public address in this line.
     print(f"lct: Loom at {upstream}; listening on {address}", flush=True)
     server.serve_forever()
 
@@ -95,3 +101,35 @@ def run_loom(
     ).start()
     command = [str(binary), f"--model={package}", f"--listen={upstream}", *args]
     run_process(command, env=env, cwd=package.parent)
+
+
+def serve(model: str, options: ServeOptions, env: dict[str, str]) -> None:
+    """Run Loom for a model package; MODEL is the package directory."""
+    if (
+        options.quant
+        or options.filename
+        or options.ctx
+        or options.mmproj
+        or options.no_mmproj
+        or options.no_mmproj_offload
+    ):
+        raise UnsupportedOptionError(
+            "Loom's model, context and drafter are set in its package preset."
+        )
+    run_loom(
+        Path(model).expanduser(),
+        shlex.split(options.extra_args),
+        env=env,
+        host=options.host or "127.0.0.1",
+        port=options.port or 8080,
+    )
+
+
+def setup(force: bool, cmake_args: tuple[str, ...], torch_index: str | None) -> str:
+    return build_engine("loom", force)
+
+
+def address(line: str) -> str:
+    if line.startswith("lct: Loom at"):
+        return line.split("listening on")[-1].strip()
+    return ""
