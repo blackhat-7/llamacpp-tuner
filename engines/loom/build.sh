@@ -61,7 +61,8 @@ with open(sys.argv[3], "w") as f:
 PY
 
 if [[ -e $out ]]; then
-  if diff -rq "$out" "$tmp" >/dev/null; then
+  # Files only in the old output (such as a saved copy of the card) do not make it out of date.
+  if ! diff -rq "$out" "$tmp" | grep -qv "^Only in $out"; then
     echo "$out is up to date"
     exit 0
   fi

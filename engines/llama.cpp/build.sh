@@ -74,18 +74,33 @@ hip_build() {
     git -C "$src" cat-file -e "$commit^{commit}" 2>/dev/null || git -C "$src" fetch -q --depth 1 "$url" "$commit"
     git -C "$src" -c advice.detachedHead=false checkout -q "$commit"
   fi
-  rm -rf "$out"
   local ui_env=()
   [[ -n $ui ]] && ui_env=(HF_UI_VERSION="$ui")
   # GGML_HIP and GPU_TARGETS are the profiles' builds' flags (their CMakeCache.txt). --rocm-path: CMake 4.5 cannot
   # identify ROCm's clang without it.
-  env "${ui_env[@]}" cmake -S "$src" -B "$out" -DCMAKE_BUILD_TYPE=Release -DGGML_HIP=ON -DGPU_TARGETS="$HIP_ARCH" \
-    -DCMAKE_HIP_COMPILER="$ROCM_PATH/llvm/bin/clang++" \
-    -DCMAKE_HIP_COMPILER_ROCM_ROOT="$ROCM_PATH" -DCMAKE_PREFIX_PATH="$ROCM_PATH" \
-    -DCMAKE_HIP_FLAGS="--rocm-path=$ROCM_PATH"
-  [[ -n ${CONFIGURE_ONLY:-} ]] && { echo "configured $out"; return; }
-  cmake --build "$out" --target llama-server -j "$JOBS"
-  echo "built $out/bin/llama-server"
+  configure() {
+    env "${ui_env[@]}" cmake -S "$src" -B "$1" -DCMAKE_BUILD_TYPE=Release -DGGML_HIP=ON -DGPU_TARGETS="$HIP_ARCH" \
+      -DCMAKE_HIP_COMPILER="$ROCM_PATH/llvm/bin/clang++" \
+      -DCMAKE_HIP_COMPILER_ROCM_ROOT="$ROCM_PATH" -DCMAKE_PREFIX_PATH="$ROCM_PATH" \
+      -DCMAKE_HIP_FLAGS="--rocm-path=$ROCM_PATH"
+  }
+  if [[ -n ${CONFIGURE_ONLY:-} ]]; then
+    configure "$out.check" && rm -rf "$out.check"
+    echo "configured $src at $commit"
+    return
+  fi
+  # The binary's RUNPATH names its build dir, so build in place, with the working build set aside until the new
+  # one is done: a failed rebuild must not leave a profile without its binary.
+  rm -rf "$out.previous"
+  [[ -e $out ]] && mv "$out" "$out.previous"
+  if configure "$out" && cmake --build "$out" --target llama-server -j "$JOBS"; then
+    rm -rf "$out.previous"
+    echo "built $out/bin/llama-server"
+  else
+    rm -rf "$out"
+    [[ -e $out.previous ]] && mv "$out.previous" "$out"
+    die "the build failed; $out holds the previous build again"
+  fi
 }
 
 case $name in

@@ -41,9 +41,17 @@ git -C "$src" apply "$patch"
 # Arch's package flags: its libstdc++ assertions turn the over-read into an abort, so build the same way.
 export CFLAGS="-march=x86-64 -mtune=generic -O2 -pipe -fno-plt -fexceptions"
 export CXXFLAGS="$CFLAGS -Wp,-D_GLIBCXX_ASSERTIONS"
-rm -rf "$src/build" "$out"
-cmake -S "$src/projects/rocr-runtime" -B "$src/build" -G Ninja -DCMAKE_BUILD_TYPE=None \
-  -DCMAKE_INSTALL_PREFIX="$out" -DCMAKE_INSTALL_LIBDIR=lib -DCMAKE_PREFIX_PATH="$ROCM_PATH" -DBUILD_SHARED_LIBS=ON
-ninja -C "$src/build" -j "$JOBS"
-ninja -C "$src/build" install
-echo "built $out"
+rm -rf "$src/build" "$out.previous"
+# Set the working install aside until the new one is done: profiles and Strata configs name this path, and a failed
+# rebuild must not leave them on the stock runtime without a word.
+[[ -e $out ]] && mv "$out" "$out.previous"
+if cmake -S "$src/projects/rocr-runtime" -B "$src/build" -G Ninja -DCMAKE_BUILD_TYPE=None \
+  -DCMAKE_INSTALL_PREFIX="$out" -DCMAKE_INSTALL_LIBDIR=lib -DCMAKE_PREFIX_PATH="$ROCM_PATH" -DBUILD_SHARED_LIBS=ON &&
+  ninja -C "$src/build" -j "$JOBS" && ninja -C "$src/build" install; then
+  rm -rf "$out.previous"
+  echo "built $out"
+else
+  rm -rf "$out"
+  [[ -e $out.previous ]] && mv "$out.previous" "$out"
+  die "the build failed; $out holds the previous build again"
+fi

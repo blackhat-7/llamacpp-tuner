@@ -111,7 +111,8 @@ fi
 # appended, so a system cmake or ninja wins; the venv's fill in what is missing
 export PATH="$PATH:$VENV/bin"
 
-configure() { [[ -f $2/build.ninja ]] || cmake -G Ninja -S "$1" -B "$2" -DCMAKE_BUILD_TYPE=Release "${@:3}"; }
+# Always configure: changed flags (HIP_ARCH, CUDA_ARCH, NVCC, ROCM_PATH) must reach an existing build dir.
+configure() { cmake -G Ninja -S "$1" -B "$2" -DCMAKE_BUILD_TYPE=Release "${@:3}"; }
 
 # 4. The HIP engine (flags of upstream's AMD source build: setup.py's engine step).
 export HIP_PLATFORM=amd HIP_COMPILER=clang HIP_RUNTIME=rocclr HIP_PATH=$ROCM_PATH
@@ -160,6 +161,11 @@ install_file "$REPO/bench/strata-compare/share/swift-1.5-iq3_xxs.bin" "$STRATA_D
 install_file "$REPO/bench/strata-compare/share/draft_vocab_agent.bin" "$STRATA_DATA/draft_vocab_agent.bin" 644
 install_file "$REPO/bench/strata-compare/share/swift-1.5-mixb-learned-frozen13.bin" \
   "$STRATA_DATA/profiles/swift-1.5-mixb-learned-frozen13.bin" 644
+# The engine saves what it learns over the profile it loads; start each missing one from the Swift profile.
+for model in iq3_xxs mixb mixd; do
+  learned=$STRATA_DATA/profiles/swift-1.5-$model-learned.bin
+  [[ -e $learned ]] || cp "$STRATA_DATA/profiles/swift-1.5-iq3_xxs.bin" "$learned"
+done
 
 # 8. The run configs.
 render_args=()

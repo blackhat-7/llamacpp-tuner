@@ -6,6 +6,7 @@ Adopted results do not live here; they go to `engines/` and `profiles.toml` (`do
 - One folder per study or tool set, with a short `README.md`: the question, how to run each tool, the env vars
   it needs, and the research doc that holds the numbers.
 - Paths come from env vars (`LCT_HOME`, `STRATA_SRC`, `STRATA_DATA`, …) or arguments, never `/home/<user>/…`.
+  Scripts copied as they ran may keep their old `~/…` paths; their README names them.
 - Commit scripts and small inputs. Outputs, logs and big files go to `$LCT_HOME/experiments/<study>/`.
 - This folder is not linted; keep scripts runnable rather than polished.
 
