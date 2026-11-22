@@ -25,7 +25,7 @@ Each line carries its own done-check. A task too big for one session gets split 
 - [ ] **Prompt reads on the 4070 too.** Design (2026-11-17, `docs/dual-gpu-research.md` "Round 13"): mask the 4070's experts out of the routed ids before `fused::group` (they get no rows; no XTX kernel change), skip them in the stream, send the XTX's int8 `Xq` + ids + weights to the plugin, run the CUDA fused prompt kernels there, return one FP32 sum per token, add it with `moe_combine_peer`. Est. +4-8% on long reads (the x4 return of the sums, ~22 ms a layer, is the limit) = ~0.5-1% of engine time: below the 10% bar. Done when a 35K read is measured both ways.
 - [ ] **Fuse the drafter's step.** 0.55 ms of ~16 small kernels, ~2.3x its memory floor; ~1.2 ms a round at `--spec 6` (~+4%). Done when the step is measured fused and the drafts are unchanged.
 - [ ] **The 4070's tier in resident RAM mode.** Its swaps must exchange with the RAM copy (today they leave the CPU reading the SSD), so full 4-bit (perplexity 3.99, code 113 t/s) can adapt. Done when the full 4-bit run reads no expert from the file.
-- [ ] **Free the 4-bit download's unused bytes.** Blocked: the user deleted the IQ4_XS shards 2026-11-21. mixD reads only 30 layers' down tensors from the 91 GiB IQ4_XS shards; punch holes in the rest (offsets stay valid). Done when the shards use ~14 GB on disk and mixD still loads.
+- [ ] **Free the 4-bit download's unused bytes.** mixD reads only 30 layers' down tensors from the 91 GiB IQ4_XS shards; punch holes in the rest (offsets stay valid). Done when the shards use ~14 GB on disk and mixD still loads.
 
 ### Inkling-2-Mini on one GPU (Loom; `docs/inkling-loom-research.md`)
 
