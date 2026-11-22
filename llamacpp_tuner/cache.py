@@ -21,10 +21,10 @@ def get_cache_dir() -> Path:
 
 
 def get_profiles_path() -> Path:
-    """A checkout's profiles.toml, kept in git; with LCT_HOME set, or for an
-    installed lct, aliases.toml in the cache dir."""
-    checkout = get_checkout_dir()
-    if checkout and not os.environ.get("LCT_HOME"):
+    """A checkout's profiles.toml, kept in git; aliases.toml in the cache dir for
+    an installed lct. LCT_HOME moves only the cache dir, so a worktree can share
+    the main checkout's downloads and still serve its own branch's profiles."""
+    if checkout := get_checkout_dir():
         return checkout / "profiles.toml"
     return get_cache_dir() / "aliases.toml"
 

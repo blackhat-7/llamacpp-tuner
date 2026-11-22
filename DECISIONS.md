@@ -140,7 +140,7 @@ Two overlapping generations make Loom reserve 4 GB more, fail and drop its model
 
 ## 2026-11-22: Profiles live in `profiles.toml` in git, with paths as `${LCT_HOME}/...`
 The profiles a machine serves must survive a fresh clone; `tmp/aliases.toml` was the only copy. lct expands `${LCT_HOME}` on read and writes cache-dir paths back that way, so TUI edits and `lct import` keep the file portable.
-With `LCT_HOME` set, or for an installed lct, profiles stay in `$LCT_HOME/aliases.toml` (tests use this). The old file is `tmp/aliases.toml.before-profiles-2026-11-22`.
+`LCT_HOME` moves only the cache dir, so a worktree with `LCT_HOME=<main>/tmp` serves its own branch's profiles. An installed lct keeps `aliases.toml` in its cache dir. The old file is `tmp/aliases.toml.before-profiles-2026-11-22`.
 
 ## 2026-11-22: Engine changes live in `engines/<engine>/`: an exact pin, our changes, `build.sh`
 Patches against the upstream tag (`git format-patch`) instead of a pushed fork: one repo to clone, diffs to review, no second remote to keep alive. Builds install under `$LCT_HOME`; a changed build gets a new name, so profiles roll back by path.

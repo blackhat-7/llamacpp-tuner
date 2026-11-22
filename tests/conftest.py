@@ -1,6 +1,6 @@
 import pytest
 
-from llamacpp_tuner import servers
+from llamacpp_tuner import cache, servers
 
 
 @pytest.fixture(autouse=True)
@@ -13,3 +13,5 @@ def no_real_gpu_hold(monkeypatch):
 def private_lct_home(monkeypatch, tmp_path):
     """Keep every test away from the checkout's profiles.toml and tmp/."""
     monkeypatch.setenv("LCT_HOME", str(tmp_path))
+    # Not a checkout, so profiles live in LCT_HOME too.
+    monkeypatch.setattr(cache, "_PROJECT_ROOT", tmp_path / "no-checkout")

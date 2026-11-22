@@ -23,8 +23,9 @@ never the only copy of anything we rely on.
 ## Profiles
 
 - A profile is a name for `lct serve` arguments; a stack is a list of profiles (`[stacks]`).
-- In a checkout, lct reads and writes `profiles.toml` at the repo root. With `LCT_HOME` set, or outside a checkout,
-  it uses `$LCT_HOME/aliases.toml`. The format is the same.
+- In a checkout, lct reads and writes `profiles.toml` at the repo root. `LCT_HOME` moves only the cache dir, so a
+  worktree can share the main checkout's `tmp/` and serve its own branch's profiles. An installed lct uses
+  `aliases.toml` in its cache dir. The format is the same.
 - `${LCT_HOME}` in a profile becomes the cache dir when lct reads it. lct writes paths under the cache dir back as
   `${LCT_HOME}/...` (TUI edits, `lct import`, `lct setup`), so the file stays portable.
 - The profiles in git are what this machine serves. Another machine edits them; a fork keeps its own.

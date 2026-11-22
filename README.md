@@ -74,7 +74,7 @@ lct serve /models/model.gguf --extra-args "-ngl all"
 lct models
 ```
 
-Save frequently used `serve` arguments as profiles. In a clone they live in `profiles.toml` at the repo root (in git); with `LCT_HOME` set, or for an installed lct, in `aliases.toml` in the cache directory (see below). Write paths inside the cache directory as `${LCT_HOME}/...`; lct fills it in when it reads the file and writes such paths back that way, so the file works on any machine:
+Save frequently used `serve` arguments as profiles. In a clone they live in `profiles.toml` at the repo root (in git); for an installed lct, in `aliases.toml` in the cache directory (see below). `LCT_HOME` moves only the cache directory. Write paths inside the cache directory as `${LCT_HOME}/...`; lct fills it in when it reads the file and writes such paths back that way, so the file works on any machine:
 
 ```toml
 qwen = """owner/model-GGUF --quant Q6_K --ctx 32768 \

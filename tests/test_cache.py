@@ -33,12 +33,14 @@ def test_checkout_keeps_profiles_in_the_repository(monkeypatch, tmp_path):
     assert cache.get_profiles_path() == tmp_path / "profiles.toml"
 
 
-def test_lct_home_keeps_profiles_in_the_cache_dir(monkeypatch, tmp_path):
+def test_lct_home_moves_only_the_cache_dir_of_a_checkout(monkeypatch, tmp_path):
+    # A worktree that shares the main checkout's downloads keeps its own profiles.
     monkeypatch.setenv("LCT_HOME", str(tmp_path / "home"))
     monkeypatch.setattr(cache, "_PROJECT_ROOT", tmp_path)
     (tmp_path / "pyproject.toml").touch()
 
-    assert cache.get_profiles_path() == tmp_path / "home" / "aliases.toml"
+    assert cache.get_profiles_path() == tmp_path / "profiles.toml"
+    assert cache.get_cache_dir() == tmp_path / "home"
 
 
 def test_installed_package_keeps_profiles_in_the_cache_dir(monkeypatch, tmp_path):
