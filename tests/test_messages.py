@@ -455,3 +455,22 @@ def test_server_sends_images_when_the_model_lists_image_input():
             ],
         }
     ]
+
+
+def test_requests_naming_any_model_reach_the_model_loom_serves():
+    # Clients made for llama-server send any name ("local"); Loom answers only to its own.
+    loom = ThreadingHTTPServer(("127.0.0.1", 0), VisionLoom)
+    server = make_server("127.0.0.1", 0, f"127.0.0.1:{loom.server_address[1]}")
+    for s in (loom, server):
+        threading.Thread(target=s.serve_forever, daemon=True).start()
+    base = f"http://127.0.0.1:{server.server_address[1]}"
+    chat = {"model": "local", "messages": [{"role": "user", "content": "hi"}]}
+    message = {**chat, "max_tokens": 9}
+    try:
+        post(f"{base}/v1/chat/completions", chat)
+        post(f"{base}/v1/messages", message)
+    finally:
+        server.shutdown()
+        loom.shutdown()
+
+    assert [r["model"] for r in VisionLoom.received[-2:]] == ["m", "m"]

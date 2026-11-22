@@ -165,7 +165,9 @@ generator had no `inkling2v` family, so the upstream package was text-only. `kv8
   lct runs `sudo prlimit` on its own process when the ceiling is below 64 MiB: one approval per start, nothing on
   disk (the user wants no system-file edits). A capability on `loom-serve` does not work: it loads its libraries
   through `$ORIGIN`.
-- Loom accepts only its own model id (`Inkling-2-Mini`); it lists it about 5 s after its own ready line.
+- Loom accepts only its own model id (`Inkling-2-Mini`) and lists it about 5 s after its own ready line. Clients made
+  for llama-server name any model (birbot's Hermes sent `local` and got 404), so the translator sends every request to
+  the one model Loom serves.
 - Loom's default wait mode is as fast as the busy-wait spin through lct (140 / 121 vs 143 / 121 short) and keeps
   the CPU free for games.
 

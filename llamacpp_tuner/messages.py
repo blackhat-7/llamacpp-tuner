@@ -355,24 +355,25 @@ def make_server(host: str, port: int, upstream: str) -> ThreadingHTTPServer:
     # overlaps the first makes it reserve 4 GB more, fail and drop the model until
     # restarted. Claude Code sends side requests (titles) alongside its main one.
     generating = threading.Lock()
-    modalities: dict[str, bool] = {}
+    served: dict = {}
 
-    def sees_images() -> bool:
-        # Loom lists each model's input modalities; a text-only package rejects images.
-        if "image" not in modalities:
+    def loom_model() -> dict:
+        """The model Loom serves, read once: {"id": its id, "images": takes images}."""
+        if not served:
             connection = http.client.HTTPConnection(
                 upstream_host, int(upstream_port), timeout=60
             )
             try:
                 connection.request("GET", "/v1/models")
-                catalog = json.loads(connection.getresponse().read())
+                models = json.loads(connection.getresponse().read()).get("data")
             finally:
                 connection.close()
-            modalities["image"] = any(
-                "image" in model.get("input_modalities", [])
-                for model in catalog.get("data", [])
-            )
-        return modalities["image"]
+            if not models:
+                raise http.client.HTTPException("Loom lists no model")
+            # A text-only package rejects images, so they become a note instead.
+            images = "image" in models[0].get("input_modalities", [])
+            served.update(id=models[0]["id"], images=images)
+        return served
 
     class Handler(BaseHTTPRequestHandler):
         upstream_connection: http.client.HTTPConnection | None = None
@@ -426,14 +427,20 @@ def make_server(host: str, port: int, upstream: str) -> ThreadingHTTPServer:
 
         def _count(self, body: dict) -> None:
             # Loom counts a chat request's tokens and answers in Anthropic's shape.
-            request = {**to_openai(body, sees_images()), "stream": False}
+            model = loom_model()
+            request = {
+                **to_openai(body, model["images"]),
+                "model": model["id"],
+                "stream": False,
+            }
             request.pop("stream_options", None)
             path = "/v1/chat/completions/input_tokens"
             response = self._upstream("POST", path, json.dumps(request).encode())
             self._send(response.status, json.loads(response.read()))
 
         def _message(self, body: dict) -> None:
-            request = to_openai(body, sees_images())
+            model = loom_model()
+            request = {**to_openai(body, model["images"]), "model": model["id"]}
             response = self._upstream(
                 "POST", "/v1/chat/completions", json.dumps(request).encode()
             )
@@ -454,6 +461,13 @@ def make_server(host: str, port: int, upstream: str) -> ThreadingHTTPServer:
                 self.wfile.flush()
             self.wfile.write(b"".join(stream.finish()))
             self.wfile.flush()
+
+        def _chat(self, request: dict) -> None:
+            # Loom answers only to its own model id; clients made for llama-server name
+            # any model ("local"), so every request goes to the one model Loom serves.
+            request = {**request, "model": loom_model()["id"]}
+            request.setdefault("temperature", TEMPERATURE)
+            self._forward("POST", json.dumps(request).encode())
 
         def _guarded(self, work) -> None:
             try:
@@ -479,11 +493,8 @@ def make_server(host: str, port: int, upstream: str) -> ThreadingHTTPServer:
                 with generating:
                     self._guarded(lambda: self._message(json.loads(raw)))
             elif path == "/v1/chat/completions":
-                request = json.loads(raw)
-                request.setdefault("temperature", TEMPERATURE)
-                sampled = json.dumps(request).encode()
                 with generating:
-                    self._guarded(lambda: self._forward("POST", sampled))
+                    self._guarded(lambda: self._chat(json.loads(raw)))
             else:
                 self._guarded(lambda: self._forward("POST", raw))
 
