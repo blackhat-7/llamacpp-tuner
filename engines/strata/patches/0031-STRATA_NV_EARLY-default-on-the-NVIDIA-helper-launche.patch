@@ -1,0 +1,28 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: blackhat-7 <44942105+blackhat-7@users.noreply.github.com>
+Date: Tue, 17 Nov 2026 07:42:33 +0530
+Subject: [PATCH 31/33] STRATA_NV_EARLY (default on): the NVIDIA helper
+ launches at its claim, before the CPU jobs are built (prose +2%, code +3% in
+ generate mode)
+
+---
+ src/core/expert_source.cpp | 6 +++++-
+ 1 file changed, 5 insertions(+), 1 deletion(-)
+
+diff --git a/src/core/expert_source.cpp b/src/core/expert_source.cpp
+index 45de740a9..a5b3ce0e1 100644
+--- a/src/core/expert_source.cpp
++++ b/src/core/expert_source.cpp
+@@ -5073,7 +5073,11 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
+                 if (!h.d->remote[r]->dispatch(h.d->layers, h.x, h.n_tok, e)) { h.failed = true; h.d->fail = e.c_str(); }
+         }
+     } helper_launch{&d, x_f, n_tok};
+-    helper_launch.done = !(d.remote_count > 0 && d.remote[0]->nv());
++    // STRATA_NV_EARLY (default on; =0: the pool's pre-drain hook launches it, as before): the NVIDIA helper launches
++    // at its claim, before the CPU's jobs are built.  Its round trip is the longer one on most prose layers, so it
++    // starts first (2026-11-17, generate mode: prose +2%, code +3%; the jobs' ~10 us no longer delay it).
++    static const bool nv_early = [] { const char* v = std::getenv("STRATA_NV_EARLY"); return !(v && v[0] == '0'); }();
++    helper_launch.done = nv_early || !(d.remote_count > 0 && d.remote[0]->nv());
+     if (d.remote_count > 0) {
+         static thread_local std::string remote_error;
+         for (int r = 0; r < d.remote_count; ++r) {

@@ -1,0 +1,1814 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: blackhat-7 <44942105+blackhat-7@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 04:20:58 +0530
+Subject: [PATCH 02/33] Router and launch cuts on gfx1100: DPP top-10, router
+ tail, GDN a/b ILP, the gfx1100 defaults table, fewer nodes a window
+
+Port of opt7/integrate 4674b8b0 c2999081 74f1bdec 18127ff0 9773eb79 163d880d 1da0aa88 (router, table) and
+0a347f12 44b62163 0ef47c13 c3574b6d (launch) onto v0.2.9. One commit: the router tail block in verify.cpp uses the
+launch switches' state (the shared gate in the tail, one-token windows), so the two cannot build apart.
+- gfx1100 defaults table (STRATA_GFX1100_DEFAULTS=0 turns it off; a switch you set is kept): ROUTE_DPP (top-10 one
+  wave per token with DPP), ROUTER_TAIL (router GEMV + top-10 + doorbell in one launch), GDN_AB_ILP (a/b projections
+  one warp per row and token, loads first), FUSE_CONVAB, MULTI_BLOCK_ARGMAX. Each bitwise its original.
+- Opt-in, set by the run config: SH_GATE_TAIL, COMBINE_MAPPED, QSA_GATE_Q8, MAPPED_FAST, T1_FUSE, QSA_FOLD,
+  ROUTER_TAIL_ROWS. QSA_FOLD re-done on v0.2.9's indexer lambdas (idx_key makes the query projection too, main
+  stream only; idx_snap skips the tails the window start already took).
+- The router tail is not used where something rewrites ids between the top-10 and the ring: v0.2.9's
+  STRATA_ROUTE_PRIOR (g_route_prior), ROUTE_RESIDENT, the device plan, the doorbell store, always-publish.
+- Dropped STRATA_HEAD_Q8 (not bitwise on HIP, never enabled).
+Measured on 0.1.43: router set code +2.7%, edit +1.3%; node cuts 1,674 -> 1,193 nodes a 4-token window, code +5%.
+---
+ CMakeLists.txt                            |   5 +
+ include/strata/core/arch_defaults.hpp     |   5 +-
+ include/strata/core/verify.hpp            |   1 +
+ include/strata/kernels/bf16_gemv.hpp      |   5 +
+ include/strata/kernels/native_moe.hpp     |   9 +
+ include/strata/kernels/native_qsa.hpp     |   4 +
+ include/strata/kernels/native_router.hpp  |  12 ++
+ include/strata/kernels/verify_kernels.hpp |  16 +-
+ src/core/arch_defaults.cpp                |  20 +-
+ src/core/arch_defaults_test.cpp           |  13 +-
+ src/core/verify.cpp                       | 141 +++++++++++--
+ src/kernels/cuda/mmvf_multi.cuh           | 166 +++++++++++++++
+ src/kernels/cuda/native_bf16.cu           | 108 ++++------
+ src/kernels/cuda/native_moe.cu            | 100 +++++++++
+ src/kernels/cuda/native_qsa.cu            |  40 ++++
+ src/kernels/cuda/native_router.cu         | 246 ++++++++++++++++++++++
+ src/kernels/cuda/verify_kernels.cu        | 159 +++++++++++---
+ src/kernels/router_tail_parity.cpp        | 201 ++++++++++++++++++
+ 18 files changed, 1132 insertions(+), 119 deletions(-)
+ create mode 100644 src/kernels/cuda/mmvf_multi.cuh
+ create mode 100644 src/kernels/router_tail_parity.cpp
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 692484a80..7d1a0236b 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -1475,6 +1475,11 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
+   target_include_directories(router_top10_parity PRIVATE ${_strata_gpu_include_directories})
+   target_link_libraries(router_top10_parity PRIVATE strata_kernels ${_strata_gpu_runtime_target})
+   add_test(NAME router_top10_parity COMMAND router_top10_parity --selftest)
++  # STRATA_ROUTER_TAIL: the router GEMV + top-10 + doorbell launch, bitwise against the three launches it replaces
++  add_executable(router_tail_parity src/kernels/router_tail_parity.cpp)
++  target_include_directories(router_tail_parity PRIVATE ${_strata_gpu_include_directories})
++  target_link_libraries(router_tail_parity PRIVATE strata_kernels ${_strata_gpu_runtime_target})
++  add_test(NAME router_tail_parity COMMAND router_tail_parity)
+   # #783 PR-c: the multi-token router and the k = 10 float4 combine, bitwise against the single-token contracts
+   add_executable(native_multi_parity src/kernels/native_multi_parity.cpp)
+   target_include_directories(native_multi_parity PRIVATE ${_strata_gpu_include_directories})
+diff --git a/include/strata/core/arch_defaults.hpp b/include/strata/core/arch_defaults.hpp
+index 2025af482..c1dd3bf05 100644
+--- a/include/strata/core/arch_defaults.hpp
++++ b/include/strata/core/arch_defaults.hpp
+@@ -7,8 +7,11 @@
+ // Switches that change bits (STRATA_PF_GEMM, STRATA_PF_FUSED, STRATA_HC_UPMIX, STRATA_PA_FAST, STRATA_HIP_WMMA,
+ // STRATA_SELECT_WMMA, STRATA_HC_Q8: rounding-level, KL-gated) stay opt-in in THIS table; docs/STRIX_HALO.md lists them.  Five of them
+ // (HIP_WMMA, PF_GEMM, PA_FAST, SELECT_WMMA, HC_UPMIX) are an opt-in set on an integrated Radeon (igpu_default_env() below).
++// gfx12 has its own, smaller table; gfx1100 (RX 7900 XTX) one of decode kernel switches, each with bit-identical
++// verify windows.
+ //
+-// A switch the user set (to anything) is never overridden; STRATA_GFX1151_DEFAULTS=0 turns the whole table off.
++// A switch the user set (to anything) is never overridden; STRATA_GFX1151_DEFAULTS=0 (STRATA_GFX12_DEFAULTS=0,
++// STRATA_GFX1100_DEFAULTS=0) turns the whole table off.
+ #pragma once
+ 
+ #include <string>
+diff --git a/include/strata/core/verify.hpp b/include/strata/core/verify.hpp
+index 1b67dd3ca..eab87ef5f 100644
+--- a/include/strata/core/verify.hpp
++++ b/include/strata/core/verify.hpp
+@@ -533,6 +533,7 @@ private:
+     bool device_plan_ = false;            ///< E-6: resident-only layers planned on the device (STRATA_VERIFY_DEVICE_PLAN)
+     uint32_t* skip_ = nullptr;            ///< E-6: per group, the ring whose plan the device built (0: the host's)
+     unsigned* qcnt_ = nullptr;             ///< S26 STRATA_QFUSE: the HC read's q8_1 group counters (n_embd / 32)
++    unsigned* tail_ticket_ = nullptr;      ///< STRATA_ROUTER_TAIL: its launches' ticket (each leaves it zero)
+     unsigned long long* slot_off_d_ = nullptr;   ///< E-6: the slot offsets on the device
+     int64_t lb_ = 0, le_ = -1;           ///< set_stage: the layers this verifier runs (-1: to the last)
+     int handoff_rows_ = 0;               ///< set_handoff_rows (0: kVerifyNarrowT)
+diff --git a/include/strata/kernels/bf16_gemv.hpp b/include/strata/kernels/bf16_gemv.hpp
+index 19c4207f3..bd733d515 100644
+--- a/include/strata/kernels/bf16_gemv.hpp
++++ b/include/strata/kernels/bf16_gemv.hpp
+@@ -63,6 +63,11 @@ void bf16_gemv_fp32_mmvf_multi(const float* x, int64_t ldx, const uint16_t* w, f
+ /// S26 STRATA_LFUSE: bf16_gemv_fp32_mmvf_multi(x, ldx, w, y, ldy, n_in, n_out, n_tok) plus the 1-row
+ /// bf16_gemv_fp32_mmvf_multi(x, ldx, w_aux, y_aux, ldy_aux, n_in, 1, n_tok) in ONE launch, every output bitwise the
+ /// two calls'. Returns false (nothing launched) unless the rows path applies (STRATA_MMVF_ROWS=1, n_out >= 64, 2-8 rows).
++/// STRATA_QSA_FOLD: bf16_gemv_fp32_mmvf_multi of w1 and of w2 on the same input in one launch, bitwise the two calls;
++/// false (nothing launched) where the two calls would not both take the plain multi-row kernel
++bool bf16_gemv_fp32_mmvf_multi_pair(const float* x, int64_t ldx, int64_t n_in, int n_tok, const uint16_t* w1, float* y1,
++                                    int64_t ldy1, int64_t n_out1, const uint16_t* w2, float* y2, int64_t ldy2, int64_t n_out2,
++                                    void* stream);
+ bool bf16_gemv_fp32_mmvf_multi_aux(const float* x, int64_t ldx, const uint16_t* w, float* y, int64_t ldy,
+                                    int64_t n_in, int64_t n_out, int n_tok, const uint16_t* w_aux, float* y_aux,
+                                    int64_t ldy_aux, void* stream);
+diff --git a/include/strata/kernels/native_moe.hpp b/include/strata/kernels/native_moe.hpp
+index 2bb2923e7..e950ebacb 100644
+--- a/include/strata/kernels/native_moe.hpp
++++ b/include/strata/kernels/native_moe.hpp
+@@ -23,6 +23,15 @@ bool native_moe_combine_hits_supported(const float* parts, const float* shared,
+ void native_moe_combine_multi_hits_added(const float* parts, const float* hits, const int32_t* dst, const int32_t* count,
+                                          const float* weights, const float* shared, float* output, int64_t n_embd, int64_t k,
+                                          int n_tok, void* stream);
++/// native_moe_combine_multi_hits_added with launches folded in, bitwise the unfused sequence.  `flag` non-null
++/// (STRATA_COMBINE_MAPPED): `parts` are the mapped host rows; the launch waits for *flag >= value, reads the CPU rows
++/// there and every hit row as 0.0f + hit - copy_rows_from_mapped_after + the combine.  `shared_gate` non-null
++/// (STRATA_SH_GATE_TAIL): `shared` is unscaled and is scaled by sigmoid(shared_gate[t]) - shared_expert_multi's
++/// sigmoid + scale launch + the combine.
++void native_moe_combine_multi_hits_x(const float* parts, const float* hits, const int32_t* dst, const int32_t* count,
++                                     const float* weights, const float* shared, const float* shared_gate, float* output,
++                                     int64_t n_embd, int64_t k, int n_tok, const uint32_t* flag, uint32_t value,
++                                     void* stream);
+ void native_moe_combine_multi(const float* parts, const float* weights, const float* shared, float* output,
+                               int64_t n_embd, int64_t k, int n_tok, void* stream);
+ /// STRATA_VERIFY_RESIDENT: the same, reading every part as `0.0f + hit[i]` - bitwise what a zeroed part row plus
+diff --git a/include/strata/kernels/native_qsa.hpp b/include/strata/kernels/native_qsa.hpp
+index e789fa3e3..ee272b1f0 100644
+--- a/include/strata/kernels/native_qsa.hpp
++++ b/include/strata/kernels/native_qsa.hpp
+@@ -31,5 +31,9 @@ void native_qsa_rms_norm_grouped(const float* input, const float* gamma, float*
+ // Exact output==attn is supported; all other spans must be disjoint.
+ void native_qsa_gate_apply(const float* attn, const float* q_full, float* output,
+                            int n_head, int head_dim, void* stream);
++/// STRATA_QSA_GATE_Q8 (HIP): native_qsa_gate_apply + native_quantize_q8_1(output, x_q8_1, n_head * head_dim, 1) in one
++/// launch, both outputs bitwise the two launches'; false (nothing launched) where it does not apply.
++bool native_qsa_gate_apply_q8_1(const float* attn, const float* q_full, float* output, void* x_q8_1,
++                                int n_head, int head_dim, void* stream);
+ 
+ } // namespace strata::kernels
+diff --git a/include/strata/kernels/native_router.hpp b/include/strata/kernels/native_router.hpp
+index a940e1b35..c31faa830 100644
+--- a/include/strata/kernels/native_router.hpp
++++ b/include/strata/kernels/native_router.hpp
+@@ -20,6 +20,18 @@ void native_router_top10_multi(const float* logits, int32_t* ids, float* weights
+ /// 256 / 8 (Qwen3.6-35B-A3B).  logits [n_tok, n_expert], ids / weights [n_tok, k].  CUDA / HIP.
+ bool native_router_topk_supported(int n_expert, int k);
+ void native_router_topk(const float* logits, int32_t* ids, float* weights, int n_expert, int k, int n_tok, void* stream);
++/// STRATA_ROUTER_TAIL (HIP wave32 RDNA, with STRATA_ROUTE_DPP): true when native_router_tail should replace a
++/// verify layer's router GEMV, top-10 and doorbell.
++bool router_tail_on();
++/// The router GEMV (bf16_gemv_fp32_mmvf_multi of x [n_tok][n_in] by w [512][n_in] into logits [n_tok][512]), the
++/// top-10 (native_router_top10_multi) and the doorbell (doorbell_publish_res: ids to `ids_out`, the activations to
++/// `x_out`, then `seq` incremented) in ONE launch, every output bitwise the same; the activations are published even
++/// when no expert is a miss.  `ticket`: a zeroed device word, left zero.  n_tok 2..4, n_in 2560 only; false (nothing
++/// launched) otherwise or without the HIP DPP router.  STRATA_SH_GATE_TAIL: with `w_sg` (one bf16 row of n_in) the
++/// launch also writes sg_out[t], bitwise bf16_gemv_fp32_mmvf_multi(x, n_in, w_sg, sg_out, 1, n_in, 1, n_tok).
++bool native_router_tail(const float* x, const uint16_t* w, float* logits, int32_t* ids, float* weights, float* x_out,
++                        int32_t* ids_out, uint32_t* seq, unsigned* ticket, int n_tok, int n_in, void* stream,
++                        const uint16_t* w_sg = nullptr, float* sg_out = nullptr);
+ /// STRATA_ROUTE_RESIDENT: swap non-resident tail-rank experts for resident ones within `margin` logits (see the .cu).
+ /// `stats` is nullptr or 4 device uint64 counters: tail entries seen, swaps, non-resident before, non-resident after.
+ void native_route_resident(const float* logits, int32_t* ids, float* weights, const int32_t* res_layer, int n_tok, float margin,
+diff --git a/include/strata/kernels/verify_kernels.hpp b/include/strata/kernels/verify_kernels.hpp
+index 4d8f2e590..ab8606f15 100644
+--- a/include/strata/kernels/verify_kernels.hpp
++++ b/include/strata/kernels/verify_kernels.hpp
+@@ -180,16 +180,26 @@ void argmax_rows(const float* logits, int n_rows, int n, void* scratch, int32_t*
+ uint64_t row_top_prob_scratch_bytes(int n_rows);
+ void row_top_prob_split(const float* logits, int n_rows, int n_vocab, const int32_t* ids, float* probs, void* scratch,
+                         void* stream);
++/// row_top_prob_split, then ids[t] = map[ids[t]] (map_ids: the draft head's subset index -> its token id) in the same
++/// launch where row_top_prob_split is its own kernel (multi_block_head_ops()), else the two launches.
++void row_top_prob_split_map(const float* logits, int n_rows, int n_vocab, int32_t* ids, float* probs, void* scratch,
++                            const int32_t* map, void* stream);
++/// row_top_prob_split_map, then mtp_select's token work with no residual copy (R_dst = nullptr) in the same launch:
++/// row *row_dev's token to tok_dst, its probability to out_p[j] and the token to out[j] (mapped host memory, last).
++void row_top_prob_split_map_select(const float* logits, int n_rows, int n_vocab, int32_t* ids, float* probs,
++                                   void* scratch, const int32_t* map, const int32_t* row_dev, int32_t* tok_dst,
++                                   int32_t* out, int j, float* out_p, void* stream);
+ /// #879 guard: flags[t * kNonfiniteBlocks + b] = 1 when slice b of row t (n floats a row) holds a NaN or an infinity,
+ /// else 0, for n_rows rows.  Every word is written on every launch (nothing to clear between windows), so `flags` can
+ /// be mapped host memory read after the window's own sync.  Graph-capturable; CUDA and HIP.
+ inline constexpr int kNonfiniteBlocks = 16;
+ void logits_nonfinite_rows(const float* logits, int n_rows, int n, uint32_t* flags, void* stream);
+-/// True where row_top_prob_split runs as its own kernel (CUDA; AMD keeps the one-block row_top_prob, so it calls
+-/// that).  STRATA_MULTI_BLOCK_ARGMAX=0: off.
++/// True where row_top_prob_split runs as its own kernel (CUDA; on the wave32 HIP backend gfx1100 by default; gfx906
++/// keeps the one-block row_top_prob, so it calls that).  STRATA_MULTI_BLOCK_ARGMAX=0: off (=1 on HIP: on any card).
+ bool multi_block_head_ops();
+ /// True where the verify head's and the draft's greedy pick should be argmax_rows: sm_80 to sm_89 (the one-block
+-/// kernel is slow there; sm_90+ has sample_tokens' cluster kernel, other cards keep sample_tokens).
++/// kernel is slow there; sm_90+ has sample_tokens' cluster kernel), and wave32 HIP with STRATA_MULTI_BLOCK_ARGMAX=1 (the
++/// gfx1100 default) or wherever multi_block_head_ops() is on; other cards keep sample_tokens.
+ bool argmax_rows_wanted();
+ /// Dense-attention step records for `n` cells: [cell, cell+1, (cell+1)/4, cell+1] from cells[i] (device memory).
+ void dense_steps(const int32_t* cells, int n, int32_t* steps, void* stream);
+diff --git a/src/core/arch_defaults.cpp b/src/core/arch_defaults.cpp
+index 9da2f6429..c0362be0b 100644
+--- a/src/core/arch_defaults.cpp
++++ b/src/core/arch_defaults.cpp
+@@ -52,6 +52,20 @@ std::vector<std::pair<std::string, std::string>> arch_default_env(const char* gc
+         t.push_back({"STRATA_EXPDEC", "1"});
+         return t;
+     }
++    if (strata::kernels::gfx_arch_is(gcn_arch, "gfx1100")) {
++        // gfx1100 (RX 7900 XTX): decode kernels for the small serial steps before a layer's doorbell, each bitwise its
++        // original (Qwen3.8 Flash-Next IQ3_XXS, greedy: every verify window bit-identical; numbers in each kernel).
++        const char* off1100 = std::getenv("STRATA_GFX1100_DEFAULTS");
++        if (off1100 != nullptr && off1100[0] == '0') return t;
++        t = {
++            {"STRATA_ROUTE_DPP", "1"},            // the router's top-10, one wave per token with DPP exchanges
++            {"STRATA_ROUTER_TAIL", "1"},          // ... in the router GEMV's launch, with the doorbell
++            {"STRATA_GDN_AB_ILP", "1"},           // the GDN a/b projections, one warp per (row, token), loads first
++            {"STRATA_FUSE_CONVAB", "1"},          // ... in the conv's launch
++            {"STRATA_MULTI_BLOCK_ARGMAX", "1"},   // the greedy picks (verify head, draft steps) over many blocks
++        };
++        return t;
++    }
+     if (!strata::kernels::gfx_arch_is_gfx1151(gcn_arch)) return t;
+     const char* off = std::getenv("STRATA_GFX1151_DEFAULTS");
+     if (off != nullptr && off[0] == '0') return t;
+@@ -180,11 +194,11 @@ std::vector<std::string> apply_arch_defaults(const char* gcn_arch, bool integrat
+         set.push_back(kv.first);
+     }
+     if (!set.empty()) {
+-        const bool g12 = strata::kernels::gfx_arch_is_gfx12(gcn_arch);
++        const bool g12 = strata::kernels::gfx_arch_is_gfx12(gcn_arch), g1100 = strata::kernels::gfx_arch_is(gcn_arch, "gfx1100");
+         std::fprintf(stderr, "strata: %s: %zu exact speed switches on by default (%s=0 turns "
+                              "them off; a switch you set is kept): ",
+-                     g12 ? "gfx12 (RDNA4)" : "gfx1151 (Strix Halo)", set.size(),
+-                     g12 ? "STRATA_GFX12_DEFAULTS" : "STRATA_GFX1151_DEFAULTS");
++                     g12 ? "gfx12 (RDNA4)" : g1100 ? "gfx1100 (RX 7900)" : "gfx1151 (Strix Halo)", set.size(),
++                     g12 ? "STRATA_GFX12_DEFAULTS" : g1100 ? "STRATA_GFX1100_DEFAULTS" : "STRATA_GFX1151_DEFAULTS");
+         for (size_t i = 0; i < set.size(); ++i) std::fprintf(stderr, "%s%s", i ? " " : "", set[i].c_str() + 7);
+         std::fprintf(stderr, "\n");
+     }
+diff --git a/src/core/arch_defaults_test.cpp b/src/core/arch_defaults_test.cpp
+index 2cac579b4..7142e28ae 100644
+--- a/src/core/arch_defaults_test.cpp
++++ b/src/core/arch_defaults_test.cpp
+@@ -30,8 +30,9 @@ static void put(const char* k, const char* v) {
+ int main() {
+     using namespace strata::core;
+     unset("STRATA_GFX1151_DEFAULTS");
++    unset("STRATA_GFX1100_DEFAULTS");
+     // other architectures (and CUDA, which passes an empty name): nothing
+-    CHECK(arch_default_env("gfx1100").empty());
++    CHECK(arch_default_env("gfx1101").empty());
+     CHECK(arch_default_env("gfx1150").empty());
+     CHECK(arch_default_env("gfx1152").empty());
+     CHECK(arch_default_env("gfx11510").empty());   // not a prefix match
+@@ -127,6 +128,16 @@ int main() {
+                   kv.first != "STRATA_PF_FUSED");
+         }
+     }
++    // gfx1100: the five decode switches, plain and with a feature suffix; the opt-out
++    for (const char* a : {"gfx1100", "gfx1100:sramecc-:xnack-"}) {
++        const auto t = arch_default_env(a);
++        CHECK(t.size() == 5);
++        for (const auto& kv : t) CHECK(kv.second == "1");
++    }
++    CHECK(arch_default_env("gfx11000").empty());
++    put("STRATA_GFX1100_DEFAULTS", "0");
++    CHECK(arch_default_env("gfx1100").empty());
++    unset("STRATA_GFX1100_DEFAULTS");
+     CHECK(arch_default_env("gfx12010").empty());
+     put("STRATA_GFX12_DEFAULTS", "0");
+     CHECK(arch_default_env("gfx1201").empty());
+diff --git a/src/core/verify.cpp b/src/core/verify.cpp
+index e8fdbd404..3a31dc71e 100644
+--- a/src/core/verify.cpp
++++ b/src/core/verify.cpp
+@@ -300,6 +300,20 @@ bool env_on(const char* name) {
+     const char* e = std::getenv(name);
+     return e != nullptr && e[0] != 0 && e[0] != '0';
+ }
++// STRATA_SH_GATE_TAIL=1 (with STRATA_ROUTER_TAIL): the shared expert's gate GEMV rides in the router tail launch and its
++// sigmoid + scale in the combine (native_moe_combine_multi_hits_x) - two launches fewer a layer, every bit the same
++bool sh_gate_tail_on() { static const bool on = env_on("STRATA_SH_GATE_TAIL"); return on; }
++// STRATA_COMBINE_MAPPED=1: the CPU rows' wait and copy (copy_rows_from_mapped_after) folded into the combine, which reads
++// them from the mapped rows - one launch fewer a layer, after the CPU's rows, so on every layer's critical path
++bool combine_mapped_on() { static const bool on = env_on("STRATA_COMBINE_MAPPED"); return on; }
++// STRATA_QSA_GATE_Q8=1: a QSA layer's output gate writes the out-projection's q8_1 image itself (one launch fewer)
++bool qsa_gate_q8_on() { static const bool on = env_on("STRATA_QSA_GATE_Q8"); return on; }
++// STRATA_T1_FUSE=1: a one-token window takes the router tail and the folded combine too (their rows are the per-token
++// launches' bits; 6 launches fewer a layer)
++bool t1_fuse_on() { static const bool on = env_on("STRATA_T1_FUSE"); return on; }
++// STRATA_QSA_FOLD=1: a QSA layer's indexer query projection rides in its key projection's launch, and every QSA layer's
++// indexer-tail snapshot is taken in one launch at the window's start (nothing writes a tail before its own layer)
++bool qsa_fold_on() { static const bool on = env_on("STRATA_QSA_FOLD"); return on; }
+ #if defined(STRATA_USE_HIP)
+ const bool g_coherent = env_on("STRATA_VERIFY_COHERENT");
+ const bool g_doorbell_store = env_on("STRATA_DOORBELL_STORE");
+@@ -449,6 +463,7 @@ bool fuse_rows_on() {
+ }
+ 
+ // 143-amdk: STRATA_FUSE_CONVAB=1 - the GDN conv and the a/b projections in one launch.  Opt-in: measured -0.3% on gfx1201 (the a/b dot chain is the longer one).
++// On by default on gfx1100 (arch_defaults): 36 layers of cold weights in a graph, T 2..4, 8.4-9.4 -> 5.6-6.7 us a layer, 4.2-5.0 with STRATA_GDN_AB_ILP.
+ bool fuse_convab_on() {
+ #if defined(STRATA_USE_HIP)
+     static const bool on = [] { const char* v = std::getenv("STRATA_FUSE_CONVAB"); return v != nullptr && std::atoi(v) != 0; }();
+@@ -714,6 +729,7 @@ Verifier::~Verifier() {
+     if (dc_arena_) cudaFree(dc_arena_);
+     if (h_commitd_) cudaFreeHost(h_commitd_);
+     if (qcnt_) cudaFree(qcnt_);
++    if (tail_ticket_) cudaFree(tail_ticket_);
+     if (d_spec_) cudaFree(d_spec_);
+     if (tap_file_) std::fclose(tap_file_);
+     if (tap_dev_) cudaFree(tap_dev_);
+@@ -1182,6 +1198,18 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
+             qcnt_ = nullptr;
+         }
+     }
++#if defined(STRATA_USE_HIP)
++    // STRATA_ROUTER_TAIL: the router tail launches' ticket, zeroed once (each launch leaves it zero); not with the
++    // doorbell variants or the device plan, which publish or plan between the top-10 and the ring
++    if (strata::kernels::router_tail_on() && !g_doorbell_store && !device_plan_ && !always_publish_ && remote_opt_ == nullptr) {
++        if (cudaMalloc((void**) &tail_ticket_, sizeof(unsigned)) != cudaSuccess ||
++            cudaMemset(tail_ticket_, 0, sizeof(unsigned)) != cudaSuccess) {
++            cudaGetLastError();
++            if (tail_ticket_) cudaFree(tail_ticket_);
++            tail_ticket_ = nullptr;
++        }
++    }
++#endif
+     if (all_resident_ || device_plan_) {
+         bool ok2 = true;
+         if (device_plan_)
+@@ -1254,6 +1282,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
+                shared_expert_native_bf16_enabled();
+     };
+     bool sg_gated_[2] = {false, false};   // per group: the combine applies the shared gate
++    bool sg_tail_[2] = {false, false};    // per group: STRATA_SH_GATE_TAIL - the router tail made the shared gate's logits
+     if (!batch_rec_) groups_[T] = G;
+     // Programmatic dependent launch (pdl.hpp; sm_90+, opt-in: STRATA_DF_PDL=1): the window's quantizations and dense
+     // projections may start while the kernel before them finishes, loading their weights before they wait for its
+@@ -1286,9 +1315,18 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
+ 
+     // ---- the window's inputs, from mapped staging.  With branches the steps and positions (first read by the first
+     // layer's mixer) cross PCIe on side 1 beside the embedding and the first hyper-connection read.
+-    copy_i32_from_mapped(tok_, m_tok_, T, cs);
+     bool inputs_pending = false;
+     cudaStream_t in_s = cs;
++#if !defined(STRATA_HIP_GFX906)
++    static const bool mapped_fast = env_on("STRATA_MAPPED_FAST");
++    if (mapped_fast && !br) {   // STRATA_MAPPED_FAST: the three input copies in one launch (copy_from_mapped_multi)
++        const MappedCopy in[3] = {{tok_, m_tok_, T}, {step_, m_step_, (int64_t) T * kStepCount},
++                                  {pos_, m_pos_, (int64_t) MT * (NH + NKV + IQ)}};
++        copy_from_mapped_multi(in, 3, cs);
++    } else
++#endif
++    {
++    copy_i32_from_mapped(tok_, m_tok_, T, cs);
+     if (br) {
+         fork(1);
+         in_s = df_side_[1];
+@@ -1296,6 +1334,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
+     }
+     copy_i32_from_mapped(step_, m_step_, (int64_t) T * kStepCount, in_s);
+     copy_i32_from_mapped(pos_, m_pos_, (int64_t) MT * (NH + NKV + IQ), in_s);
++    }
+     // per-ROW positions of the K rows [t][NKV] and the indexer query rows [t][IQ] (for batched RoPE)
+     const int32_t* pos_k = pos_ + MT * NH;
+     const int32_t* pos_i = pos_ + MT * (NH + NKV);
+@@ -1338,6 +1377,27 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
+             else gdn_idx[(size_t) l] = gi++;
+         }
+     }
++    // STRATA_QSA_FOLD: the indexer-tail snapshots the QSA layers below would take one by one, here in one launch per 8
++    const bool snap_batched = qsa_fold_on() && !batch_rec_;
++    if (snap_batched) {
++        MappedCopy cp[8];
++        int nc = 0;
++        for (int64_t l = lb_; l < le_; ++l) {
++            if (!is_qsa_layer(g, l)) continue;
++            const int64_t qi = qsa_idx[(size_t) l];
++            cp[nc++] = {tail_snap_ + (size_t) qi * TS, ss.qsa_states[qi].idx_tail, TS};
++            if (nc == 8) { copy_from_mapped_multi(cp, nc, cs); nc = 0; }
++        }
++        if (nc > 0) copy_from_mapped_multi(cp, nc, cs);
++    }
++
++    // 143-amdk FUSE_HITS: the combine adds the GPU's hit rows itself (the launch STRATA_SH_GATE_TAIL and
++    // STRATA_COMBINE_MAPPED extend)
++    auto hits_combine = [&](int tb, int n) {
++        return fuse_hits_on() && !prof_on_ && !remote_opt_ && dec_batch && (n > 1 || (n == 1 && t1_fuse_on())) && n <= 8 &&
++               native_moe_combine_enabled() &&
++               native_moe_combine_hits_supported(parts_ + (size_t) tb * K * N, shared_ + tb * N, bo_ + tb * N, N, K, n);
++    };
+ 
+     // ---------------------------------------------------------------- pre(l, group): up to the ring
+     auto pre = [&](int64_t l, int grp) -> bool {
+@@ -1730,7 +1790,15 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
+                     }
+                     norm_rope_on(data, norm, rows, cols, pos, ns);
+                 };
++                bool qidx_ready = false;   // STRATA_QSA_FOLD: idx_key's launch made the indexer query's projection too
+                 auto idx_key = [&](cudaStream_t ns) {
++                    // STRATA_QSA_FOLD: the indexer query's projection (idx_query) in this launch too - nothing between
++                    // reads or writes qidx_ (the main stream only; a query branch or the side mixer makes its own)
++                    qidx_ready = ns == cs && qb && !qbr && !sidem && qsa_fold_on() &&
++                        bf16_gemv_fp32_mmvf_multi_pair(mixed_ + tb * N, N, N, n, (const uint16_t*) wik->data, idx_raw + tb * ID,
++                                                       ID, ID, (const uint16_t*) wiq->data, qidx_ + tb * IQ * ID, IQ * ID,
++                                                       IQ * ID, ns);
++                    if (qidx_ready) return;
+                     if (qb) bf16_gemv_fp32_mmvf_multi(mixed_ + tb * N, N, (const uint16_t*) wik->data, idx_raw + tb * ID, ID, N, ID, n, ns);
+                     else for (int t = tb; t < te; ++t)
+                         bf16_gemv_fp32_mmvf(mixed_ + t * N, (const uint16_t*) wik->data, idx_raw + t * ID, (int) N, (int) ID, ns);
+@@ -1742,7 +1810,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
+                                 copy_from_mapped(tail_snap_b_ + ((size_t) brow_[t] * nQall + qi) * TS,
+                                                  slot_ss(t).qsa_states[qi].idx_tail, TS, ns);
+                     } else
+-                    if (grp == 0) copy_from_mapped(tail_snap_ + (size_t) qi * TS, st.idx_tail, TS, ns);
++                    if (grp == 0 && !snap_batched) copy_from_mapped(tail_snap_ + (size_t) qi * TS, st.idx_tail, TS, ns);
+                 };
+                 auto idx_append = [&](cudaStream_t ns) {
+                     if (dec_batch && !g_no_batch_kv && !batch_rec_) {
+@@ -1762,8 +1830,9 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
+                 };
+                 auto idx_query = [&](cudaStream_t ns) {
+                     if (qb) {
+-                        bf16_gemv_fp32_mmvf_multi(mixed_ + tb * N, N, (const uint16_t*) wiq->data, qidx_ + tb * IQ * ID, IQ * ID,
+-                                                  N, IQ * ID, n, ns);
++                        if (!qidx_ready)
++                            bf16_gemv_fp32_mmvf_multi(mixed_ + tb * N, N, (const uint16_t*) wiq->data, qidx_ + tb * IQ * ID,
++                                                      IQ * ID, N, IQ * ID, n, ns);
+                         norm_rope_s(qidx_ + tb * IQ * ID, wiqn, (int) (n * IQ), (int) ID, pos_i + tb * IQ, ns);
+                     } else
+                         for (int t = tb; t < te; ++t) {
+@@ -2018,7 +2087,12 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
+                 }
+                 stamp(l, 13, grp);
+                 if (st.kv_rot || st.kv_hybrid) fwht256_inplace_cuda(attn_ + tb * NH * HD, (int64_t) n * NH, cs);   // back: H^-1 = H
+-                if (qb) native_qsa_gate_apply(attn_ + tb * NH * HD, qfull_ + tb * NH * 2 * HD, attn32_ + tb * NH * HD,
++                bool gate_q8 = false;   // STRATA_QSA_GATE_Q8: xq_ written by the gate
++                if (qb && qsa_gate_q8_on())
++                    gate_q8 = native_qsa_gate_apply_q8_1(attn_ + tb * NH * HD, qfull_ + tb * NH * 2 * HD, attn32_ + tb * NH * HD,
++                                                         xq_, (int) (n * NH), (int) HD, cs);
++                if (gate_q8) {
++                } else if (qb) native_qsa_gate_apply(attn_ + tb * NH * HD, qfull_ + tb * NH * 2 * HD, attn32_ + tb * NH * HD,
+                                               (int) (n * NH), (int) HD, cs);
+                 else
+                 for (int t = tb; t < te; ++t) {
+@@ -2029,7 +2103,8 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
+                         qsa_gate_apply_f32(attn_ + t * NH * HD, qfull_ + t * NH * 2 * HD, s, attn32_ + t * NH * HD, cs);
+                 }
+                 stamp(l, 14, grp);
+-                quant_in(attn32_ + tb * NH * HD, (int) (NH * HD));
++                if (gate_q8) il_ready = false;   // STRATA_QSA_GATE_Q8: the gate wrote xq_
++                else quant_in(attn32_ + tb * NH * HD, (int) (NH * HD));
+                 mm(wo, bo_ + tb * N, (int) (NH * HD), (int) N);
+             }
+         } catch (const std::exception& e) {
+@@ -2060,16 +2135,34 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
+         // move into the combine, gate + up share one launch (all bitwise; resident combine path, 2-8 rows only)
+         const WeightRef* w_sgi = lfuse_on(n) && g_lfuse_gate() ? v.get("ffn_gate_inp_shexp.weight") : nullptr;
+         bool sg_ready = false;
+-        if (dec_batch && n > 1 && w_router != nullptr && native_router_enabled() && NE == 512 && K == 10) {
++        const float route_prior = g_route_prior();   // STRATA_ROUTE_PRIOR, applied after the top-10 below
++        // STRATA_ROUTER_TAIL: the GEMV, the top-10 and doorbell_publish_res below in one launch (native_router.hpp),
++        // unless something reads or rewrites the ids between the top-10 and the ring
++        const bool tail = tail_ticket_ != nullptr && !always_publish_ && w_sgi == nullptr && !ar_on() && route_prior <= 0.0f &&
++                          route_resident_cfg().margin <= 0.0f;
++        const WeightRef* w_sgt = tail && sh_gate_tail_on() && shared_expert_native_bf16_enabled() && hits_combine(tb, n)
++                                     ? v.get("ffn_gate_inp_shexp.weight") : nullptr;
++        bool published = false, sg_tail = false;
++        if (dec_batch && (n > 1 || (n == 1 && tail && t1_fuse_on())) && w_router != nullptr && native_router_enabled() &&
++            NE == 512 && K == 10) {
+             try {
+                 if (w_sgi != nullptr)
+                     sg_ready = bf16_gemv_fp32_mmvf_multi_aux(mixed_ + tb * N, N, (const uint16_t*) w_router->data,
+                                                              logits_ + tb * NE, NE, N, NE, n,
+                                                              (const uint16_t*) w_sgi->data, sh_g_ + tb, 1, cs);
+-                if (!sg_ready)
+-                bf16_gemv_fp32_mmvf_multi(mixed_ + tb * N, N, (const uint16_t*) w_router->data, logits_ + tb * NE, NE, N,
+-                                          NE, n, cs);
+-                native_router_top10_multi(logits_ + tb * NE, ids_ + tb * K, w_ + tb * K, n, cs);
++                if (tail) {
++                    published = native_router_tail(mixed_ + tb * N, (const uint16_t*) w_router->data, logits_ + tb * NE,
++                                                   ids_ + tb * K, w_ + tb * K, m_x_ + tb * N, m_ids_ + tb * K, m_seq_,
++                                                   tail_ticket_, n, (int) N, cs,
++                                                   w_sgt ? (const uint16_t*) w_sgt->data : nullptr, w_sgt ? sh_g_ + tb : nullptr);
++                    sg_tail = published && w_sgt != nullptr;
++                }
++                if (!published) {
++                    if (!sg_ready)
++                        bf16_gemv_fp32_mmvf_multi(mixed_ + tb * N, N, (const uint16_t*) w_router->data, logits_ + tb * NE,
++                                                  NE, N, NE, n, cs);
++                    native_router_top10_multi(logits_ + tb * NE, ids_ + tb * K, w_ + tb * K, n, cs);
++                }
+             } catch (const std::exception& e) { err = "verify router: " + std::string(e.what()); return false; }
+ #if defined(STRATA_HIP_GFX906)
+         } else if (dec_batch) {
+@@ -2090,7 +2183,6 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
+         // experts; the weights stay the router's (route_prior.cu).  g_route_prior() above: off unless STRATA_ROUTE_PRIOR is set
+         // (measured on an RTX 3060 12 GB at 2.0: story +37.6%, code +35.2%; on an RTX PRO 5000 72 GB -1.9% / -0.5%, on 2x RTX A4000
+         // -4.2% / +11.0%, so it only helps a card that streams most experts).
+-        const float route_prior = g_route_prior();
+         if (route_prior > 0.0f && NE == 512 && K == 10 && hits_.d_res != nullptr)
+             route_prior_top10(logits_ + tb * NE, hits_.d_res + l * g.n_expert, route_prior, ids_ + tb * K, w_ + tb * K, n, cs);
+         if (route_resident_cfg().margin > 0.0f && NE == 512 && K == 10 && hits_.d_res != nullptr) {
+@@ -2124,7 +2216,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
+             if (remote_opt_ || always_publish_)
+                 doorbell_publish(xm, ids_ + tb * K, w_ + tb * K, (int64_t) n * N, (int64_t) n * K, m_x_ + tb * N,
+                                  m_ids_ + tb * K, m_w_ + tb * K, m_seq_, cs);
+-            else {
++            else if (!published) {
+                 const int32_t* layer_res = hits_.d_res != nullptr ? (hits_.d_res + l * g.n_expert) : nullptr;
+                 doorbell_publish_res(xm, ids_ + tb * K, layer_res, (int) g.n_expert, (int64_t) n * N, (int64_t) n * K,
+                                      m_x_ + tb * N, m_ids_ + tb * K, m_seq_, cs);
+@@ -2162,8 +2254,9 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
+                 shared_expert_multi(n, xm, sh_bf16_ + tb * N, nsw, (const uint16_t*) wgi->data, sh_gate_ + (size_t) tb * g.n_ff,
+                                     sh_up_ + (size_t) tb * g.n_ff, sh_g_ + tb, shared_ + tb * N, N, g.n_ff, sh_stream,
+                                     qdedup ? (const void*) (nat_xq_ + (size_t) tb * (N / 32) * 36) : nullptr,
+-                                    (sg_ready ? 1 : 0) | (lfuse_on(n) && g_lfuse_pair() ? 2 : 0));
++                                    (sg_ready || sg_tail ? 1 : 0) | (lfuse_on(n) && g_lfuse_pair() ? 2 : 0));
+                 sg_gated_[grp] = sg_ready;
++                sg_tail_[grp] = sg_tail;
+             } catch (const std::exception& e) {
+                 err = std::string("verify shared expert: ") + e.what();
+                 return false;
+@@ -2239,7 +2332,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
+                                       hit_xs_ + (size_t) tb * (N / 32), hit_scratch_, dst_buf, cs, n);   // (a group holds <= n entries)
+             }
+         };
+-        bool hits_in_combine = false;
++        bool hits_in_combine = false, rows_in_combine = false;
+         if (ar_on()) {
+             stamp(l, 19, grp);
+             grouped(p_ptr, p_start, p_counts, 0, parts_out, true);
+@@ -2283,6 +2376,8 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
+                                          skip_ + grp, ring, cs);
+             } else {
+                 const bool fuse_rows = fuse_rows_on() && !prof_on_ && !remote_opt_ && dec_batch && m_bal_ == nullptr;   // 143-amdk
++                // STRATA_COMBINE_MAPPED: the combine below waits and reads the CPU rows itself
++                rows_in_combine = fuse_rows && combine_mapped_on() && hits_combine(tb, n) && !sg_gated_[grp];
+                 if (!fuse_rows) {
+                     if (m_bal_ != nullptr)   // set_pcie_balance: ... and ends as it waits for the CPU's rows
+                         wait_flag_ge_stamped(m_flag_, ring, m_bal_ + ((l - lb_) * 2 + grp) * 4 + 2, nullptr, cs);
+@@ -2290,7 +2385,8 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
+                         wait_flag_ge(m_flag_, ring, cs);           // the CPU's share is in the mapped rows
+                 }
+                 stamp(l, 23, grp);
+-                if (remote_opt_)   // #578: the helper's rows come back reduced; skip them as well
++                if (rows_in_combine) {
++                } else if (remote_opt_)   // #578: the helper's rows come back reduced; skip them as well
+                     remote_opt_->copy_rows(parts_out, m_ymiss_ + (size_t) tb * K * N, tb, n, p_dst, p_counts + 1, cs);
+                 else if (fuse_rows)   // the wait folded into the copy's blocks
+                     copy_rows_from_mapped_after(m_flag_, ring, parts_out, m_ymiss_ + (size_t) tb * K * N, (int64_t) n * K, N,
+@@ -2302,9 +2398,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
+                     copy_from_mapped(parts_out, m_ymiss_ + (size_t) tb * K * N, (int64_t) n * K * N, cs);
+             }
+             // 143-amdk: the add of the GPU's hit rows is done by the combine that follows (one launch fewer)
+-            hits_in_combine = fuse_hits_on() && !prof_on_ && !remote_opt_ && !sg_gated_[grp] && dec_batch && n > 1 &&
+-                              native_moe_combine_enabled() && n <= 8 &&
+-                              native_moe_combine_hits_supported(parts_ + (size_t) tb * K * N, shared_ + tb * N, bo_ + tb * N, N, K, n);
++            hits_in_combine = hits_combine(tb, n) && !sg_gated_[grp];
+             if (!hits_in_combine) moe_hit_add(parts_out, hit_out, p_dst, p_counts + 1, cap, N, cs);
+         }
+         // Same condition as `sh_fork` above, which is per group and out of scope here: wait only when the fork
+@@ -2319,9 +2413,18 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
+         } else
+         if (hits_in_combine) {
+             try {
++                if (rows_in_combine || sg_tail_[grp])   // STRATA_COMBINE_MAPPED / STRATA_SH_GATE_TAIL: the folded launches
++                    native_moe_combine_multi_hits_x(rows_in_combine ? m_ymiss_ + (size_t) tb * K * N : parts_ + (size_t) tb * K * N,
++                                                    hit_out, p_dst, p_counts + 1, w_ + tb * K, shared_ + tb * N,
++                                                    sg_tail_[grp] ? sh_g_ + tb : nullptr, bo_ + tb * N, N, K, n,
++                                                    rows_in_combine ? m_flag_ : nullptr, ring, cs);
++                else
+                 native_moe_combine_multi_hits_added(parts_ + (size_t) tb * K * N, hit_out, p_dst, p_counts + 1, w_ + tb * K,
+                                                     shared_ + tb * N, bo_ + tb * N, N, K, n, cs);
+             } catch (const std::exception& e) { err = "verify combine: " + std::string(e.what()); return false; }
++        } else if (sg_tail_[grp]) {   // never: the router tail took the gate only where this combine runs
++            err = "verify: the shared gate rode in the router tail but the combine cannot apply it";
++            return false;
+         } else
+         if (dec_batch && n > 1 && native_moe_combine_enabled()) {   // one launch for the window's rows
+             try {
+diff --git a/src/kernels/cuda/mmvf_multi.cuh b/src/kernels/cuda/mmvf_multi.cuh
+new file mode 100644
+index 000000000..6b4fdc90b
+--- /dev/null
++++ b/src/kernels/cuda/mmvf_multi.cuh
+@@ -0,0 +1,166 @@
++// One block of the bf16 x fp32 multi-row GEMV (bf16_f32_mmvf_multi_kernel, native_bf16.cu): output row blockIdx.x for
++// up to NT activation rows.  Shared with STRATA_ROUTER_TAIL's launch (native_router.cu), so the router's logits there
++// are the same FMAs and reductions, bit for bit.
++// Adapted from llama.cpp 3cf03257f219afbe7334045ff7c6a06ac68c627d, ggml/src/ggml-cuda/{mmvf.cu,common.cuh}.
++//
++// MIT License
++// Copyright (c) 2023-2026 The ggml authors
++//
++// Permission is hereby granted, free of charge, to any person obtaining a copy
++// of this software and associated documentation files (the "Software"), to deal
++// in the Software without restriction, including without limitation the rights
++// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++// copies of the Software, and to permit persons to whom the Software is
++// furnished to do so, subject to the following conditions:
++//
++// The above copyright notice and this permission notice shall be included in all
++// copies or substantial portions of the Software.
++//
++// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++// SOFTWARE.
++#pragma once
++
++#include "strata/kernels/bf16_bits.hpp"
++#include "strata/kernels/pdl.hpp"
++
++#include <cuda_runtime.h>
++#include <cstdint>
++
++namespace strata::kernels {
++
++__device__ __forceinline__ float mmvf_warp_sum(float value) {
++#pragma unroll
++    for (int offset = 16; offset > 0; offset >>= 1)
++        value += __shfl_xor_sync(0xffffffffu, value, offset, 32);
++    return value;
++}
++
++// the weight row is read ONCE and every token keeps its own accumulator with exactly the single-row kernel's order
++// (pairs, two ordered FMAs, the same warp and block reductions), so each output is bit-identical to a
++// bf16_f32_mmvf_kernel launch of its own.
++// `r`: the output row (blockIdx.x in the GEMV's own launch; STRATA_SH_GATE_TAIL's extra router-tail block passes 0)
++template <int BLOCK_SIZE, int NT, bool EXACT_T>
++__device__ __forceinline__ void mmvf_multi_block(const float* x_, int64_t ldx, const uint16_t* __restrict__ w, float* y_,
++                                                 int64_t ldy, int n_in, int n_tok, int r = blockIdx.x) {
++    const float* STRATA_PDL_RESTRICT x = x_;   // __restrict__ below sm_70 only (pdl.hpp, #1469)
++    float* STRATA_PDL_RESTRICT y = y_;
++    const int t = threadIdx.x;
++    const uint16_t* row = w + (size_t) r * n_in;
++    const uint32_t* weights2 = reinterpret_cast<const uint32_t*>(row);
++    __shared__ float partials[NT][32];
++    if (t < 32) {
++#pragma unroll
++        for (int k = 0; k < NT; ++k) partials[k][t] = 0.0f;
++    }
++    __syncthreads();
++    float acc[NT];
++#pragma unroll
++    for (int k = 0; k < NT; ++k) acc[k] = 0.0f;
++    // PDL (pdl.hpp): this thread's first PRE weight pairs are loaded before waiting for the activations
++    constexpr int PRE = kPdlPrefetch ? 8 : 0;
++    uint32_t wpre[PRE > 0 ? PRE : 1];
++#pragma unroll
++    for (int q = 0; q < PRE; ++q) {
++        const int pair = t + q * BLOCK_SIZE;
++        wpre[q] = pair < n_in / 2 ? __ldg(weights2 + pair) : 0u;
++    }
++    pdl_wait();
++    int q = 0;
++    for (int pair = t; pair < n_in / 2; pair += BLOCK_SIZE, ++q) {
++        const uint32_t weight = q < PRE ? wpre[q] : __ldg(weights2 + pair);
++        const float w0 = f32_from_bf16((uint16_t) weight), w1 = f32_from_bf16((uint16_t) (weight >> 16));
++#pragma unroll
++        for (int k = 0; k < NT; ++k) {
++            if (EXACT_T || k < n_tok) {
++                const float2 input = __ldg(reinterpret_cast<const float2*>(x + (size_t) k * ldx) + pair);
++                acc[k] = __fmaf_rn(w0, input.x, acc[k]);
++                acc[k] = __fmaf_rn(w1, input.y, acc[k]);
++            }
++        }
++    }
++#pragma unroll
++    for (int k = 0; k < NT; ++k)
++        if (EXACT_T || k < n_tok) acc[k] = mmvf_warp_sum(acc[k]);
++    if constexpr (BLOCK_SIZE > 32) {
++        if ((t & 31) == 0)
++#pragma unroll
++            for (int k = 0; k < NT; ++k)
++                if (EXACT_T || k < n_tok) partials[k][t / 32] = acc[k];
++        __syncthreads();
++        if (t < 32)
++#pragma unroll
++            for (int k = 0; k < NT; ++k)
++                if (EXACT_T || k < n_tok) acc[k] = mmvf_warp_sum(partials[k][t]);
++    }
++    if (t == 0)
++#pragma unroll
++        for (int k = 0; k < NT; ++k)
++            if (EXACT_T || k < n_tok) y[(size_t) k * ldy + r] = acc[k];
++}
++
++// R consecutive output rows r0.. in one block (STRATA_ROUTER_TAIL_ROWS): every row keeps mmvf_multi_block's thread
++// mapping, FMA order and both reductions, so each output is the same bits; the block loads the activations once for
++// its R rows instead of once per row (the router's 512 one-row blocks read 512 copies of them through the caches)
++template <int BLOCK_SIZE, int NT, int R>
++__device__ __forceinline__ void mmvf_multi_rows_block(const float* __restrict__ x, int64_t ldx, const uint16_t* __restrict__ w,
++                                                      float* __restrict__ y, int64_t ldy, int n_in, int r0) {
++    static_assert(!kPdlPrefetch, "the PDL prefetch of mmvf_multi_block is not mirrored here");
++    const int t = threadIdx.x;
++    __shared__ float partials[R][NT][32];
++    if (t < 32) {
++#pragma unroll
++        for (int i = 0; i < R; ++i)
++#pragma unroll
++            for (int k = 0; k < NT; ++k) partials[i][k][t] = 0.0f;
++    }
++    __syncthreads();
++    float acc[R][NT];
++#pragma unroll
++    for (int i = 0; i < R; ++i)
++#pragma unroll
++        for (int k = 0; k < NT; ++k) acc[i][k] = 0.0f;
++    for (int pair = t; pair < n_in / 2; pair += BLOCK_SIZE) {
++        float2 in[NT];
++#pragma unroll
++        for (int k = 0; k < NT; ++k) in[k] = __ldg(reinterpret_cast<const float2*>(x + (size_t) k * ldx) + pair);
++#pragma unroll
++        for (int i = 0; i < R; ++i) {
++            const uint32_t weight = __ldg(reinterpret_cast<const uint32_t*>(w + (size_t) (r0 + i) * n_in) + pair);
++            const float w0 = f32_from_bf16((uint16_t) weight), w1 = f32_from_bf16((uint16_t) (weight >> 16));
++#pragma unroll
++            for (int k = 0; k < NT; ++k) {
++                acc[i][k] = __fmaf_rn(w0, in[k].x, acc[i][k]);
++                acc[i][k] = __fmaf_rn(w1, in[k].y, acc[i][k]);
++            }
++        }
++    }
++#pragma unroll
++    for (int i = 0; i < R; ++i)
++#pragma unroll
++        for (int k = 0; k < NT; ++k) acc[i][k] = mmvf_warp_sum(acc[i][k]);
++    if constexpr (BLOCK_SIZE > 32) {
++        if ((t & 31) == 0)
++#pragma unroll
++            for (int i = 0; i < R; ++i)
++#pragma unroll
++                for (int k = 0; k < NT; ++k) partials[i][k][t / 32] = acc[i][k];
++        __syncthreads();
++        if (t < 32)
++#pragma unroll
++            for (int i = 0; i < R; ++i)
++#pragma unroll
++                for (int k = 0; k < NT; ++k) acc[i][k] = mmvf_warp_sum(partials[i][k][t]);
++    }
++    if (t == 0)
++#pragma unroll
++        for (int i = 0; i < R; ++i)
++#pragma unroll
++            for (int k = 0; k < NT; ++k) y[(size_t) k * ldy + r0 + i] = acc[i][k];
++}
++
++}  // namespace strata::kernels
+diff --git a/src/kernels/cuda/native_bf16.cu b/src/kernels/cuda/native_bf16.cu
+index ff6c439ef..4ac90a129 100644
+--- a/src/kernels/cuda/native_bf16.cu
++++ b/src/kernels/cuda/native_bf16.cu
+@@ -1,5 +1,6 @@
+ #include "strata/kernels/bf16_gemv.hpp"
+ #include "strata/kernels/window_limits.hpp"
++#include "mmvf_multi.cuh"
+ #include "s26_tsum.cuh"
+ #include "strata/kernels/bf16_bits.hpp"
+ #include "strata/kernels/pdl.hpp"
+@@ -37,13 +38,6 @@ namespace {
+ // LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+ // SOFTWARE.
+-__device__ __forceinline__ float mmvf_warp_sum(float value) {
+-#pragma unroll
+-    for (int offset = 16; offset > 0; offset >>= 1)
+-        value += __shfl_xor_sync(0xffffffffu, value, offset, 32);
+-    return value;
+-}
+-
+ template <int BLOCK_SIZE>
+ __global__ void bf16_f32_mmvf_kernel(const float* __restrict__ x, const uint16_t* __restrict__ w,
+                                     float* __restrict__ y, int n_in) {
+@@ -72,66 +66,11 @@ __global__ void bf16_f32_mmvf_kernel(const float* __restrict__ x, const uint16_t
+     if (t == 0) y[blockIdx.x] = acc;
+ }
+ 
+-// the same kernel for up to 8 activation rows - the weight row is read ONCE and every
+-// token keeps its own accumulator with exactly the single-row kernel's order (pairs, two ordered FMAs, the same warp
+-// and block reductions), so each output is bit-identical to a bf16_f32_mmvf_kernel launch of its own.
++// the same kernel for up to 8 activation rows (mmvf_multi.cuh, shared with STRATA_ROUTER_TAIL's launch)
+ template <int BLOCK_SIZE, int NT, bool EXACT_T = true>
+ __global__ void bf16_f32_mmvf_multi_kernel(const float* x_, int64_t ldx, const uint16_t* __restrict__ w,
+                                           float* y_, int64_t ldy, int n_in, int n_tok) {
+-    const float* STRATA_PDL_RESTRICT x = x_;   // __restrict__ below sm_70 only (pdl.hpp, #1469)
+-    float* STRATA_PDL_RESTRICT y = y_;
+-    const int t = threadIdx.x;
+-    const uint16_t* row = w + (size_t) blockIdx.x * n_in;
+-    const uint32_t* weights2 = reinterpret_cast<const uint32_t*>(row);
+-    __shared__ float partials[NT][32];
+-    if (t < 32) {
+-#pragma unroll
+-        for (int k = 0; k < NT; ++k) partials[k][t] = 0.0f;
+-    }
+-    __syncthreads();
+-    float acc[NT];
+-#pragma unroll
+-    for (int k = 0; k < NT; ++k) acc[k] = 0.0f;
+-    // PDL (pdl.hpp): this thread's first PRE weight pairs are loaded before waiting for the activations
+-    constexpr int PRE = kPdlPrefetch ? 8 : 0;
+-    uint32_t wpre[PRE > 0 ? PRE : 1];
+-#pragma unroll
+-    for (int q = 0; q < PRE; ++q) {
+-        const int pair = t + q * BLOCK_SIZE;
+-        wpre[q] = pair < n_in / 2 ? __ldg(weights2 + pair) : 0u;
+-    }
+-    pdl_wait();
+-    int q = 0;
+-    for (int pair = t; pair < n_in / 2; pair += BLOCK_SIZE, ++q) {
+-        const uint32_t weight = q < PRE ? wpre[q] : __ldg(weights2 + pair);
+-        const float w0 = f32_from_bf16((uint16_t) weight), w1 = f32_from_bf16((uint16_t) (weight >> 16));
+-#pragma unroll
+-        for (int k = 0; k < NT; ++k) {
+-            if (EXACT_T || k < n_tok) {
+-                const float2 input = __ldg(reinterpret_cast<const float2*>(x + (size_t) k * ldx) + pair);
+-                acc[k] = __fmaf_rn(w0, input.x, acc[k]);
+-                acc[k] = __fmaf_rn(w1, input.y, acc[k]);
+-            }
+-        }
+-    }
+-#pragma unroll
+-    for (int k = 0; k < NT; ++k)
+-        if (EXACT_T || k < n_tok) acc[k] = mmvf_warp_sum(acc[k]);
+-    if constexpr (BLOCK_SIZE > 32) {
+-        if ((t & 31) == 0)
+-#pragma unroll
+-            for (int k = 0; k < NT; ++k)
+-                if (EXACT_T || k < n_tok) partials[k][t / 32] = acc[k];
+-        __syncthreads();
+-        if (t < 32)
+-#pragma unroll
+-            for (int k = 0; k < NT; ++k)
+-                if (EXACT_T || k < n_tok) acc[k] = mmvf_warp_sum(partials[k][t]);
+-    }
+-    if (t == 0)
+-#pragma unroll
+-        for (int k = 0; k < NT; ++k)
+-            if (EXACT_T || k < n_tok) y[(size_t) k * ldy + blockIdx.x] = acc[k];
++    mmvf_multi_block<BLOCK_SIZE, NT, EXACT_T>(x_, ldx, w, y_, ldy, n_in, n_tok);
+ }
+ 
+ // S25 (STRATA_MMVF_ROWS=1): RPB output rows per block. Each block read its row's weights once but all T activation
+@@ -293,6 +232,47 @@ bool bf16_gemv_fp32_mmvf_multi_aux(const float* x, int64_t ldx, const uint16_t*
+     return true;
+ }
+ 
++// STRATA_QSA_FOLD: two matrices on one input in one launch - blocks [0, n_out1) are w1's rows, the rest w2's, each
++// output by mmvf_multi_block at the block size both separate launches pick (the same n_in): their bits
++template <int BLOCK_SIZE, int NT, bool EXACT_T>
++__global__ void bf16_f32_mmvf_multi_pair_kernel(const float* x, int64_t ldx, int n_in, int n_tok, const uint16_t* __restrict__ w1,
++                                                float* y1, int64_t ldy1, int n_out1, const uint16_t* __restrict__ w2,
++                                                float* y2, int64_t ldy2) {
++    const int b = (int) blockIdx.x;
++    if (b < n_out1) mmvf_multi_block<BLOCK_SIZE, NT, EXACT_T>(x, ldx, w1, y1, ldy1, n_in, n_tok, b);
++    else mmvf_multi_block<BLOCK_SIZE, NT, EXACT_T>(x, ldx, w2, y2, ldy2, n_in, n_tok, b - n_out1);
++}
++bool bf16_gemv_fp32_mmvf_multi_pair(const float* x, int64_t ldx, int64_t n_in, int n_tok, const uint16_t* w1, float* y1,
++                                    int64_t ldy1, int64_t n_out1, const uint16_t* w2, float* y2, int64_t ldy2, int64_t n_out2,
++                                    void* stream) {
++    static const bool rows = [] { const char* v = std::getenv("STRATA_MMVF_ROWS"); return v && v[0] == '1'; }();
++    // only where both bf16_gemv_fp32_mmvf_multi calls would launch bf16_f32_mmvf_multi_kernel<N, n_tok, true>
++    if (rows || n_tok < 2 || n_tok > 6 || n_in <= 0 || (n_in & 1) != 0 || (ldx & 1) != 0 || n_out1 <= 0 || n_out2 <= 0 ||
++        n_out1 + n_out2 > std::numeric_limits<int>::max() || x == nullptr || w1 == nullptr || y1 == nullptr || w2 == nullptr || y2 == nullptr ||
++        (reinterpret_cast<uintptr_t>(x) & 7u) != 0)
++        return false;
++    const cudaStream_t st = (cudaStream_t) stream;
++    const dim3 grid((unsigned) (n_out1 + n_out2));
++    const int ni = (int) n_in, no1 = (int) n_out1;
++#define STRATA_MMVF_P(N) case N: \
++    switch (n_tok) { \
++        case 2: bf16_f32_mmvf_multi_pair_kernel<N, 2, true><<<grid, N, 0, st>>>(x, ldx, ni, n_tok, w1, y1, ldy1, no1, w2, y2, ldy2); break; \
++        case 3: bf16_f32_mmvf_multi_pair_kernel<N, 3, true><<<grid, N, 0, st>>>(x, ldx, ni, n_tok, w1, y1, ldy1, no1, w2, y2, ldy2); break; \
++        case 4: bf16_f32_mmvf_multi_pair_kernel<N, 4, true><<<grid, N, 0, st>>>(x, ldx, ni, n_tok, w1, y1, ldy1, no1, w2, y2, ldy2); break; \
++        case 5: bf16_f32_mmvf_multi_pair_kernel<N, 5, true><<<grid, N, 0, st>>>(x, ldx, ni, n_tok, w1, y1, ldy1, no1, w2, y2, ldy2); break; \
++        default: bf16_f32_mmvf_multi_pair_kernel<N, 6, true><<<grid, N, 0, st>>>(x, ldx, ni, n_tok, w1, y1, ldy1, no1, w2, y2, ldy2); break; \
++    } break
++    switch (mmvf_block_size(n_in)) {
++        STRATA_MMVF_P(32); STRATA_MMVF_P(64); STRATA_MMVF_P(96); STRATA_MMVF_P(128);
++        STRATA_MMVF_P(160); STRATA_MMVF_P(192); STRATA_MMVF_P(224); STRATA_MMVF_P(256);
++    }
++#undef STRATA_MMVF_P
++    const cudaError_t result = cudaGetLastError();
++    if (result != cudaSuccess)
++        throw std::runtime_error(std::string("bf16_gemv_fp32_mmvf_multi_pair launch: ") + cudaGetErrorString(result));
++    return true;
++}
++
+ void bf16_gemv_fp32_mmvf_multi(const float* x, int64_t ldx, const uint16_t* w, float* y, int64_t ldy,
+                                int64_t n_in, int64_t n_out, int n_tok, void* stream) {
+     if (n_tok == 1 && ldy >= n_out) { bf16_gemv_fp32_mmvf(x, w, y, n_in, n_out, stream); return; }
+diff --git a/src/kernels/cuda/native_moe.cu b/src/kernels/cuda/native_moe.cu
+index 3e0117abd..cf3b62191 100644
+--- a/src/kernels/cuda/native_moe.cu
++++ b/src/kernels/cuda/native_moe.cu
+@@ -22,6 +22,7 @@
+ // SOFTWARE.
+ #include "strata/kernels/native_moe.hpp"
+ #include "strata/kernels/verify_kernels.hpp"
++#include "strata/kernels/dp4a.hpp"
+ #include <cuda_runtime.h>
+ #include <atomic>
+ #include <cstddef>
+@@ -139,6 +140,80 @@ __global__ void combine_k10_vec4_hits(const float4* __restrict__ parts4, const f
+     sum.w += sh.w;
+     output4[c4] = sum;
+ }
++// combine_k10_vec4_hits with up to two launches folded in, every output bit the same:
++//  MAPPED (STRATA_COMBINE_MAPPED): copy_rows_from_mapped_after's wait for `flag` >= `value` and its copy - the CPU
++//    rows are read straight from the mapped host rows `parts4`; a hit row reads as 0.0f + hit (the zero that copy
++//    wrote, plus the hit, as the unfused kernel adds them)
++//  GATED (STRATA_SH_GATE_TAIL): shared_expert_multi's sigmoid_scale_rows_vec4_kernel - `shared4` is the unscaled
++//    shared expert row, scaled here by that kernel's gate expression and its separately rounded product
++template <bool MAPPED, bool GATED>
++__global__ void combine_k10_vec4_hits_x(const float4* parts4, const float4* __restrict__ hits4,
++                                        const int32_t* __restrict__ dst, const int32_t* __restrict__ count,
++                                        const float* __restrict__ weights, const float4* __restrict__ shared4,
++                                        const float* __restrict__ sg, float4* __restrict__ output4, int64_t n4,
++                                        const volatile uint32_t* flag, uint32_t value) {
++    const int64_t tk = blockIdx.y;
++    __shared__ int hit_mask;
++    if (threadIdx.x == 0) {
++        if constexpr (MAPPED) {
++            while (*flag < value) strata_spin_pause();
++            __threadfence_system();
++        }
++        hit_mask = 0;
++    }
++    __syncthreads();
++    const int nh = *count;
++    for (int h = threadIdx.x; h < nh; h += blockDim.x) {
++        const int r = dst[h];
++        if (r / 10 == (int) tk) atomicOr(&hit_mask, 1 << (r % 10));
++    }
++    __syncthreads();
++    const int mask = hit_mask;
++    parts4 += tk * 10 * n4;
++    hits4 += tk * 10 * n4;
++    weights += tk * 10;
++    shared4 += tk * n4;
++    output4 += tk * n4;
++    const int64_t c4 = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
++    if (c4 >= n4) return;
++    auto part = [&](int e) {
++        if (MAPPED && ((mask >> e) & 1)) {
++            const float4 hh = hits4[int64_t(e) * n4 + c4];
++            return make_float4(0.0f + hh.x, 0.0f + hh.y, 0.0f + hh.z, 0.0f + hh.w);
++        }
++        float4 p = parts4[int64_t(e) * n4 + c4];
++        if (!MAPPED && ((mask >> e) & 1)) { const float4 hh = hits4[int64_t(e) * n4 + c4]; p.x += hh.x; p.y += hh.y; p.z += hh.z; p.w += hh.w; }
++        return p;
++    };
++    const float w0 = __ldg(weights + 0);
++    const float4 p0 = part(0);
++    float4 sum = make_float4(p0.x * w0, p0.y * w0, p0.z * w0, p0.w * w0);
++#pragma unroll
++    for (int expert = 1; expert < 10; ++expert) {
++        const float w = __ldg(weights + expert);
++        const float4 p = part(expert);
++        sum.x = fmaf(p.x, w, sum.x);
++        sum.y = fmaf(p.y, w, sum.y);
++        sum.z = fmaf(p.z, w, sum.z);
++        sum.w = fmaf(p.w, w, sum.w);
++    }
++    float4 sh = shared4[c4];
++    {
++#pragma clang fp contract(off)
++        if constexpr (GATED) {
++            const float gt = __fdividef(1.0f, 1.0f + __expf(-__ldg(sg + tk)));
++            sh.x *= gt;
++            sh.y *= gt;
++            sh.z *= gt;
++            sh.w *= gt;
++        }
++        sum.x += sh.x;
++        sum.y += sh.y;
++        sum.z += sh.z;
++        sum.w += sh.w;
++    }
++    output4[c4] = sum;
++}
+ bool valid_span(const void* p, size_t bytes) {
+     const auto address = reinterpret_cast<uintptr_t>(p);
+     return p && address % alignof(float) == 0 && bytes <= UINTPTR_MAX - address;
+@@ -191,6 +266,31 @@ void native_moe_combine_multi_hits_added(const float* parts, const float* hits,
+     const auto error = cudaGetLastError();
+     if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
+ }
++void native_moe_combine_multi_hits_x(const float* parts, const float* hits, const int32_t* dst, const int32_t* count,
++                                     const float* weights, const float* shared, const float* shared_gate, float* output,
++                                     int64_t n_embd, int64_t k, int n_tok, const uint32_t* flag, uint32_t value,
++                                     void* stream) {
++    if (!stream || !native_moe_combine_hits_supported(parts, shared, output, n_embd, k, n_tok) || ((uintptr_t) hits & 15u) != 0)
++        throw std::invalid_argument("native MoE combine (hits, folded) requires k = 10, aligned spans, 1..8 tokens");
++    const int64_t n4 = n_embd >> 2;
++    const dim3 grid(unsigned((n4 + 127) / 128), (unsigned) n_tok);
++    const cudaStream_t st = static_cast<cudaStream_t>(stream);
++    const auto* p4 = reinterpret_cast<const float4*>(parts);
++    const auto* h4 = reinterpret_cast<const float4*>(hits);
++    const auto* s4 = reinterpret_cast<const float4*>(shared);
++    auto* o4 = reinterpret_cast<float4*>(output);
++    const auto* f = reinterpret_cast<const volatile uint32_t*>(flag);
++    if (flag != nullptr && shared_gate != nullptr)
++        combine_k10_vec4_hits_x<true, true><<<grid, 128, 0, st>>>(p4, h4, dst, count, weights, s4, shared_gate, o4, n4, f, value);
++    else if (flag != nullptr)
++        combine_k10_vec4_hits_x<true, false><<<grid, 128, 0, st>>>(p4, h4, dst, count, weights, s4, nullptr, o4, n4, f, value);
++    else if (shared_gate != nullptr)
++        combine_k10_vec4_hits_x<false, true><<<grid, 128, 0, st>>>(p4, h4, dst, count, weights, s4, shared_gate, o4, n4, f, value);
++    else
++        combine_k10_vec4_hits_x<false, false><<<grid, 128, 0, st>>>(p4, h4, dst, count, weights, s4, nullptr, o4, n4, f, value);
++    const auto error = cudaGetLastError();
++    if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
++}
+ void native_moe_combine_multi(const float* parts, const float* weights, const float* shared, float* output,
+                               int64_t n_embd, int64_t k, int n_tok, void* stream) {
+     if (!stream || n_embd <= 0 || k < 1 || k > 15 || n_tok < 1)
+diff --git a/src/kernels/cuda/native_qsa.cu b/src/kernels/cuda/native_qsa.cu
+index 2e2e1e6bf..7f4ba77ac 100644
+--- a/src/kernels/cuda/native_qsa.cu
++++ b/src/kernels/cuda/native_qsa.cu
+@@ -23,6 +23,7 @@
+ // SOFTWARE.
+ 
+ #include "strata/kernels/native_qsa.hpp"
++#include "strata/kernels/q8_1_finite.hpp"
+ #include <cuda_runtime.h>
+ #include <atomic>
+ #include <cmath>
+@@ -100,6 +101,30 @@ __global__ void gate(const float* attn, const float* __restrict__ q_full, float*
+     const float sigmoid = 1.0f / (1.0f + expf(-raw));
+     output[i] = attn[i] * sigmoid;
+ }
++// STRATA_QSA_GATE_Q8: gate() and native_quantize_q8_1_kernel in one launch.  Each output is gate()'s product (also
++// stored), and the warp holding a q8_1 block's 32 outputs quantizes it with that kernel's warp max / sum and rounding;
++// contraction off, so the product is rounded before the sums use it, as when the quantizer read it from memory.
++struct GateQ81 { half2 ds; int8_t qs[32]; };
++__global__ void gate_q8_1(const float* attn, const float* __restrict__ q_full, float* output, GateQ81* __restrict__ xq,
++                          int n_head, int head_dim) {
++#pragma clang fp contract(off)
++    const std::size_t i = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
++    if (i >= std::size_t(n_head) * head_dim) return;   // a multiple of 32 (checked by the caller): whole warps return
++    const std::size_t head = i / head_dim, channel = i % head_dim;
++    const float raw = q_full[head * 2 * head_dim + head_dim + channel];
++    const float sigmoid = 1.0f / (1.0f + expf(-raw));
++    const float xi = attn[i] * sigmoid;
++    output[i] = xi;
++    float amax = fabsf(xi), sum = xi;
++#pragma unroll
++    for (int o = 16; o > 0; o >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o, 32));
++#pragma unroll
++    for (int o = 16; o > 0; o >>= 1) sum += __shfl_xor_sync(0xffffffffu, sum, o, 32);
++    const float d = q8_1_finite(amax / 127.0f);
++    const int8_t q = q8_1_quant(xi, d, amax);
++    xq[i / 32].qs[i % 32] = q;
++    if (i % 32 == 0) xq[i / 32].ds = q8_1_ds(d, sum);
++}
+ std::size_t elements(int cols, int rows) {
+     if (cols <= 0 || rows <= 0 || std::uint64_t(cols) * rows > std::uint64_t(std::numeric_limits<int>::max()))
+         throw std::invalid_argument("native QSA requires positive bounded dimensions");
+@@ -157,6 +182,21 @@ void native_qsa_rms_norm_grouped(const float* input, const float* gamma, float*
+                                                                                            groups, epsilon);
+     check_launch();
+ }
++bool native_qsa_gate_apply_q8_1(const float* attn, const float* q_full, float* output, void* x_q8_1,
++                                int n_head, int head_dim, void* stream) {
++#if defined(__HIP_PLATFORM_AMD__)
++    const auto count = elements(head_dim, n_head);
++    if (count % 32 != 0 || x_q8_1 == nullptr || (reinterpret_cast<std::uintptr_t>(x_q8_1) & 3u) != 0) return false;
++    buffers(attn, count * 4, q_full, count * 8, output, stream);
++    gate_q8_1<<<unsigned((count + 255) / 256), 256, 0, static_cast<cudaStream_t>(stream)>>>(
++        attn, q_full, output, static_cast<GateQ81*>(x_q8_1), n_head, head_dim);
++    check_launch();
++    return true;
++#else
++    (void) attn; (void) q_full; (void) output; (void) x_q8_1; (void) n_head; (void) head_dim; (void) stream;
++    return false;   // wave32 warps only (one q8_1 block a warp)
++#endif
++}
+ void native_qsa_gate_apply(const float* attn, const float* q_full, float* output,
+                            int n_head, int head_dim, void* stream) {
+     const auto count = elements(head_dim, n_head);
+diff --git a/src/kernels/cuda/native_router.cu b/src/kernels/cuda/native_router.cu
+index 6611bceb0..302d55b48 100644
+--- a/src/kernels/cuda/native_router.cu
++++ b/src/kernels/cuda/native_router.cu
+@@ -21,11 +21,14 @@
+ // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+ // SOFTWARE.
+ #include "strata/kernels/native_router.hpp"
++#include "mmvf_multi.cuh"
+ #include <cuda_runtime.h>
+ #include <atomic>
+ #include <cfloat>
++#include <climits>
+ #include <cstddef>
+ #include <cstdint>
++#include <cstdlib>
+ #include <stdexcept>
+ 
+ namespace strata::kernels {
+@@ -205,6 +208,196 @@ __global__ void route_topk(const float* __restrict__ logits, int32_t* __restrict
+     const float inverse_selected_sum = 1.0f / selected_sum;
+     if (lane < K) weights[lane] = selected * inverse_selected_sum;
+ }
++
++#if defined(__HIPCC__) && !defined(STRATA_HIP_GFX906)
++#define STRATA_ROUTE_DPP_BUILT 1
++// STRATA_ROUTE_DPP=1 (HIP wave32; on by default on gfx1100, strata/core/arch_defaults.hpp): `route`'s row, bit for bit,
++// one wave per token.  On gfx1100 `route_multi` sits directly before the doorbell and took 12-13 us a layer in the
++// engine: every __shfl_xor_sync is a ds_bpermute (a round trip through the LDS pipe), each of the 10 selection rounds
++// walked the lane's 16 values as a dependent chain, then ran a 5-step butterfly on (value, id) pairs whose tie test
++// compiled to branches, and the unrolled kernel is 14 KB of code, fetched cold every layer.  Here:
++//  - the lane exchanges are DPP (row_xmask within a 16-lane row, v_permlanex16 across the rows), with warp_max's and
++//    warp_sum's pairing order, so every max and sum is the same;
++//  - the lane's best is a tree over its 16 values (the larger value, the lower index on a tie: the linear scan's pick);
++//  - a round's winner is the largest lane best (an exact fmaxf butterfly), then the lowest expert id among the lanes
++//    holding that value (a ballot; a min butterfly only on a tie), then read from its lane.
++// The softmax is the same expressions in the same order, and the winner of every round is the same (largest value,
++// lowest id), so ids, weights and the per-lane order of selected_sum's terms are unchanged.
++// 7900 XTX, one graph node with its launch, T=4: 14.9 -> 6.6 us after a 256 MB sweep, 5.3 -> 4.5 us hot.
++#if !defined(__HIP_DEVICE_COMPILE__) || defined(__GFX11__) || defined(__GFX12__)
++#define STRATA_ROUTE_DPP_DEVICE 1
++template <int M> __device__ __forceinline__ int xor_lane(int x) {
++    if constexpr (M == 16) return __builtin_amdgcn_permlanex16(x, x, 0x76543210, 0xfedcba98, false, false);
++    else return __builtin_amdgcn_mov_dpp(x, 0x160 | M, 0xF, 0xF, false);   // row_xmask:M
++}
++template <int M> __device__ __forceinline__ float xor_lane(float v) { return __int_as_float(xor_lane<M>(__float_as_int(v))); }
++__device__ __forceinline__ float dpp_sum(float v) {
++    v += xor_lane<16>(v); v += xor_lane<8>(v); v += xor_lane<4>(v); v += xor_lane<2>(v); v += xor_lane<1>(v);
++    return v;
++}
++__device__ __forceinline__ float dpp_max(float v) {
++    v = fmaxf(v, xor_lane<16>(v)); v = fmaxf(v, xor_lane<8>(v)); v = fmaxf(v, xor_lane<4>(v));
++    v = fmaxf(v, xor_lane<2>(v)); v = fmaxf(v, xor_lane<1>(v));
++    return v;
++}
++__device__ __forceinline__ int dpp_min(int v) {
++    v = min(v, xor_lane<16>(v)); v = min(v, xor_lane<8>(v)); v = min(v, xor_lane<4>(v));
++    v = min(v, xor_lane<2>(v)); v = min(v, xor_lane<1>(v));
++    return v;
++}
++// one warp, one row; `lane` = 0..31.  The loops stay loops (`unroll 1`, the index uniform: v_movrels / v_movreld):
++// the kernel runs once a layer from cold caches, where every 64-byte line of code costs a fetch from VRAM - the
++// unrolled form was 14 KB, and that fetch, not its arithmetic, made most of route_multi's 12 us.
++// `values` holds the row's logits lane + 32 i; returns, in lanes 0..9, the id of rank `lane`.
++__device__ __forceinline__ int route_values_dpp(float (&values)[16], int32_t* __restrict__ ids, float* __restrict__ weights,
++                                                int lane) {
++    float maximum = -INFINITY;
++#pragma unroll
++    for (int i = 0; i < 16; ++i) maximum = max(maximum, values[i]);
++    maximum = dpp_max(maximum);
++    float sum = 0.0f;
++#pragma unroll 1
++    for (int i = 0; i < 16; ++i) {
++        values[i] = expf(values[i] - maximum);
++        sum += values[i];
++    }
++    const float reciprocal = 1.0f / dpp_sum(sum);
++#pragma unroll 1
++    for (int i = 0; i < 16; ++i) {
++        const float p = values[i] * reciprocal;
++        values[i] = __isnanf(p) ? -FLT_MAX : p;
++    }
++    float selected = 0.0f, selected_sum = 0.0f;
++    int selected_id = 0;
++#pragma unroll 1
++    for (int rank = 0; rank < 10; ++rank) {
++        // the lane's best, as `route`'s linear scan picks it (the larger value, the lower index on a tie), by a tree
++        // whose left operands hold the lower indices
++        float v8[8], v4[4], v2[2];
++        int i8[8], i4[4], i2[2];
++#pragma unroll
++        for (int k = 0; k < 8; ++k) {
++            const bool up = values[2 * k + 1] > values[2 * k];
++            v8[k] = up ? values[2 * k + 1] : values[2 * k];
++            i8[k] = 2 * k + up;
++        }
++#pragma unroll
++        for (int k = 0; k < 4; ++k) {
++            const bool up = v8[2 * k + 1] > v8[2 * k];
++            v4[k] = up ? v8[2 * k + 1] : v8[2 * k];
++            i4[k] = up ? i8[2 * k + 1] : i8[2 * k];
++        }
++#pragma unroll
++        for (int k = 0; k < 2; ++k) {
++            const bool up = v4[2 * k + 1] > v4[2 * k];
++            v2[k] = up ? v4[2 * k + 1] : v4[2 * k];
++            i2[k] = up ? i4[2 * k + 1] : i4[2 * k];
++        }
++        const bool up = v2[1] > v2[0];
++        const float lv = up ? v2[1] : v2[0];
++        const int li = up ? i2[1] : i2[0];
++        // the round's winner: the largest lane best, then the lowest expert id (i * 32 + lane) holding it
++        const float top = dpp_max(lv);
++        const unsigned holders = __builtin_amdgcn_ballot_w32(lv == top);
++        int wl = __builtin_ctz(holders);
++        if (holders & (holders - 1)) wl = __builtin_amdgcn_readfirstlane(dpp_min(lv == top ? li * 32 + lane : INT_MAX)) & 31;
++        const int wi = __builtin_amdgcn_readlane(li, wl);
++        const float best = __int_as_float(__builtin_amdgcn_readlane(__float_as_int(lv), wl));
++        values[wi] = lane == wl ? -INFINITY : values[wi];   // wi is uniform: one slot, every lane
++        // Deliberately accumulate by WINNING EXPERT lane, not output rank (as `route`).
++        if (lane == wl) selected_sum += best;
++        if (rank == lane) { selected = best; selected_id = wi * 32 + wl; }
++    }
++    selected_sum = max(dpp_sum(selected_sum), 6.103515625e-5f);
++    const float inverse_selected_sum = 1.0f / selected_sum;
++    if (lane < 10) {
++        ids[lane] = selected_id;
++        weights[lane] = selected * inverse_selected_sum;
++    }
++    return selected_id;
++}
++__device__ __forceinline__ void route_row_dpp(const float* __restrict__ logits, int32_t* __restrict__ ids,
++                                              float* __restrict__ weights, int lane) {
++    float values[16];
++#pragma unroll
++    for (int i = 0; i < 16; ++i) values[i] = logits[lane + i * 32];
++    route_values_dpp(values, ids, weights, lane);
++}
++#endif
++__launch_bounds__(32)
++__global__ void route_dpp(const float* __restrict__ logits, int32_t* __restrict__ ids, float* __restrict__ weights) {
++#if defined(STRATA_ROUTE_DPP_DEVICE)
++    const size_t t = blockIdx.x;   // one block of one warp per token
++    route_row_dpp(logits + t * 512, ids + t * 10, weights + t * 10, (int) threadIdx.x);
++#else
++    __builtin_trap();   // not wave32 RDNA: the switch is never on there
++#endif
++}
++bool route_dpp_on() {
++    static const bool on = [] { const char* v = std::getenv("STRATA_ROUTE_DPP"); return v != nullptr && std::atoi(v) != 0; }();
++    return on;
++}
++// STRATA_ROUTER_TAIL=1 (with STRATA_ROUTE_DPP; on by default on gfx1100, strata/core/arch_defaults.hpp): a verify
++// layer's router GEMV, top-10 and doorbell in ONE launch.  They were three dependent launches directly before the
++// doorbell (the GEMV's 512 blocks, route_dpp, doorbell_publish_res' one block), each with its launch gap.  Here every
++// block computes its logit row with the GEMV's own code (mmvf_multi.cuh, the block size bf16_gemv_fp32_mmvf_multi
++// picks for 2560 inputs), publishes its share of the activations, fences both and takes a ticket; the block that takes
++// the last ticket (nothing waits: every other row is written by then) runs route_dpp's rows, publishes the ids, rings.
++// Logits, ids, weights and the published ids are the three launches' bits.  The activations are published in every
++// window; doorbell_publish_res skips them when no routed expert is a miss (the host reads them only for misses).
++// 7900 XTX, 48 layers of cold router weights in one graph: T=4 20.0 -> 13.5 us a layer, T=2 17.2 -> 12.4 (the last
++// block publishing all the activations itself: 15.7 and 12.9).
++constexpr int kTailIn = 2560;
++// STRATA_SH_GATE_TAIL: with `w_sg`, one block more (index 512) computes the shared expert's gate logits sg_out[t] - the
++// shared expert's own bf16_gemv_fp32_mmvf_multi launch (one 256-thread block, the same mmvf_multi_block), bit for bit
++// STRATA_ROUTER_TAIL_ROWS=R (2, 4 or 8): R logit rows a block (512 / R blocks, mmvf_multi_rows_block: the same bits)
++template <int NT, int R>
++__global__ void __launch_bounds__(256) router_tail_kernel(const float* x, const uint16_t* __restrict__ w, float* logits,
++                                                          int32_t* ids, float* weights, float* x_out, int32_t* ids_out,
++                                                          uint32_t* seq, unsigned* ticket, const uint16_t* __restrict__ w_sg,
++                                                          float* sg_out) {
++#if defined(STRATA_ROUTE_DPP_DEVICE)
++    if (blockIdx.x < 512 / R) {
++        if constexpr (R == 1) mmvf_multi_block<256, NT, true>(x, kTailIn, w, logits, 512, kTailIn, NT);
++        else mmvf_multi_rows_block<256, NT, R>(x, kTailIn, w, logits, 512, kTailIn, (int) blockIdx.x * R);
++    } else {
++        mmvf_multi_block<256, NT, true>(x, kTailIn, w_sg, sg_out, 1, kTailIn, NT, 0);
++    }
++    // the block's share of the activations to the host (a few float4), fenced with its logit row before the ticket:
++    // spread over the blocks, the copy is no longer a serial step of the last one
++    constexpr int n4 = NT * kTailIn / 4;
++    const int per = (n4 + (int) gridDim.x - 1) / (int) gridDim.x, i = (int) blockIdx.x * per + (int) threadIdx.x;
++    if ((int) threadIdx.x < per && i < n4) reinterpret_cast<float4*>(x_out)[i] = reinterpret_cast<const float4*>(x)[i];
++    __shared__ int last;
++    __threadfence_system();
++    __syncthreads();
++    if (threadIdx.x == 0) {
++        last = atomicAdd(ticket, 1u) == gridDim.x - 1;
++        if (last) atomicExch(ticket, 0u);   // zero again for the next launch
++    }
++    __syncthreads();
++    if (!last) return;
++    __threadfence();
++    const int t = threadIdx.x, lane = t & 31, warp = t >> 5;
++    if (warp < NT) {
++        float values[16];
++        const volatile float* row = logits + (size_t) warp * 512;   // other blocks' rows: no cached or hoisted loads
++#pragma unroll
++        for (int i = 0; i < 16; ++i) values[i] = row[lane + i * 32];
++        const int id = route_values_dpp(values, ids + warp * 10, weights + warp * 10, lane);
++        if (lane < 10) ids_out[warp * 10 + lane] = id;
++    }
++    __threadfence_system();
++    __syncthreads();
++    if (t == 0) {   // doorbell_publish_res' ring
++        *(volatile uint32_t*) seq = *(volatile uint32_t*) seq + 1u;
++        __threadfence_system();
++    }
++#else
++    __builtin_trap();   // not wave32 RDNA: native_router_tail is never called there
++#endif
++}
++#endif
+ bool valid(const void* p, size_t bytes) {
+     const auto address = reinterpret_cast<uintptr_t>(p);
+     return p && address % 4 == 0 && bytes <= UINTPTR_MAX - address;
+@@ -221,6 +414,10 @@ void native_router_top10(const float* logits, int32_t* ids, float* weights, void
+         || overlap(logits, 512 * 4, ids, 10 * 4) || overlap(logits, 512 * 4, weights, 10 * 4)
+         || overlap(ids, 10 * 4, weights, 10 * 4))
+         throw std::invalid_argument("native router requires a stream, aligned spans, and disjoint outputs");
++#if defined(STRATA_ROUTE_DPP_BUILT)
++    if (route_dpp_on()) route_dpp<<<1, 32, 0, static_cast<cudaStream_t>(stream)>>>(logits, ids, weights);
++    else
++#endif
+     route<<<1, dim3(32, 8), 0, static_cast<cudaStream_t>(stream)>>>(logits, ids, weights);
+     const auto error = cudaGetLastError();
+     if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
+@@ -229,6 +426,10 @@ void native_router_top10_multi(const float* logits, int32_t* ids, float* weights
+     if (!stream || n_tok < 1 || !valid(logits, (size_t) n_tok * 512 * 4) || !valid(ids, (size_t) n_tok * 10 * 4) ||
+         !valid(weights, (size_t) n_tok * 10 * 4))
+         throw std::invalid_argument("native router (multi) requires a stream and aligned [n,512]/[n,10] buffers");
++#if defined(STRATA_ROUTE_DPP_BUILT)
++    if (route_dpp_on()) route_dpp<<<(unsigned) n_tok, 32, 0, static_cast<cudaStream_t>(stream)>>>(logits, ids, weights);
++    else
++#endif
+     route_multi<<<(unsigned) ((n_tok + 7) / 8), dim3(32, 8), 0, static_cast<cudaStream_t>(stream)>>>(logits, ids, weights, n_tok);
+     const auto error = cudaGetLastError();
+     if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
+@@ -249,6 +450,51 @@ void native_router_topk(const float* logits, int32_t* ids, float* weights, int n
+     const auto error = cudaGetLastError();
+     if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
+ }
++bool router_tail_on() {
++#if defined(STRATA_ROUTE_DPP_BUILT)
++    static const bool on = [] { const char* v = std::getenv("STRATA_ROUTER_TAIL"); return v != nullptr && std::atoi(v) != 0; }();
++    return on && route_dpp_on();
++#else
++    return false;
++#endif
++}
++bool native_router_tail(const float* x, const uint16_t* w, float* logits, int32_t* ids, float* weights, float* x_out,
++                        int32_t* ids_out, uint32_t* seq, unsigned* ticket, int n_tok, int n_in, void* stream,
++                        const uint16_t* w_sg, float* sg_out) {
++#if defined(STRATA_ROUTE_DPP_BUILT)
++    if (!stream || n_tok < 1 || n_tok > 4 || n_in != kTailIn || !ticket || !seq || !valid(w, (size_t) 512 * kTailIn * 2) ||
++        !valid(logits, (size_t) n_tok * 512 * 4) || !valid(ids, (size_t) n_tok * 10 * 4) || !valid(weights, (size_t) n_tok * 10 * 4) ||
++        !valid(ids_out, (size_t) n_tok * 10 * 4) || reinterpret_cast<uintptr_t>(x) % 16 != 0 ||
++        reinterpret_cast<uintptr_t>(x_out) % 16 != 0 || (w_sg != nullptr) != (sg_out != nullptr) ||
++        (w_sg != nullptr && (!valid(w_sg, (size_t) kTailIn * 2) || !valid(sg_out, (size_t) n_tok * 4))))
++        return false;
++    const cudaStream_t st = static_cast<cudaStream_t>(stream);
++    static const int rows = [] {
++        const char* v = std::getenv("STRATA_ROUTER_TAIL_ROWS");
++        const int r = v != nullptr ? std::atoi(v) : 1;
++        return r == 2 || r == 4 || r == 8 ? r : 1;
++    }();
++    const unsigned blocks = (unsigned) (512 / rows) + (w_sg != nullptr ? 1u : 0u);
++#define STRATA_TAIL(NT, R) router_tail_kernel<NT, R><<<blocks, 256, 0, st>>>(x, w, logits, ids, weights, x_out, ids_out, seq, ticket, w_sg, sg_out)
++#define STRATA_TAIL_R(NT) switch (rows) { case 2: STRATA_TAIL(NT, 2); break; case 4: STRATA_TAIL(NT, 4); break; \
++                                         case 8: STRATA_TAIL(NT, 8); break; default: STRATA_TAIL(NT, 1); break; }
++    switch (n_tok) {
++        case 1: STRATA_TAIL_R(1) break;
++        case 2: STRATA_TAIL_R(2) break;
++        case 3: STRATA_TAIL_R(3) break;
++        default: STRATA_TAIL_R(4) break;
++    }
++#undef STRATA_TAIL_R
++#undef STRATA_TAIL
++    const auto error = cudaGetLastError();
++    if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
++    return true;
++#else
++    (void) x; (void) w; (void) logits; (void) ids; (void) weights; (void) x_out; (void) ids_out; (void) seq; (void) ticket;
++    (void) n_tok; (void) n_in; (void) stream; (void) w_sg; (void) sg_out;
++    return false;
++#endif
++}
+ 
+ // STRATA_ROUTE_RESIDENT (EXPERIMENTAL, opt-in, changes the output): residency-biased routing for 512 x 10.
+ // After the top-10: for the ranks lo..hi a non-resident expert is replaced by the best resident expert not already
+diff --git a/src/kernels/cuda/verify_kernels.cu b/src/kernels/cuda/verify_kernels.cu
+index f2aba7378..94c68e8ab 100644
+--- a/src/kernels/cuda/verify_kernels.cu
++++ b/src/kernels/cuda/verify_kernels.cu
+@@ -9,6 +9,7 @@
+ #include "strata/kernels/q8_1_finite.hpp"   // #606: q8_1_ds
+ #include "strata/kernels/window_start.hpp"  // KVA: the draft layer's window floor
+ #include "strata/kernels/dp4a.hpp"
++#include "strata/kernels/gfx_arch.hpp"
+ #include "strata/kernels/pdl.hpp"
+ 
+ #include <cuda_fp16.h>
+@@ -92,6 +93,37 @@ __global__ void gdn_conv_commit_kernel(float* __restrict__ hist, const float* __
+     hist[c * 3 + 2] = seq[2];
+ }
+ 
++// a lane's 8 weights of one uint4 against x[0..8), in gdn_ab_body's FMA order
++__device__ __forceinline__ float gdn_ab_dot8(const uint4 wv, const float4 xa, const float4 xb, float a) {
++    a = fmaf(__uint_as_float(wv.x << 16), xa.x, a); a = fmaf(__uint_as_float(wv.x & 0xffff0000u), xa.y, a);
++    a = fmaf(__uint_as_float(wv.y << 16), xa.z, a); a = fmaf(__uint_as_float(wv.y & 0xffff0000u), xa.w, a);
++    a = fmaf(__uint_as_float(wv.z << 16), xb.x, a); a = fmaf(__uint_as_float(wv.z & 0xffff0000u), xb.y, a);
++    a = fmaf(__uint_as_float(wv.w << 16), xb.z, a); a = fmaf(__uint_as_float(wv.w & 0xffff0000u), xb.w, a);
++    return a;
++}
++
++// the lanes' partial dots of one row -> gate or beta for every token
++template <int MAX_T, bool EXACT_T>
++__device__ __forceinline__ void gdn_ab_finish(const float (&acc)[MAX_T], int lane, bool is_beta, int r,
++                                              const float* __restrict__ dt, const float* __restrict__ ssm_a,
++                                              float* __restrict__ gate, float* __restrict__ beta, int h_v, int T) {
++#pragma unroll
++    for (int t = 0; t < MAX_T; ++t) {
++        if (!EXACT_T && t >= T) break;
++        float a = acc[t];
++#pragma unroll
++        for (int o = 16; o > 0; o >>= 1) a += __shfl_xor_sync(0xffffffffu, a, o);
++        if (lane != 0) continue;
++        if (is_beta) {
++            beta[(size_t) t * h_v + r] = 1.0f / (1.0f + __expf(-a));
++        } else {
++            const float v = a + dt[r];
++            const float sp = v > 20.0f ? v : log1pf(__expf(v));
++            gate[(size_t) t * h_v + r] = sp * ssm_a[r];
++        }
++    }
++}
++
+ template <int MAX_T = kVerifyNarrowT, bool EXACT_T = false>
+ __device__ __forceinline__ void gdn_ab_body(const int bx, const float* __restrict__ x, const uint16_t* __restrict__ wa,
+                                                           const uint16_t* __restrict__ wb,
+@@ -108,39 +140,56 @@ __device__ __forceinline__ void gdn_ab_body(const int bx, const float* __restric
+     for (int t = 0; t < MAX_T; ++t) acc[t] = 0.0f;
+     for (int j = lane; j < n / 8; j += 32) {
+         const uint4 wv = __ldg(w4 + j);
+-        const float w0 = __uint_as_float(wv.x << 16), w1 = __uint_as_float(wv.x & 0xffff0000u);
+-        const float w2 = __uint_as_float(wv.y << 16), w3 = __uint_as_float(wv.y & 0xffff0000u);
+-        const float w4f = __uint_as_float(wv.z << 16), w5 = __uint_as_float(wv.z & 0xffff0000u);
+-        const float w6 = __uint_as_float(wv.w << 16), w7 = __uint_as_float(wv.w & 0xffff0000u);
+ #pragma unroll
+         for (int t = 0; t < MAX_T; ++t) {
+             if (!EXACT_T && t >= T) break;
+             const float* xt = x + (size_t) t * n;
+-            const float4 xa = __ldg(reinterpret_cast<const float4*>(xt + j * 8));
+-            const float4 xb = __ldg(reinterpret_cast<const float4*>(xt + j * 8 + 4));
+-            float a = acc[t];
+-            a = fmaf(w0, xa.x, a); a = fmaf(w1, xa.y, a);
+-            a = fmaf(w2, xa.z, a); a = fmaf(w3, xa.w, a);
+-            a = fmaf(w4f, xb.x, a); a = fmaf(w5, xb.y, a);
+-            a = fmaf(w6, xb.z, a); a = fmaf(w7, xb.w, a);
+-            acc[t] = a;
++            acc[t] = gdn_ab_dot8(wv, __ldg(reinterpret_cast<const float4*>(xt + j * 8)),
++                                 __ldg(reinterpret_cast<const float4*>(xt + j * 8 + 4)), acc[t]);
+         }
+     }
++    gdn_ab_finish<MAX_T, EXACT_T>(acc, lane, is_beta, r, dt, ssm_a, gate, beta, h_v, T);
++}
++
++// STRATA_GDN_AB_ILP=1 (on by default on gfx1100, strata/core/arch_defaults.hpp): gdn_ab_body with one warp per (row,
++// token) instead of one per row, for n = 256 * IT.  gdn_ab_body's loop runs to a kernel argument, so each of a lane's
++// IT steps waits for its own loads: IT memory latencies in a row (6.7 us for 0.5 MB on a 7900 XTX).  Here a lane
++// loads its IT weight chunks and its token's 2 * IT x chunks at once, then runs that token's fmaf chain: the chain
++// gdn_ab_body's lane runs for that token (the tokens' chains never mix), followed by the same butterfly and epilogue,
++// so gate and beta are bitwise the same.  grid (rows / 2, T), 64 threads.  The conv + a/b of a verify layer, 36 layers
++// of cold weights in a graph, T 2..4: 8.4-9.4 -> 6.6-6.8 us a layer (4.2-5.0 inside STRATA_FUSE_CONVAB's launch).
++template <int IT>
++__device__ __forceinline__ void gdn_ab_body_ilp(const int bx, const int t, const float* __restrict__ x,
++                                                const uint16_t* __restrict__ wa, const uint16_t* __restrict__ wb,
++                                                const float* __restrict__ dt, const float* __restrict__ ssm_a,
++                                                float* __restrict__ gate, float* __restrict__ beta, int h_v) {
++    constexpr int n = 256 * IT;
++    const int row = bx * 2 + (threadIdx.x >> 5), lane = threadIdx.x & 31;
++    if (row >= 2 * h_v) return;
++    const bool is_beta = row >= h_v;
++    const int r = is_beta ? row - h_v : row;
++    const uint4* w4 = reinterpret_cast<const uint4*>((is_beta ? wb : wa) + (size_t) r * n) + lane;
++    const float4* x4 = reinterpret_cast<const float4*>(x + (size_t) t * n) + 2 * lane;
++    uint4 wv[IT];
++    float4 xa[IT], xb[IT];
+ #pragma unroll
+-    for (int t = 0; t < MAX_T; ++t) {
+-        if (!EXACT_T && t >= T) break;
+-        float a = acc[t];
+-#pragma unroll
+-        for (int o = 16; o > 0; o >>= 1) a += __shfl_xor_sync(0xffffffffu, a, o);
+-        if (lane != 0) continue;
+-        if (is_beta) {
+-            beta[(size_t) t * h_v + r] = 1.0f / (1.0f + __expf(-a));
+-        } else {
+-            const float v = a + dt[r];
+-            const float sp = v > 20.0f ? v : log1pf(__expf(v));
+-            gate[(size_t) t * h_v + r] = sp * ssm_a[r];
+-        }
++    for (int i = 0; i < IT; ++i) {
++        wv[i] = __ldg(w4 + 32 * i);
++        xa[i] = __ldg(x4 + 64 * i);
++        xb[i] = __ldg(x4 + 64 * i + 1);
+     }
++    float acc[1] = {0.0f};
++#pragma unroll
++    for (int i = 0; i < IT; ++i) acc[0] = gdn_ab_dot8(wv[i], xa[i], xb[i], acc[0]);
++    gdn_ab_finish<1, true>(acc, lane, is_beta, r, dt, ssm_a, gate + (size_t) t * h_v, beta + (size_t) t * h_v, h_v, 1);
++}
++constexpr int kAbIlpIt = 10;   // n_embd 2560 (Qwen3.8 Flash-Next); another width keeps gdn_ab_body
++
++__global__ void __launch_bounds__(64) gdn_ab_ilp_kernel(const float* __restrict__ x, const uint16_t* __restrict__ wa,
++                                                        const uint16_t* __restrict__ wb, const float* __restrict__ dt,
++                                                        const float* __restrict__ ssm_a, float* __restrict__ gate,
++                                                        float* __restrict__ beta, int h_v) {
++    gdn_ab_body_ilp<kAbIlpIt>(blockIdx.x, blockIdx.y, x, wa, wb, dt, ssm_a, gate, beta, h_v);
+ }
+ 
+ template <int MAX_T = kVerifyNarrowT, bool EXACT_T = false>
+@@ -169,6 +218,24 @@ __global__ void __launch_bounds__(S) gdn_conv_ab_kernel(int conv_blocks, float*
+         gdn_ab_body<MAX_T, EXACT_T>((int) blockIdx.x, x, wa, wb, dt, ssm_a, gate, beta, n, h_v, T);
+     }
+ }
++// the same with STRATA_GDN_AB_ILP's a/b body: an a/b block serves token blockIdx.y, as a conv block does
++__global__ void __launch_bounds__(S) gdn_conv_ab_ilp_kernel(int conv_blocks, float* hist, const float* __restrict__ qkv,
++                                                            const float* __restrict__ w, float* __restrict__ h, int C,
++                                                            int qk_heads, float eps, int t_begin, bool commit,
++                                                            const float* __restrict__ x, const uint16_t* __restrict__ wa,
++                                                            const uint16_t* __restrict__ wb, const float* __restrict__ dt,
++                                                            const float* __restrict__ ssm_a, float* __restrict__ gate,
++                                                            float* __restrict__ beta, int h_v) {
++    const int ab_blocks = (2 * h_v + 1) / 2;
++    if ((int) blockIdx.x >= ab_blocks)
++        gdn_conv_l2_body((int) blockIdx.x - ab_blocks, (int) blockIdx.y, hist, qkv, w, h, C, qk_heads, eps, t_begin, commit);
++    else if (threadIdx.x < 64)
++        gdn_ab_body_ilp<kAbIlpIt>((int) blockIdx.x, (int) blockIdx.y, x, wa, wb, dt, ssm_a, gate, beta, h_v);
++}
++bool ab_ilp_on() {
++    static const bool on = [] { const char* v = std::getenv("STRATA_GDN_AB_ILP"); return v != nullptr && std::atoi(v) != 0; }();
++    return on;
++}
+ 
+ // State-only commit kernel: each head's 128 independent state columns are split across 4 blocks of 32 columns
+ // (48 * 4 = 192 blocks of 128 threads across all SMs, vs 48 blocks of 512 threads), with no sq/o/norm/z/y work.
+@@ -969,8 +1036,20 @@ void logits_nonfinite_rows(const float* logits, int n_rows, int n, uint32_t* fla
+ }
+ 
+ bool multi_block_head_ops() {
+-#if defined(__HIPCC__)
++#if defined(STRATA_HIP_GFX906)
+     return false;
++#elif defined(__HIPCC__)
++    // wave32 HIP: the one-block argmax and top probability read a draft or verify row (106K-248K logits) on one CU,
++    // 15-25 us each on a 7900 XTX; these are their bitwise twins (verify_parity).  On by default on gfx1100, where
++    // that was measured; STRATA_MULTI_BLOCK_ARGMAX=0 / 1 turns them off / on on any wave32 card.
++    static const bool on = [] {
++        if (const char* v = std::getenv("STRATA_MULTI_BLOCK_ARGMAX")) return std::atoi(v) != 0;
++        int dev = 0;
++        cudaDeviceProp p;
++        return cudaGetDevice(&dev) == cudaSuccess && cudaGetDeviceProperties(&p, dev) == cudaSuccess &&
++               gfx_arch_is(p.gcnArchName, "gfx1100");
++    }();
++    return on;
+ #else
+     static const bool on = [] {
+         const char* v = std::getenv("STRATA_MULTI_BLOCK_ARGMAX");
+@@ -981,8 +1060,17 @@ bool multi_block_head_ops() {
+ }
+ 
+ bool argmax_rows_wanted() {
+-#if defined(__HIPCC__)
++#if defined(STRATA_HIP_GFX906)
+     return false;
++#elif defined(__HIPCC__)
++    // wave32 HIP: STRATA_MULTI_BLOCK_ARGMAX=1 (on by default on gfx1100, strata/core/arch_defaults.hpp).  7900 XTX, in a
++    // graph: the verify head's 4 x 248,320 logits 30.3 -> 7.1 us, a draft step's 106,299 14.2 -> 5.6 us.  The split
++    // row_top_prob stays off: its threads keep the one-block kernel's 243-long chains, so it measured no faster here.
++    static const bool on = [] {
++        const char* v = std::getenv("STRATA_MULTI_BLOCK_ARGMAX");
++        return v != nullptr && std::atoi(v) != 0;
++    }();
++    return on || multi_block_head_ops();
+ #else
+     // sm_80 to sm_89, and sm_7x with STRATA_ARGMAX_ROWS_SM70=1: sample_tokens' greedy pick there is the one-block kernel (sm_90+ has the cluster kernel)
+     static const bool want = [] {
+@@ -1072,6 +1160,12 @@ void gdn_conv_ab_multi(const float* history, const float* qkv, const float* conv
+     const dim3 grid((unsigned) (conv_blocks + ab_blocks), (unsigned) n_tok);
+     cudaStream_t st = (cudaStream_t) stream;
+     float* hist = const_cast<float*>(history);
++    if (ab_ilp_on() && n_embd == 256 * kAbIlpIt) {
++        gdn_conv_ab_ilp_kernel<<<grid, S, 0, st>>>(conv_blocks, hist, qkv, conv_w, h, channels, qk_heads, eps, t_begin, commit, x,
++                                                   w_alpha, w_beta, dt, ssm_a, gate, beta, h_v);
++        check("gdn_conv_ab_multi");
++        return;
++    }
+     switch (n_tok) {
+         case 1: gdn_conv_ab_kernel<1, true><<<grid, S, 0, st>>>(conv_blocks, hist, qkv, conv_w, h, channels, qk_heads, eps, t_begin, commit, x, w_alpha, w_beta, dt, ssm_a, gate, beta, n_embd, h_v, n_tok); break;
+         case 2: gdn_conv_ab_kernel<2, true><<<grid, S, 0, st>>>(conv_blocks, hist, qkv, conv_w, h, channels, qk_heads, eps, t_begin, commit, x, w_alpha, w_beta, dt, ssm_a, gate, beta, n_embd, h_v, n_tok); break;
+@@ -1122,6 +1216,11 @@ void gdn_ab_multi(const float* x, const uint16_t* w_alpha, const uint16_t* w_bet
+     }
+     const unsigned blocks = (unsigned) ((2 * h_v + 1) / 2);
+     cudaStream_t st = (cudaStream_t) stream;
++    if (ab_ilp_on() && n_embd == 256 * kAbIlpIt) {
++        gdn_ab_ilp_kernel<<<dim3(blocks, (unsigned) n_tok), 64, 0, st>>>(x, w_alpha, w_beta, dt, ssm_a, gate, beta, h_v);
++        check("gdn_ab_multi");
++        return;
++    }
+     switch (n_tok) {
+         case 1: gdn_ab_multi_kernel<1, true><<<blocks, 64, 0, st>>>(x, w_alpha, w_beta, dt, ssm_a, gate, beta, n_embd, h_v, n_tok); break;
+         case 2: gdn_ab_multi_kernel<2, true><<<blocks, 64, 0, st>>>(x, w_alpha, w_beta, dt, ssm_a, gate, beta, n_embd, h_v, n_tok); break;
+@@ -1561,7 +1660,11 @@ __global__ void wait_copy_i32_kernel(const volatile uint32_t* flag, uint32_t val
+ }  // namespace
+ void wait_copy_i32_from_mapped(const uint32_t* flag, uint32_t value, int32_t* dst, const int32_t* src, int64_t n,
+                                void* stream) {
+-    wait_copy_i32_kernel<<<1, 128, 0, (cudaStream_t) stream>>>(flag, value, dst, src, (int) n);
++    // STRATA_MAPPED_FAST: a thread per word (up to 1024): the copy is one PCIe round trip instead of one per 128 words
++    // (each read of mapped memory waits ~1.5 us; the plan of a 4-token window is 328 words)
++    static const bool wide = [] { const char* v = std::getenv("STRATA_MAPPED_FAST"); return v != nullptr && v[0] == '1'; }();
++    const int threads = wide ? (int) (n < 32 ? 32 : n > 1024 ? 1024 : (n + 31) & ~31ll) : 128;
++    wait_copy_i32_kernel<<<1, threads, 0, (cudaStream_t) stream>>>(flag, value, dst, src, (int) n);
+     check("wait_copy_i32_from_mapped");
+ }
+ 
+diff --git a/src/kernels/router_tail_parity.cpp b/src/kernels/router_tail_parity.cpp
+new file mode 100644
+index 000000000..837455fb8
+--- /dev/null
++++ b/src/kernels/router_tail_parity.cpp
+@@ -0,0 +1,201 @@
++// src/kernels/router_tail_parity.cpp - STRATA_ROUTER_TAIL's one launch against the three it replaces: the router GEMV
++// (bf16_gemv_fp32_mmvf_multi), the top-10 (native_router_top10_multi) and the doorbell (doorbell_publish_res).
++// Logits, ids, weights, the published ids and activations and the ring must be bitwise the same, for T = 1..4 rows,
++// on random rows, on all-zero activations (every logit ties: the lowest ids win) and on duplicated weight rows
++// (pairs of equal logits), each over many launches of one captured graph (the ticket must come back to zero).
++//
++//     build/router_tail_parity
++#include "strata/kernels/bf16_gemv.hpp"
++#include "strata/kernels/elementwise.hpp"
++#include "strata/kernels/native_router.hpp"
++#include "strata/kernels/verify_kernels.hpp"
++
++#include <cuda_runtime.h>
++
++#include <cstdint>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <random>
++#include <vector>
++
++namespace K = strata::kernels;
++
++#define CK(x) do { cudaError_t e_ = (x); if (e_ != cudaSuccess) { std::fprintf(stderr, "%s: %s\n", #x, cudaGetErrorString(e_)); std::exit(1); } } while (0)
++
++namespace {
++
++constexpr int N = 2560, NE = 512, KK = 10, REPS = 50;
++
++struct Mapped {
++    float* x = nullptr; int32_t* ids = nullptr; uint32_t* seq = nullptr;     // host views
++    float* dx = nullptr; int32_t* dids = nullptr; uint32_t* dseq = nullptr;  // device views
++    explicit Mapped(int T) {
++        CK(cudaHostAlloc((void**) &x, (size_t) T * N * 4, cudaHostAllocMapped));
++        CK(cudaHostAlloc((void**) &ids, (size_t) T * KK * 4, cudaHostAllocMapped));
++        CK(cudaHostAlloc((void**) &seq, 64, cudaHostAllocMapped));
++        CK(cudaHostGetDevicePointer((void**) &dx, x, 0));
++        CK(cudaHostGetDevicePointer((void**) &dids, ids, 0));
++        CK(cudaHostGetDevicePointer((void**) &dseq, seq, 0));
++        std::memset(x, 0, (size_t) T * N * 4);
++        std::memset(ids, 0xff, (size_t) T * KK * 4);
++        *seq = 0;
++    }
++};
++
++// 0: random rows, 1: all-zero activations, 2: random rows with every odd weight row a copy of the one before
++bool run_case(int T, int kind, unsigned seed) {
++    std::mt19937 rng(seed);
++    std::normal_distribution<float> nd(0.f, 1.f);
++    std::vector<uint16_t> w((size_t) NE * N);
++    for (auto& v : w) {
++        const float f = 0.05f * nd(rng);
++        uint32_t u;
++        std::memcpy(&u, &f, 4);
++        v = (uint16_t) ((u + 0x7fff + ((u >> 16) & 1)) >> 16);
++    }
++    if (kind == 2)
++        for (int r = 1; r < NE; r += 2) std::memcpy(&w[(size_t) r * N], &w[(size_t) (r - 1) * N], (size_t) N * 2);
++    std::vector<float> x((size_t) T * N);
++    for (auto& v : x) v = kind == 1 ? 0.f : nd(rng);
++    uint16_t* dw; float* dxin; float *lg[2], *wt[2]; int32_t* id[2]; unsigned* ticket;
++    CK(cudaMalloc((void**) &dw, w.size() * 2));
++    CK(cudaMemcpy(dw, w.data(), w.size() * 2, cudaMemcpyHostToDevice));
++    CK(cudaMalloc((void**) &dxin, x.size() * 4));
++    CK(cudaMemcpy(dxin, x.data(), x.size() * 4, cudaMemcpyHostToDevice));
++    for (int v = 0; v < 2; ++v) {
++        CK(cudaMalloc((void**) &lg[v], (size_t) T * NE * 4));
++        CK(cudaMalloc((void**) &wt[v], (size_t) T * KK * 4));
++        CK(cudaMalloc((void**) &id[v], (size_t) T * KK * 4));
++        CK(cudaMemset(lg[v], 0, (size_t) T * NE * 4));
++    }
++    CK(cudaMalloc((void**) &ticket, 4));
++    CK(cudaMemset(ticket, 0, 4));
++    Mapped m[2] = {Mapped(T), Mapped(T)};
++    cudaStream_t st;
++    CK(cudaStreamCreateWithFlags(&st, cudaStreamNonBlocking));
++    // the reference: the engine's three launches (d_res null: every expert a miss, so the activations are published)
++    cudaGraph_t g[2];
++    cudaGraphExec_t ex[2];
++    CK(cudaStreamBeginCapture(st, cudaStreamCaptureModeThreadLocal));
++    K::bf16_gemv_fp32_mmvf_multi(dxin, N, dw, lg[0], NE, N, NE, T, st);
++    K::native_router_top10_multi(lg[0], id[0], wt[0], T, st);
++    K::doorbell_publish_res(dxin, id[0], nullptr, NE, (int64_t) T * N, (int64_t) T * KK, m[0].dx, m[0].dids, m[0].dseq, st);
++    CK(cudaStreamEndCapture(st, &g[0]));
++    CK(cudaStreamBeginCapture(st, cudaStreamCaptureModeThreadLocal));
++    const bool launched = K::native_router_tail(dxin, dw, lg[1], id[1], wt[1], m[1].dx, m[1].dids, m[1].dseq, ticket, T, N, st);
++    CK(cudaStreamEndCapture(st, &g[1]));
++    if (!launched) {
++        std::printf("router_tail_parity: not available on this build/device (T=%d)\n", T);
++        return true;
++    }
++    for (int v = 0; v < 2; ++v) CK(cudaGraphInstantiate(&ex[v], g[v], nullptr, nullptr, 0));
++    for (int r = 0; r < REPS; ++r)
++        for (int v = 0; v < 2; ++v) CK(cudaGraphLaunch(ex[v], st));
++    CK(cudaStreamSynchronize(st));
++    std::vector<float> l0((size_t) T * NE), l1((size_t) T * NE), w0((size_t) T * KK), w1((size_t) T * KK);
++    std::vector<int32_t> i0((size_t) T * KK), i1((size_t) T * KK);
++    unsigned tk = 1;
++    CK(cudaMemcpy(l0.data(), lg[0], l0.size() * 4, cudaMemcpyDeviceToHost));
++    CK(cudaMemcpy(l1.data(), lg[1], l1.size() * 4, cudaMemcpyDeviceToHost));
++    CK(cudaMemcpy(w0.data(), wt[0], w0.size() * 4, cudaMemcpyDeviceToHost));
++    CK(cudaMemcpy(w1.data(), wt[1], w1.size() * 4, cudaMemcpyDeviceToHost));
++    CK(cudaMemcpy(i0.data(), id[0], i0.size() * 4, cudaMemcpyDeviceToHost));
++    CK(cudaMemcpy(i1.data(), id[1], i1.size() * 4, cudaMemcpyDeviceToHost));
++    CK(cudaMemcpy(&tk, ticket, 4, cudaMemcpyDeviceToHost));
++    const bool ok = !std::memcmp(l0.data(), l1.data(), l0.size() * 4) && !std::memcmp(w0.data(), w1.data(), w0.size() * 4) &&
++                    i0 == i1 && !std::memcmp(m[0].x, m[1].x, (size_t) T * N * 4) &&
++                    !std::memcmp(m[0].ids, m[1].ids, (size_t) T * KK * 4) && !std::memcmp(m[0].ids, i0.data(), i0.size() * 4) &&
++                    !std::memcmp(m[0].x, x.data(), x.size() * 4) && *m[0].seq == REPS && *m[1].seq == REPS && tk == 0;
++    std::printf("T=%d %-10s seed %u: %s (ring %u/%u, ticket %u, ids row 0:", T,
++                kind == 0 ? "random" : kind == 1 ? "zero x" : "dup rows", seed, ok ? "bitwise equal" : "DIFFERENT",
++                *m[0].seq, *m[1].seq, tk);
++    for (int k = 0; k < KK; ++k) std::printf(" %d", i1[k]);
++    std::printf(")\n");
++    for (int v = 0; v < 2; ++v) {
++        CK(cudaGraphExecDestroy(ex[v]));
++        CK(cudaGraphDestroy(g[v]));
++        CK(cudaFree(lg[v])); CK(cudaFree(wt[v])); CK(cudaFree(id[v]));
++        CK(cudaFreeHost(m[v].x)); CK(cudaFreeHost(m[v].ids)); CK(cudaFreeHost(m[v].seq));
++    }
++    CK(cudaFree(dw)); CK(cudaFree(dxin)); CK(cudaFree(ticket));
++    CK(cudaStreamDestroy(st));
++    return ok;
++}
++
++// STRATA_RT_BENCH=1: the time of one router tail in a graph of 48 launches on 48 different weight matrices (126 MB,
++// more than the 96 MB Infinity Cache: the weights come from VRAM as in the engine), against 48 empty kernels
++void bench(int T) {
++    constexpr int L = 48, REP = 20;
++    std::mt19937 rng(1234u + (unsigned) T);
++    std::uniform_int_distribution<int> ud(-3000, 3000);
++    std::vector<uint16_t> w((size_t) NE * N);
++    for (auto& v : w) v = (uint16_t) (0x3c00 + ud(rng));   // bf16 around 0.0078 +- a few binades
++    std::vector<float> x((size_t) T * N);
++    for (auto& v : x) v = (float) ud(rng) / 3000.f;
++    std::vector<uint16_t*> dw(L);
++    for (int l = 0; l < L; ++l) {
++        CK(cudaMalloc((void**) &dw[l], w.size() * 2));
++        CK(cudaMemcpy(dw[l], w.data(), w.size() * 2, cudaMemcpyHostToDevice));
++    }
++    float *dx, *lg, *wt; int32_t* id; unsigned* ticket;
++    CK(cudaMalloc((void**) &dx, x.size() * 4));
++    CK(cudaMemcpy(dx, x.data(), x.size() * 4, cudaMemcpyHostToDevice));
++    CK(cudaMalloc((void**) &lg, (size_t) T * NE * 4));
++    CK(cudaMalloc((void**) &wt, (size_t) T * KK * 4));
++    CK(cudaMalloc((void**) &id, (size_t) T * KK * 4));
++    CK(cudaMalloc((void**) &ticket, 4));
++    CK(cudaMemset(ticket, 0, 4));
++    Mapped m(T);
++    cudaStream_t st;
++    CK(cudaStreamCreateWithFlags(&st, cudaStreamNonBlocking));
++    cudaGraph_t g[2];
++    cudaGraphExec_t ex[2];
++    CK(cudaStreamBeginCapture(st, cudaStreamCaptureModeThreadLocal));
++    for (int l = 0; l < L; ++l) K::native_router_tail(dx, dw[l], lg, id, wt, m.dx, m.dids, m.dseq, ticket, T, N, st);
++    CK(cudaStreamEndCapture(st, &g[0]));
++    CK(cudaStreamBeginCapture(st, cudaStreamCaptureModeThreadLocal));
++    for (int l = 0; l < L; ++l) K::gpu_noop(st);
++    CK(cudaStreamEndCapture(st, &g[1]));
++    cudaEvent_t a, b;
++    CK(cudaEventCreate(&a));
++    CK(cudaEventCreate(&b));
++    float us[2];
++    for (int v = 0; v < 2; ++v) {
++        CK(cudaGraphInstantiate(&ex[v], g[v], nullptr, nullptr, 0));
++        for (int r = 0; r < 3; ++r) CK(cudaGraphLaunch(ex[v], st));
++        CK(cudaEventRecord(a, st));
++        for (int r = 0; r < REP; ++r) CK(cudaGraphLaunch(ex[v], st));
++        CK(cudaEventRecord(b, st));
++        CK(cudaEventSynchronize(b));
++        float ms = 0.f;
++        CK(cudaEventElapsedTime(&ms, a, b));
++        us[v] = ms * 1000.f / (REP * L);
++    }
++    const char* rows = std::getenv("STRATA_ROUTER_TAIL_ROWS");
++    std::printf("bench T=%d rows %s: router tail %.2f us a launch, empty kernel %.2f us (ring %u)\n", T, rows ? rows : "1",
++                us[0], us[1], *m.seq);
++    for (int v = 0; v < 2; ++v) { CK(cudaGraphExecDestroy(ex[v])); CK(cudaGraphDestroy(g[v])); }
++    for (int l = 0; l < L; ++l) CK(cudaFree(dw[l]));
++    CK(cudaFree(dx)); CK(cudaFree(lg)); CK(cudaFree(wt)); CK(cudaFree(id)); CK(cudaFree(ticket));
++    CK(cudaFreeHost(m.x)); CK(cudaFreeHost(m.ids)); CK(cudaFreeHost(m.seq));
++    CK(cudaEventDestroy(a)); CK(cudaEventDestroy(b));
++    CK(cudaStreamDestroy(st));
++}
++
++}  // namespace
++
++int main() {
++    setvbuf(stdout, nullptr, _IONBF, 0);
++    K::native_router_set_enabled(true);
++    if (const char* b = std::getenv("STRATA_RT_BENCH"); b != nullptr && b[0] == '1') {
++        for (int T = 1; T <= 4; ++T) bench(T);
++        return 0;
++    }
++    bool ok = true;
++    for (int T = 1; T <= 4; ++T)   // T = 1: STRATA_T1_FUSE's one-token windows
++        for (int kind = 0; kind < 3; ++kind)
++            for (unsigned seed = 1; seed <= (kind == 1 ? 1u : 4u); ++seed) ok &= run_case(T, kind, seed * 7919u + (unsigned) T);
++    std::printf("router_tail_parity: %s\n", ok ? "OK" : "FAILED");
++    return ok ? 0 : 1;
++}

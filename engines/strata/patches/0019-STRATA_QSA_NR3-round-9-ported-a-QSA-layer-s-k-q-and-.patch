@@ -1,0 +1,250 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: blackhat-7 <44942105+blackhat-7@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 08:17:49 +0530
+Subject: [PATCH 19/33] STRATA_QSA_NR3 (round 9, ported): a QSA layer's k, q
+ and indexer-q norm+ropes in one launch (opt-in)
+
+The q GEMV moves up beside the k/v GEMVs, so the three native_qsa_rms_norm_rope calls of a QSA layer become one
+norm_rope3 launch (the same row body: norm_rope_row). Two fewer critical-path launches per QSA layer at T >= 2.
+On v0.2.9's QSA lambdas: only on the main stream (not with STRATA_SIDE_MIXER's branches), only with STRATA_QSA_FOLD
+having made the indexer query, no K/V rotation. rope_parity check 7: bit-identical (0 of 34816, none and yarn).
+---
+ include/strata/kernels/native_rope.hpp | 14 +++++
+ src/core/verify.cpp                    | 20 ++++++-
+ src/kernels/cuda/native_rope.cu        | 74 +++++++++++++++++++++++---
+ src/kernels/rope_parity.cpp            | 53 ++++++++++++++++++
+ 4 files changed, 154 insertions(+), 7 deletions(-)
+
+diff --git a/include/strata/kernels/native_rope.hpp b/include/strata/kernels/native_rope.hpp
+index f550a29de..0642b79ae 100644
+--- a/include/strata/kernels/native_rope.hpp
++++ b/include/strata/kernels/native_rope.hpp
+@@ -24,6 +24,20 @@ void native_rope_apply(const float* x, float* out, int rows, int head_dim,
+ void native_qsa_rms_norm_rope(const float* x, int in_stride, const float* gamma, float* out,
+                               int rows, int head_dim, int n_rot, float epsilon,
+                               const RopeScaling& scaling, const int* positions, void* stream);
++/// One native_qsa_rms_norm_rope call's rows, for native_qsa_rms_norm_rope3.
++struct NormRopeSeg {
++    const float* x;
++    int in_stride;
++    const float* gamma;
++    float* out;
++    int rows;
++    int head_dim;
++    const int* positions;
++};
++/// (STRATA_QSA_NR3) three native_qsa_rms_norm_rope calls with the same n_rot, epsilon and scaling in one launch; every
++/// row is computed exactly as the single call computes it.
++void native_qsa_rms_norm_rope3(const NormRopeSeg (&seg)[3], int n_rot, float epsilon, const RopeScaling& scaling,
++                               void* stream);
+ /// Whether callers should take the fused kernel (and the in-place rope's 32-thread launch) for this geometry. On the
+ /// CUDA build it is on unless STRATA_NO_NORM_ROPE=1; on the HIP build it is on where the AMD parity check (rope_parity
+ /// check 6) passes - gfx1100 - and elsewhere only STRATA_NORM_ROPE=1 turns it on (=0 turns it off on gfx1100).
+diff --git a/src/core/verify.cpp b/src/core/verify.cpp
+index 70b7651c2..a80d5b634 100644
+--- a/src/core/verify.cpp
++++ b/src/core/verify.cpp
+@@ -315,6 +315,8 @@ bool t1_fuse_on() { static const bool on = env_on("STRATA_T1_FUSE"); return on;
+ // STRATA_QSA_FOLD=1: a QSA layer's indexer query projection rides in its key projection's launch, and every QSA layer's
+ // indexer-tail snapshot is taken in one launch at the window's start (nothing writes a tail before its own layer)
+ bool qsa_fold_on() { static const bool on = env_on("STRATA_QSA_FOLD"); return on; }
++// STRATA_QSA_NR3 (opt-in): a QSA layer's k, q and indexer-q norm+ropes in one launch (native_qsa_rms_norm_rope3)
++bool qsa_nr3_on() { static const bool on = env_on("STRATA_QSA_NR3"); return on; }
+ #if defined(STRATA_USE_HIP)
+ const bool g_coherent = env_on("STRATA_VERIFY_COHERENT");
+ const bool g_doorbell_store = env_on("STRATA_DOORBELL_STORE");
+@@ -1918,6 +1920,22 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
+                 stamp(l, 7, grp);
+                 mm(wk, kcur_ + tb * NKV * HD, (int) N, (int) (NKV * HD));
+                 mm(wv, vcur_ + tb * NKV * HD, (int) N, (int) (NKV * HD));
++                // STRATA_QSA_NR3: q's GEMV moves up here (nothing until its old place touches qfull_/qcur_) so the three
++                // norm+ropes are one launch; kv_rot would put the rotations between them, the unfolded indexer GEMV too
++                // (the side mixer / query branch run the q and indexer-query chains on branches: not then)
++                const bool nr3 = qsa_nr3_on() && qb && fuse_nr && !qbr && !sidem && !side_proj && !st.kv_rot && qidx_ready &&
++                                 native_norm_rope_usable((int) ID, (int) s.n_rot);
++                if (nr3) {
++                    mm(wq, qfull_ + tb * NH * 2 * HD, (int) N, (int) (NH * 2 * HD));
++                    const strata::kernels::NormRopeSeg seg[3] = {
++                        {kcur_ + tb * NKV * HD, (int) HD, (const float*) wkn->data, kcur_ + tb * NKV * HD, (int) (n * NKV),
++                         (int) HD, pos_k + tb * NKV},
++                        {qfull_ + tb * NH * 2 * HD, (int) (2 * HD), (const float*) wqn->data, qcur_ + tb * NH * HD,
++                         (int) (n * NH), (int) HD, pos_ + tb * NH},
++                        {qidx_ + tb * IQ * ID, (int) ID, (const float*) wiqn->data, qidx_ + tb * IQ * ID, (int) (n * IQ),
++                         (int) ID, pos_i + tb * IQ}};
++                    strata::kernels::native_qsa_rms_norm_rope3(seg, (int) s.n_rot, EPS, rope_scaling(), cs);
++                } else
+                 if (qb) norm_rope(kcur_ + tb * NKV * HD, wkn, (int) (n * NKV), (int) HD, pos_k + tb * NKV);
+                 else for (int t = tb; t < te; ++t) norm_rope(kcur_ + t * NKV * HD, wkn, (int) NKV, (int) HD, pos_ + t * NH);
+                 if (st.kv_rot) {   // K and V rotated before they are stored (kv_q4.hpp)
+@@ -1979,7 +1997,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
+                 stamp(l, 9, grp);
+                 if (qbr) {
+                     join(1);   // the indexer query, for the block scores
+-                } else {
++                } else if (!nr3) {
+                     if (!side_proj && !q_chain(cs)) return false;
+                     if (!sidem) idx_query(cs);
+                 }
+diff --git a/src/kernels/cuda/native_rope.cu b/src/kernels/cuda/native_rope.cu
+index c4ca9e312..31ffb965b 100644
+--- a/src/kernels/cuda/native_rope.cu
++++ b/src/kernels/cuda/native_rope.cu
+@@ -75,14 +75,14 @@ __global__ void apply(const float* x, float* out, int rows, int width,
+ #endif
+ }
+ 
++// one row of norm_rope_kernel; also the body of norm_rope3_kernel's rows (STRATA_QSA_NR3), so both are one source
+ template <bool TAB>
+-__global__ void norm_rope_kernel(const float* x, int in_stride, const float* __restrict__ gamma, float* out,
+-                                 int n_cols, int n_rot, float epsilon, float theta_scale,
+-                                 float freq_scale, float corr_low, float corr_high,
+-                                 float ext_factor, float mscale, const int* positions,
+-                                 const int32_t* mtab, RopeTab rt) {
++__device__ __forceinline__ void norm_rope_row(int row, const float* x, int in_stride, const float* __restrict__ gamma,
++                                              float* out, int n_cols, int n_rot, float epsilon, float theta_scale,
++                                              float freq_scale, float corr_low, float corr_high,
++                                              float ext_factor, float mscale, const int* positions,
++                                              const int32_t* mtab, RopeTab rt) {
+     const int tid = threadIdx.x;
+-    const int row = blockIdx.x;
+     const float* in_row = x + size_t(row) * in_stride;
+     float* out_row = out + size_t(row) * n_cols;
+     float partial = 0.0f;
+@@ -135,6 +135,39 @@ __global__ void norm_rope_kernel(const float* x, int in_stride, const float* __r
+ #endif
+     }
+ }
++
++template <bool TAB>
++__global__ void norm_rope_kernel(const float* x, int in_stride, const float* __restrict__ gamma, float* out,
++                                 int n_cols, int n_rot, float epsilon, float theta_scale,
++                                 float freq_scale, float corr_low, float corr_high,
++                                 float ext_factor, float mscale, const int* positions,
++                                 const int32_t* mtab, RopeTab rt) {
++    norm_rope_row<TAB>(blockIdx.x, x, in_stride, gamma, out, n_cols, n_rot, epsilon, theta_scale, freq_scale, corr_low,
++                       corr_high, ext_factor, mscale, positions, mtab, rt);
++}
++
++struct NormRopeSegs {
++    NormRopeSeg s[3];
++};
++
++// blocks [0, rows0) run segment 0, the next rows1 segment 1, the rest segment 2
++template <bool TAB>
++__global__ void norm_rope3_kernel(NormRopeSegs g, int n_rot, float epsilon, float theta_scale,
++                                  float freq_scale, float corr_low, float corr_high,
++                                  float ext_factor, float mscale, const int32_t* mtab, RopeTab rt) {
++    int row = blockIdx.x, i = 0;
++    if (row >= g.s[0].rows) {
++        row -= g.s[0].rows;
++        i = 1;
++        if (row >= g.s[1].rows) {
++            row -= g.s[1].rows;
++            i = 2;
++        }
++    }
++    const NormRopeSeg& q = g.s[i];
++    norm_rope_row<TAB>(row, q.x, q.in_stride, q.gamma, q.out, q.head_dim, n_rot, epsilon, theta_scale, freq_scale,
++                       corr_low, corr_high, ext_factor, mscale, q.positions, mtab, rt);
++}
+ }
+ // one table per device (a layer split runs the rope kernels on several): set and read for the current device
+ namespace {
+@@ -259,4 +292,33 @@ void native_qsa_rms_norm_rope(const float* x, int in_stride, const float* gamma,
+     const auto error = cudaGetLastError();
+     if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
+ }
++
++void native_qsa_rms_norm_rope3(const NormRopeSeg (&seg)[3], int n_rot, float epsilon, const RopeScaling& scaling,
++                               void* stream) {
++    long total = 0;
++    for (const NormRopeSeg& q : seg) {
++        if (!q.x || !q.gamma || !q.out || !q.positions || q.rows < 1 || (q.head_dim != 128 && q.head_dim != 256) ||
++            q.in_stride < q.head_dim || reinterpret_cast<uintptr_t>(q.x) % 4 || reinterpret_cast<uintptr_t>(q.gamma) % 4 ||
++            reinterpret_cast<uintptr_t>(q.out) % 4 || reinterpret_cast<uintptr_t>(q.positions) % 4)
++            throw std::invalid_argument("native_qsa_rms_norm_rope3: invalid segment");
++        total += q.rows;
++    }
++    if (!stream || total > 65535 || n_rot != 64 || !std::isfinite(epsilon) || epsilon < 0.0f ||
++        rope_scaling_invalid(scaling) != nullptr)
++        throw std::invalid_argument("native_qsa_rms_norm_rope3: invalid arguments");
++    const float theta_scale = powf((float) scaling.freq_base, -2.0f / n_rot);
++    const RopeKernelArgs k = scaling.kernel_args(n_rot);
++    const RopeTab rt = rope_table_for(scaling);
++    const NormRopeSegs g{{seg[0], seg[1], seg[2]}};
++    if (rt.cos != nullptr)
++        norm_rope3_kernel<true><<<unsigned(total), 256, 0, static_cast<cudaStream_t>(stream)>>>(
++            g, n_rot, epsilon, theta_scale, k.freq_scale, k.corr_low, k.corr_high, k.ext_factor, k.attn_factor,
++            mrope_table(), rt);
++    else
++        norm_rope3_kernel<false><<<unsigned(total), 256, 0, static_cast<cudaStream_t>(stream)>>>(
++            g, n_rot, epsilon, theta_scale, k.freq_scale, k.corr_low, k.corr_high, k.ext_factor, k.attn_factor,
++            mrope_table(), rt);
++    const auto error = cudaGetLastError();
++    if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
++}
+ }
+diff --git a/src/kernels/rope_parity.cpp b/src/kernels/rope_parity.cpp
+index 32476c890..92081222b 100644
+--- a/src/kernels/rope_parity.cpp
++++ b/src/kernels/rope_parity.cpp
+@@ -511,6 +511,59 @@ int main(int argc, char** argv) {
+             cudaFree(d_fus6);
+             cudaFree(d_pos6);
+         }
++
++        // ---- 7. native_qsa_rms_norm_rope3 (STRATA_QSA_NR3) MUST BE BIT-IDENTICAL to its three segments as three
++        // native_qsa_rms_norm_rope calls: k in place (hd 256), q out of q|gate rows (stride 512), indexer q in place (hd 128)
++        for (const auto& sc7 : {none5, yarn}) {
++            if (!run6) break;
++            const int rk = 8, rq = 96, ri = 64, hk = 256, hi = 128;
++            const size_t nk = (size_t) rk * hk, nq = (size_t) rq * 2 * hk, ni = (size_t) ri * hi;
++            std::vector<float> hx(nk + nq + ni), hg(hk + hk + hi);
++            std::vector<int> hp((size_t) (rk + rq + ri));
++            for (auto& v : hx) v = gauss2(rng2);
++            for (auto& g : hg) g = 0.5f + std::fabs(gauss2(rng2));
++            for (size_t r = 0; r < hp.size(); ++r) hp[r] = (int) ((r * 37 + 5) % (size_t) npos);
++            float *d_x = nullptr, *d_g = nullptr, *d_a = nullptr, *d_b = nullptr;
++            int* d_p = nullptr;
++            const size_t nout = nk + (size_t) rq * hk + ni;   // k | q out | idx
++            check(cudaMalloc(&d_x, hx.size() * 4), "malloc x7");
++            check(cudaMalloc(&d_g, hg.size() * 4), "malloc g7");
++            check(cudaMalloc(&d_p, hp.size() * 4), "malloc p7");
++            check(cudaMalloc(&d_a, nout * 4), "malloc a7");
++            check(cudaMalloc(&d_b, nout * 4), "malloc b7");
++            check(cudaMemcpy(d_x, hx.data(), hx.size() * 4, cudaMemcpyHostToDevice), "copy x7");
++            check(cudaMemcpy(d_g, hg.data(), hg.size() * 4, cudaMemcpyHostToDevice), "copy g7");
++            check(cudaMemcpy(d_p, hp.data(), hp.size() * 4, cudaMemcpyHostToDevice), "copy p7");
++            const float* xq = d_x + nk;
++            for (float* o : {d_a, d_b}) {   // in-place segments start from the same input
++                check(cudaMemcpy(o, d_x, nk * 4, cudaMemcpyDeviceToDevice), "k7");
++                check(cudaMemset(o + nk, 0xff, (size_t) rq * hk * 4), "q7");
++                check(cudaMemcpy(o + nk + (size_t) rq * hk, d_x + nk + nq, ni * 4, cudaMemcpyDeviceToDevice), "i7");
++            }
++            strata::kernels::native_qsa_rms_norm_rope(d_a, hk, d_g, d_a, rk, hk, 64, 1e-6f, sc7, d_p, cs5);
++            strata::kernels::native_qsa_rms_norm_rope(xq, 2 * hk, d_g + hk, d_a + nk, rq, hk, 64, 1e-6f, sc7, d_p + rk, cs5);
++            strata::kernels::native_qsa_rms_norm_rope(d_a + nk + (size_t) rq * hk, hi, d_g + 2 * hk,
++                                                      d_a + nk + (size_t) rq * hk, ri, hi, 64, 1e-6f, sc7, d_p + rk + rq, cs5);
++            const strata::kernels::NormRopeSeg seg[3] = {
++                {d_b, hk, d_g, d_b, rk, hk, d_p},
++                {xq, 2 * hk, d_g + hk, d_b + nk, rq, hk, d_p + rk},
++                {d_b + nk + (size_t) rq * hk, hi, d_g + 2 * hk, d_b + nk + (size_t) rq * hk, ri, hi, d_p + rk + rq}};
++            strata::kernels::native_qsa_rms_norm_rope3(seg, 64, 1e-6f, sc7, cs5);
++            check(cudaStreamSynchronize(cs5), "sync7");
++            std::vector<float> ha(nout), hb(nout);
++            check(cudaMemcpy(ha.data(), d_a, nout * 4, cudaMemcpyDeviceToHost), "back a7");
++            check(cudaMemcpy(hb.data(), d_b, nout * 4, cudaMemcpyDeviceToHost), "back b7");
++            long long d7 = 0;
++            for (size_t i = 0; i < nout; ++i) d7 += std::memcmp(&ha[i], &hb[i], 4) != 0;
++            std::printf("  native_qsa_rms_norm_rope3 vs 3 calls         %s (%lld of %zu elements differ)\n",
++                        d7 ? "*** WRONG ***" : "bit-identical", d7, nout);
++            bad += (int) d7;
++            cudaFree(d_x);
++            cudaFree(d_g);
++            cudaFree(d_p);
++            cudaFree(d_a);
++            cudaFree(d_b);
++        }
+     }
+ 
+     std::printf("\nrope: %d failures\n", bad);

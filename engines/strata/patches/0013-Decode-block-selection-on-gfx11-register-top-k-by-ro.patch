@@ -1,0 +1,615 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: blackhat-7 <44942105+blackhat-7@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 07:11:56 +0530
+Subject: [PATCH 13/33] Decode block selection on gfx11: register top-k by rows
+ (STRATA_TOPK_ROWS) and the DPP16 scorer (STRATA_SCORES_DPP), on for gfx1100
+
+Ported from opt7 (ad4b6f5e 4d9def71 a64ecb5e 9ae2279c) onto v0.2.9's selection code: the kernels sit beside
+v0.2.9's register, wide and rows kernels and take only the decode calls (no block count) on gfx11.
+qsa_topk_parity --selftest passes (special values, graph replay); at a 262144 capacity, 8 queries, the
+decode top-k is 0.088 ms against v0.2.9's wide kernel 0.137 ms (STRATA_TOPK_ROWS=0).
+---
+ src/kernels/cuda/qsa_select.cu   | 328 +++++++++++++++++++++++++++++++
+ src/kernels/qsa_select_bench.cpp |  62 ++++--
+ src/kernels/qsa_topk_parity.cpp  | 109 ++++++++--
+ 3 files changed, 468 insertions(+), 31 deletions(-)
+
+diff --git a/src/kernels/cuda/qsa_select.cu b/src/kernels/cuda/qsa_select.cu
+index 283aba9ea..908754057 100644
+--- a/src/kernels/cuda/qsa_select.cu
++++ b/src/kernels/cuda/qsa_select.cu
+@@ -843,6 +843,185 @@ __global__ void __launch_bounds__(TK_T) block_topk_reg_kernel(const float* __res
+     }
+ }
+ 
++#if defined(__HIPCC__)
++// ---- the decode top-k on gfx11 (wave32).  A decode window's call has no block count, so past 33,792 blocks of
++// capacity (--max-context 262144: 65,538) it took block_topk_kernel, ~0.2 ms a call at 200K cells on a 7900 XTX:
++// one CU making four passes of strided reads, 32-way same-bin LDS atomics (the scores share their top byte) and a
++// serial 256-bin digit search, 12 times a window.  Here 1,024 threads hold the keys in registers, laid out in rows:
++// warp w has the 32 * pa consecutive blocks from w * 32 * pa, lane l of row r block w * 32 * pa + 32 r + l (each row
++// one coalesced 128-byte read).  A row adds its matching keys' first two digits once each and the rest lane by lane;
++// the digit search is one warp's scan; the emit places cells with ballots and popcounts.  block_topk_kernel's
++// selection rule (radix threshold, ties to the lowest index, cells ascending): identical ids.
++constexpr int RW_T = 1024, RW_WARPS = RW_T / 32, RW_P = 66;   // RW_P = TK_PER_MAX: 270,336 cells
++typedef uint32_t rw_v32 __attribute__((ext_vector_type(32)));
++typedef uint32_t rw_v2 __attribute__((ext_vector_type(2)));
++
++__device__ __forceinline__ unsigned rw_ballot(bool p) { return __builtin_amdgcn_ballot_w32(p); }
++
++__global__ void __launch_bounds__(RW_T) block_topk_rows_kernel(const float* __restrict__ scores,
++                                                               const int32_t* __restrict__ steps, int64_t max_blocks,
++                                                               int64_t cap, int32_t* __restrict__ ids) {
++#if STRATA_SEL_GFX11   // wave32 code: the host launches it on the gfx11 parts this build has code for
++    __shared__ int hist[RW_WARPS][256];
++    __shared__ int s_sel[RW_WARPS], s_eqb[RW_WARPS];
++    __shared__ int s_digit, s_above;
++    const int64_t qi = blockIdx.x;
++    const int32_t* st = steps + qi * kStepCount;
++    const int n_kv = st[kStepNKv], n_bid = st[kStepNBid], width = st[kStepWidth];
++    int32_t* out = ids + qi * cap;
++    const int t = threadIdx.x, lane = t & 31, warp = t >> 5;
++    if (n_kv <= width) {
++        for (int j = t; j < n_kv; j += RW_T) out[j] = j;
++        return;
++    }
++    const float* sc = scores + qi * max_blocks;
++    const int wt = n_kv - n_bid * R;                   // the tail block's cells, 0..3
++    const int n_live = n_bid + (wt > 0 ? 1 : 0);       // the blocks holding cells
++    const int pa = n_bid / RW_T + 1;                   // rows per warp, ceil((n_bid + 1) / RW_T) <= RW_P (the host checks)
++    const int w0 = __builtin_amdgcn_readfirstlane(warp * 32 * pa);
++    const unsigned below = (1u << lane) - 1u;
++    // the cells of the blocks rb + l for the lanes l in m: R each, the tail block wt
++    auto cells = [&](unsigned m, int rb) -> int {
++        const int tl = n_bid - rb;
++        return R * __popc(m) - (((unsigned) tl < 32u && ((m >> tl) & 1u)) ? R - wt : 0);
++    };
++    // the keys of rows 0..65 in registers, all loads issued at once (clamped addresses: no branch between them).  The
++    // row loops below are rolled and read row r with a uniform index (v_movrels): unrolled, the kernel's straight code
++    // misses the instruction cache on every row (ctx 3,000: 19 us for one row).
++    rw_v32 ka, kb;
++    rw_v2 kc;
++    auto ld = [&](int r) -> uint32_t {   // a mask, not a select: a select on a load becomes a branch and a wait per row
++        const int b = w0 + r * 32 + lane;
++        return order_key(sc[b < n_live ? b : n_live - 1]) & (r < pa && b < n_live ? 0xffffffffu : 0u);
++    };
++#pragma unroll
++    for (int i = 0; i < 32; ++i) {
++        ka[i] = ld(i);
++        kb[i] = ld(32 + i);
++    }
++    kc[0] = ld(64);
++    kc[1] = ld(65);
++    // f(key, r) for this warp's rows in order
++    auto rows = [&](auto f) {
++        const int n0 = pa < 32 ? pa : 32, n1 = pa < 64 ? pa : 64;
++        for (int r = 0; r < n0; ++r) f(ka[r], r);
++        for (int r = 32; r < n1; ++r) f(kb[r - 32], r);
++        for (int r = 64; r < pa; ++r) f(kc[r - 64], r);
++    };
++    uint32_t prefix = 0;
++    int above = 0;                                     // cells strictly above the digits fixed so far
++    for (int shift = 24; shift >= 0; shift -= 8) {
++        for (int i = lane; i < 256; i += 32) hist[warp][i] = 0;
++        __syncwarp();
++        const uint32_t hi_mask = shift == 24 ? 0u : (0xffffffffu << (shift + 8));
++        rows([&](uint32_t key, int r) {
++            const int rb = w0 + r * 32, b = rb + lane;
++            const bool m = b < n_live && (key & hi_mask) == prefix;
++            unsigned rem = rw_ballot(m);
++            const int d = (int) ((key >> shift) & 255u);
++            for (int j = 0; j < 2 && rem != 0u; ++j) {   // the leading lanes' digits: one add each
++                const int lead = __ffs(rem) - 1;
++                const int d0 = __builtin_amdgcn_readlane(d, lead);
++                const unsigned same = rw_ballot(m && d == d0);
++                if (lane == lead) atomicAdd(&hist[warp][d0], cells(same, rb));
++                rem &= ~same;
++            }
++            if ((rem >> lane) & 1u) atomicAdd(&hist[warp][d], b < n_bid ? R : wt);
++        });
++        __syncthreads();
++        if (t < 256) {                                // fold the warps' histograms into warp 0's
++            int s = 0;
++            for (int w2 = 0; w2 < RW_WARPS; ++w2) s += hist[w2][t];
++            hist[0][t] = s;
++        }
++        __syncthreads();
++        if (warp == 0) {
++            // block_topk_kernel's digit: the largest d whose cells at or above it reach `need` (0 when none).  Lane l
++            // owns digits 255 - 8l down to 248 - 8l; the lane whose run crosses `need` walks its eight.
++            const int need = width - above;
++            int tot[8], part = 0;
++#pragma unroll
++            for (int j = 0; j < 8; ++j) {
++                tot[j] = hist[0][255 - 8 * lane - j];
++                part += tot[j];
++            }
++            int incl = part;
++#pragma unroll
++            for (int o = 1; o < 32; o <<= 1) {
++                const int y = __shfl_up_sync(0xffffffffu, incl, o);
++                if (lane >= o) incl += y;
++            }
++            const int excl = incl - part;
++            const unsigned hit = rw_ballot(excl < need && incl >= need);
++            if (lane == (hit ? __ffs(hit) - 1 : 31)) {
++                int acc = excl, j = 0;
++                for (; j < 7; ++j) {
++                    if (acc + tot[j] >= need) break;
++                    acc += tot[j];
++                }
++                s_digit = 255 - 8 * lane - j;
++                s_above = above + acc;
++            }
++        }
++        __syncthreads();
++        prefix |= (uint32_t) s_digit << shift;
++        above = s_above;
++    }
++    const uint32_t thr = prefix;
++    const int eq_budget = width - above;               // cells at thr that fit, lowest index first
++    int gt = 0, eq = 0;                                // this warp's cells above / at thr (the same in every lane)
++    rows([&](uint32_t key, int r) {
++        const int rb = w0 + r * 32, b = rb + lane;
++        const bool live = b < n_live;
++        gt += cells(rw_ballot(live && key > thr), rb);
++        eq += cells(rw_ballot(live && key == thr), rb);
++    });
++    if (lane == 0) { s_sel[warp] = gt; s_eqb[warp] = eq; }
++    __syncthreads();
++    if (warp == 0) {                                   // per warp: the cells selected and tied before it
++        const int g2 = s_sel[lane], e2 = s_eqb[lane];
++        int e_in = e2;
++#pragma unroll
++        for (int o = 1; o < 32; o <<= 1) {
++            const int y = __shfl_up_sync(0xffffffffu, e_in, o);
++            if (lane >= o) e_in += y;
++        }
++        const int eb = e_in - e2;
++        const int take = eq_budget - eb < 0 ? 0 : (eq_budget - eb > e2 ? e2 : eq_budget - eb);
++        int s_in = g2 + take;
++#pragma unroll
++        for (int o = 1; o < 32; o <<= 1) {
++            const int y = __shfl_up_sync(0xffffffffu, s_in, o);
++            if (lane >= o) s_in += y;
++        }
++        s_sel[lane] = s_in - g2 - take;
++        s_eqb[lane] = eb;
++    }
++    __syncthreads();
++    int run_sel = s_sel[warp], run_eq = s_eqb[warp];
++    rows([&](uint32_t key, int r) {
++        const int rb = w0 + r * 32, b = rb + lane;
++        const bool live = b < n_live;
++        const unsigned gm = rw_ballot(live && key > thr);
++        const unsigned em = rw_ballot(live && key == thr);
++        if ((gm | em) != 0u) {
++            const int budget = eq_budget - run_eq > 0 ? eq_budget - run_eq : 0;   // tied cells still to take
++            const int eq_bel = cells(em & below, rb);
++            const int pos = run_sel + cells(gm & below, rb) + (budget < eq_bel ? budget : eq_bel);
++            const int w = b < n_bid ? R : wt;
++            int n = 0;
++            if ((gm >> lane) & 1u) n = w;
++            else if ((em >> lane) & 1u) n = budget - eq_bel < 0 ? 0 : (budget - eq_bel > w ? w : budget - eq_bel);
++            for (int c = 0; c < n; ++c) out[pos + c] = b * R + c;
++            const int e_row = cells(em, rb);
++            run_sel += cells(gm, rb) + (budget < e_row ? budget : e_row);
++            run_eq += e_row;
++        }
++    });
++#endif
++}
++#endif
++
+ // ---- a query with more blocks than the register kernel holds (contexts past 4 * 1024 * TK_PER cells): the register
+ // kernel's threads, per-warp histograms and warp scans, with each key read from memory again on every pass.  A
+ // histogram has no order, so on the four radix passes thread t reads blocks t, t + 1024, ...: a warp reads 32
+@@ -1137,6 +1316,93 @@ __global__ void __launch_bounds__(SCORE_WARPS * 32) block_scores_rows_kernel(con
+     }
+ }
+ 
++#if defined(__HIPCC__)
++// v + (v of lane ^ O within the 16-lane row), O in 1..8: DPP row_xmask, bound_ctrl so the move folds into the add.  The
++// same addition, operand for operand, as `v += __shfl_xor_sync(m, v, O)`.
++template <int O> __device__ __forceinline__ float row_xor_add(float v) {
++    return v + __int_as_float(__builtin_amdgcn_mov_dpp(__float_as_int(v), 0x160 + O, 0xf, 0xf, true));
++}
++
++// block_scores_multi_kernel for NQ <= 4 queries on gfx11 (a decode window's call), the same bits.  A block's 128-term
++// dot is block_scores_kernel's: 32 four-term products (lane l: dims 4l..4l+3) summed by an xor butterfly over offsets
++// 16, 8, 4, 2, 1.  Here a 16-lane row takes a block, lane j the products j and j + 16: the offset-16 sum is its own
++// add, the four others DPP row_xmask adds - every addition the butterfly's - so a wave scores two blocks at once with
++// no LDS traffic, and the queries stay in registers.  The multi kernel at four queries is ALU-bound (~110 us a layer
++// at 200K cells, a quarter of DRAM speed).  The tail block n_bid (the dead key) is scored once per query apart.
++template <int NQ>
++__global__ void __launch_bounds__(SCORE_WARPS * 32) block_scores_dpp_kernel(const float* __restrict__ pooled,
++                                                                            const float* __restrict__ dead,
++                                                                            const float* __restrict__ q_idx,
++                                                                            const int32_t* __restrict__ steps,
++                                                                            int64_t max_blocks, float* __restrict__ out) {
++#if STRATA_SEL_GFX11   // wave32 code: the host launches it on the gfx11 parts this build has code for
++    __shared__ int s_nkv[NQ], s_nbid[NQ];
++    if (threadIdx.x < NQ) {
++        s_nkv[threadIdx.x] = steps[threadIdx.x * kStepCount + kStepNKv];
++        s_nbid[threadIdx.x] = steps[threadIdx.x * kStepCount + kStepNBid];
++    }
++    __syncthreads();
++    int nbid[NQ], top = 0;
++#pragma unroll
++    for (int q = 0; q < NQ; ++q) {
++        nbid[q] = s_nbid[q];
++        top = nbid[q] > top ? nbid[q] : top;
++    }
++    const int last = top < max_blocks - 1 ? top : (int) max_blocks - 1;
++    if (2 * (int) blockIdx.x * SCORE_WARPS > last) return;   // CTA-uniform: its first block pair is past every query
++    const int lane = threadIdx.x & 31, j = lane & 15, half = lane >> 4;
++    float4 qr[NQ][IDX_HEADS][2];
++#pragma unroll
++    for (int q = 0; q < NQ; ++q)
++#pragma unroll
++        for (int h = 0; h < IDX_HEADS; ++h)
++#pragma unroll
++            for (int c = 0; c < 2; ++c)
++                qr[q][h][c] = *reinterpret_cast<const float4*>(q_idx + (q * IDX_HEADS + h) * IDX_DIM + (c * 16 + j) * 4);
++    // the score of one query against the key chunks k0 (dims 4j..) and k1 (dims 64 + 4j..), in every lane of the row
++    auto score = [&](const float4 (&qq)[IDX_HEADS][2], float4 k0, float4 k1) {
++        float s = 0.0f;
++#pragma unroll
++        for (int h = 0; h < IDX_HEADS; ++h) {
++            const float4 a = qq[h][0], b = qq[h][1];
++            const float d0 = k0.x * a.x + k0.y * a.y + k0.z * a.z + k0.w * a.w;
++            const float d1 = k1.x * b.x + k1.y * b.y + k1.z * b.z + k1.w * b.w;
++            float d = d0 + d1;
++            d = row_xor_add<8>(d);
++            d = row_xor_add<4>(d);
++            d = row_xor_add<2>(d);
++            d = row_xor_add<1>(d);
++            s += d > 0.0f ? d : 0.0f;
++        }
++        return s;
++    };
++    const int gw = (int) blockIdx.x * SCORE_WARPS + (int) (threadIdx.x >> 5);
++    if (gw == 0) {   // the tail blocks: the dead key
++        const float4 k0 = *reinterpret_cast<const float4*>(dead + j * 4), k1 = *reinterpret_cast<const float4*>(dead + 64 + j * 4);
++#pragma unroll
++        for (int q = 0; q < NQ; ++q) {
++            float s = score(qr[q], k0, k1);
++            if (lane == 0 && nbid[q] < max_blocks) {
++                if (s_nkv[q] % R != 0) s += 1e9f;
++                out[q * max_blocks + nbid[q]] = s;
++            }
++        }
++    }
++    const int stride = (int) gridDim.x * SCORE_WARPS;
++    for (int p = gw; 2 * p <= last; p += stride) {
++        const int b = 2 * p + half;                    // this row's block; past `last` it reads `last` and stores nothing
++        const float* kp = pooled + (int64_t) (b <= last ? b : last) * IDX_DIM;
++        const float4 k0 = *reinterpret_cast<const float4*>(kp + j * 4), k1 = *reinterpret_cast<const float4*>(kp + 64 + j * 4);
++#pragma unroll
++        for (int q = 0; q < NQ; ++q) {
++            const float s = score(qr[q], k0, k1);
++            if (j == 0 && b < nbid[q]) out[q * max_blocks + b] = s;
++        }
++    }
++#endif
++}
++#endif
++
+ #if defined(__HIPCC__)
+ // Optional gfx1100 port of PR1825 (14bf3215): same FP32 expression and reduction tree.
+ // Decode and the original top-k stay unchanged. No additional persistent weight/state allocation.
+@@ -2085,6 +2351,43 @@ bool scores_halve_on() {
+     return ok[dev] == 1;
+ }
+ 
++#if defined(__HIPCC__)
++// The gfx11 decode selection kernels are wave32 code, built for the gfx11 WMMA list (gfx_arch.hpp).  Per device (a
++// layer split runs several): 0 no such code, 1 gfx1100, 2 another gfx11 part of the list.
++static int sel_gfx11_kind() {
++    static int kind[64] = {};   // kind + 1 once known
++    int dev = 0;
++    if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) { cudaGetLastError(); return 0; }
++    if (kind[dev] == 0) {
++        cudaDeviceProp prop;
++        int k = 0;
++        if (cudaGetDeviceProperties(&prop, dev) == cudaSuccess && gfx_arch_is_gfx11_wmma(prop.gcnArchName))
++            k = gfx_arch_is(prop.gcnArchName, "gfx1100") ? 1 : 2;
++        cudaGetLastError();
++        kind[dev] = k + 1;
++    }
++    return kind[dev] - 1;
++}
++// A switch's value: -1 unset, 0 off, 1 on.  Unset: on for gfx1100 (a 7900 XTX: the same ids, faster at every context;
++// 205K cells, four queries: 303 -> 75 us a layer), off for the other gfx11 parts (unmeasured; =1 turns them on).
++static int sel_env(const char* name) {
++    const char* v = std::getenv(name);
++    return v == nullptr || *v == '\0' ? -1 : (v[0] != '0' ? 1 : 0);
++}
++static bool sel_on(int env) {
++    const int k = sel_gfx11_kind();
++    return k != 0 && (env == 1 || (env == -1 && k == 1));
++}
++static bool scores_dpp_device() {   // STRATA_SCORES_DPP: block_scores_dpp_kernel
++    static const int env = sel_env("STRATA_SCORES_DPP");
++    return sel_on(env);
++}
++static bool topk_rows_device() {    // STRATA_TOPK_ROWS: block_topk_rows_kernel
++    static const int env = sel_env("STRATA_TOPK_ROWS");
++    return sel_on(env);
++}
++#endif
++
+ void qsa_block_scores(const float* pooled, const float* dead, const float* q_idx, const int32_t* steps, int64_t nq,
+                       int64_t max_blocks, const QsaShapes& s, float* scores, void* stream, int64_t active_blocks) {
+     if (nq <= 0) return;
+@@ -2097,6 +2400,18 @@ void qsa_block_scores(const float* pooled, const float* dead, const float* q_idx
+         // QSAROWS: STRATA_QSA_ROWS=1 (exactly) takes block_scores_rows_kernel for calls of up to 4 queries - the same bits
+         static const bool rows_env = [] { const char* v = std::getenv("STRATA_QSA_ROWS"); return v != nullptr && v[0] == '1' && v[1] == '\0'; }();
+         if (rows_env && qsa_block_scores_rows(pooled, dead, q_idx, steps, nq, max_blocks, s, scores, stream)) return;
++#if defined(__HIPCC__)
++        if (nq <= 4 && scores_dpp_device()) {   // gfx11: block_scores_dpp_kernel, the same bits
++            const cudaStream_t cs = (cudaStream_t) stream;
++            if (nq == 1) block_scores_dpp_kernel<1><<<256, SCORE_WARPS * 32, 0, cs>>>(pooled, dead, q_idx, steps, max_blocks, scores);
++            else if (nq == 2) block_scores_dpp_kernel<2><<<256, SCORE_WARPS * 32, 0, cs>>>(pooled, dead, q_idx, steps, max_blocks, scores);
++            else if (nq == 3) block_scores_dpp_kernel<3><<<256, SCORE_WARPS * 32, 0, cs>>>(pooled, dead, q_idx, steps, max_blocks, scores);
++            else block_scores_dpp_kernel<4><<<256, SCORE_WARPS * 32, 0, cs>>>(pooled, dead, q_idx, steps, max_blocks, scores);
++            const cudaError_t e = cudaGetLastError();
++            if (e != cudaSuccess) { std::fprintf(stderr, "qsa_block_scores dpp: %s\n", cudaGetErrorString(e)); std::exit(1); }
++            return;
++        }
++#endif
+         if (scores_halve_on()) {   // Turing: block_scores_halve_kernel, the same bits
+             const cudaStream_t st = (cudaStream_t) stream;
+             if (nq <= 1) block_scores_halve_kernel<4><<<256, SCORE_WARPS * 32, 0, st>>>(pooled, dead, q_idx, steps, (int) nq, max_blocks, scores);
+@@ -2886,6 +3201,19 @@ void qsa_block_topk(const float* scores, const int32_t* steps, int64_t nq, int64
+     }();
+     if (cluster && !old && nq <= CL_MAXQ && qsa_block_topk_cluster(scores, steps, nq, max_blocks, cap, s, ids, stream))
+         return;
++#else
++    // gfx11: a decode call (no block count) takes block_topk_rows_kernel up to 67,584 blocks of capacity (270K
++    // cells); the same ids.  On by default on gfx1100 (sel_on); STRATA_TOPK_ROWS=0 turns it off
++    if (!old && active_blocks <= 0 && max_blocks <= (int64_t) RW_T * RW_P && topk_rows_device()) {
++        if (s.idx_block != R || cap < qsa_selection_width(kTopkMaxCells, s)) {
++            std::fprintf(stderr, "qsa_block_topk: unsupported geometry or cap\n");
++            std::exit(1);
++        }
++        block_topk_rows_kernel<<<(unsigned) nq, RW_T, 0, (cudaStream_t) stream>>>(scores, steps, max_blocks, cap, ids);
++        const cudaError_t e = cudaGetLastError();
++        if (e != cudaSuccess) { std::fprintf(stderr, "qsa_block_topk (rows): %s\n", cudaGetErrorString(e)); std::exit(1); }
++        return;
++    }
+ #endif
+ #if !defined(__HIPCC__)
+     // Turing decode (a window's few queries, no block count): the split kernels above; the same ids
+diff --git a/src/kernels/qsa_select_bench.cpp b/src/kernels/qsa_select_bench.cpp
+index 094b9d2c3..d6e91306f 100644
+--- a/src/kernels/qsa_select_bench.cpp
++++ b/src/kernels/qsa_select_bench.cpp
+@@ -71,27 +71,51 @@ int main(int argc, char** argv) {
+     ck(cudaMalloc(&ids_old, (size_t) (nq * cap) * 4), "malloc");
+     ck(cudaMalloc(&ids_new, (size_t) (nq * cap) * 4), "malloc");
+     const int64_t active = steps[(size_t) ((nq - 1) * k::kStepCount + k::kStepNBid)] + 1;
+-    if (std::getenv("QSA_BENCH_DECODE")) {   // a decode window's call: no block count (block_scores_multi_kernel)
+-        auto run_dec = [&] { k::qsa_block_scores(d_pooled, d_dead, d_q, d_steps, nq, max_blocks, s, sc_old, nullptr, -1); };
+-        run_dec();
+-        ck(cudaDeviceSynchronize(), "sync");
+-        cudaEvent_t a0, a1;
+-        cudaEventCreate(&a0); cudaEventCreate(&a1);
+-        cudaEventRecord(a0);
+-        for (int r = 0; r < reps; ++r) run_dec();
+-        cudaEventRecord(a1); cudaEventSynchronize(a1);
+-        float ms = 0; cudaEventElapsedTime(&ms, a0, a1);
+-        std::vector<float> h((size_t) (nq * max_blocks));
+-        ck(cudaMemcpy(h.data(), sc_old, h.size() * 4, cudaMemcpyDeviceToHost), "down");
+-        unsigned long long x = 1469598103934665603ull;
++    if (std::getenv("QSA_BENCH_DECODE")) {   // a decode window's calls (no block count), as a captured graph replays them
++        cudaStream_t cs;
++        ck(cudaStreamCreate(&cs), "stream");
++        auto graph_of = [&](auto f) {
++            cudaGraph_t g;
++            cudaGraphExec_t x;
++            ck(cudaStreamBeginCapture(cs, cudaStreamCaptureModeThreadLocal), "capture");
++            for (int i = 0; i < 12; ++i) f();   // a window's 12 QSA layers
++            ck(cudaStreamEndCapture(cs, &g), "capture end");
++            ck(cudaGraphInstantiate(&x, g, nullptr, nullptr, 0), "instantiate");
++            return x;
++        };
++        // the decode dispatch's scores against the per-(query, block) kernel's (the call with a block count): bitwise
++        k::qsa_block_scores(d_pooled, d_dead, d_q, d_steps, nq, max_blocks, s, sc_old, cs, -1);
++        k::qsa_block_scores(d_pooled, d_dead, d_q, d_steps, nq, max_blocks, s, sc_new, cs, active);
++        ck(cudaStreamSynchronize(cs), "scores");
++        std::vector<uint32_t> ha((size_t) (nq * max_blocks)), hb(ha.size());
++        ck(cudaMemcpy(ha.data(), sc_old, ha.size() * 4, cudaMemcpyDeviceToHost), "down");
++        ck(cudaMemcpy(hb.data(), sc_new, hb.size() * 4, cudaMemcpyDeviceToHost), "down");
++        int64_t rows_same = 0;
+         for (int64_t i = 0; i < nq; ++i) {
+-            const int64_t nbid = steps[(size_t) (i * k::kStepCount + k::kStepNBid)];
+-            for (int64_t j = 0; j <= nbid; ++j) { uint32_t u; std::memcpy(&u, &h[(size_t) (i * max_blocks + j)], 4); x = (x ^ u) * 1099511628211ull; }
++            const int64_t nb = steps[(size_t) (i * k::kStepCount + k::kStepNBid)] + 1;
++            rows_same += std::equal(ha.begin() + i * max_blocks, ha.begin() + i * max_blocks + nb, hb.begin() + i * max_blocks);
+         }
+-        const double gb = (double) active * 512.0 / 1e9;
+-        std::printf("decode scores ctx %lld, %lld queries: %.1f us (%.0f GB/s of pooled keys), hash %016llx\n", (long long) ctx,
+-                    (long long) nq, 1e3 * ms / reps, gb / (ms / reps / 1e3), x);
+-        return 0;
++        auto sc = [&] { k::qsa_block_scores(d_pooled, d_dead, d_q, d_steps, nq, max_blocks, s, sc_old, cs, -1); };
++        auto tk = [&] { k::qsa_block_topk(sc_old, d_steps, nq, max_blocks, cap, s, ids_old, cs, -1); };
++        const cudaGraphExec_t gs = graph_of(sc), gt = graph_of(tk), gb = graph_of([&] { sc(); tk(); });
++        cudaEvent_t a0, a1;
++        cudaEventCreate(&a0); cudaEventCreate(&a1);
++        auto per_call = [&](cudaGraphExec_t x) {
++            for (int r = 0; r < reps; ++r) ck(cudaGraphLaunch(x, cs), "replay");   // warm: the clocks ramp up
++            cudaEventRecord(a0, cs);
++            for (int r = 0; r < reps; ++r) ck(cudaGraphLaunch(x, cs), "replay");
++            cudaEventRecord(a1, cs);
++            ck(cudaEventSynchronize(a1), "time");
++            float ms = 0;
++            cudaEventElapsedTime(&ms, a0, a1);
++            return 1e3f * ms / (float) reps / 12.0f;
++        };
++        const float us_s = per_call(gs), us_t = per_call(gt), us_b = per_call(gb);
++        std::printf("decode ctx %lld, %lld queries, capacity %lld blocks: scores %.1f us, top-k %.1f us, both %.1f us a "
++                    "layer (%.2f ms a window of 12); scores bitwise the per-block kernel's: %lld/%lld rows\n",
++                    (long long) ctx, (long long) nq, (long long) max_blocks, us_s, us_t, us_b, 12.0 * us_b / 1e3,
++                    (long long) rows_same, (long long) nq);
++        return rows_same == nq ? 0 : 1;
+     }
+     auto run_old = [&] { k::qsa_block_scores(d_pooled, d_dead, d_q, d_steps, nq, max_blocks, s, sc_old, nullptr, active); };
+     // a device without the tensor-core scorer (HIP other than gfx12): time the warp scorer and the top-k only
+diff --git a/src/kernels/qsa_topk_parity.cpp b/src/kernels/qsa_topk_parity.cpp
+index d14af3e13..c9d83d987 100644
+--- a/src/kernels/qsa_topk_parity.cpp
++++ b/src/kernels/qsa_topk_parity.cpp
+@@ -3,9 +3,12 @@
+ //
+ // A case is a context under a capacity (the engine's --max-context; max_blocks = capacity / 4 + 2, and without an
+ // active-block count the dispatch follows it), with consecutive queries at the context's end so that the tail block
+-// holds 0 to 3 cells.  Three score sets per case: continuous, 64 levels (many ties at the threshold) and all equal
+-// (the rule's ties go to the lowest index).  The dispatch is called as a decode window calls it (no block count) and as
+-// the prompt path does (with the call's largest block count).  The reference and the dispatched kernel are also timed.
++// holds 0 to 3 cells.  Four score sets per case: continuous, 64 levels (many ties at the threshold), all equal (the
++// rule's ties go to the lowest index) and special values (NaN, -0, +-inf, and high scores past each query's blocks,
++// which no kernel may read).  Whole rows of `cap` ids are compared, so a write past the selection fails too.  The
++// dispatch is called as a decode window calls it (no block count) and as the prompt path does (with the call's
++// largest block count).  The reference and the dispatched kernel are also timed.  A decode call is also captured in
++// a graph once and replayed as the context grows and shrinks (its steps are read on the device at every replay).
+ //
+ // Usage: qsa_topk_parity --selftest
+ //        qsa_topk_parity CONTEXT [QUERIES=256] [REPS=10] [CAPACITY=CONTEXT] [COUNT=1]   (COUNT=0: no block count)
+@@ -19,6 +22,7 @@
+ #include <cstdio>
+ #include <cstdlib>
+ #include <cstring>
++#include <limits>
+ #include <random>
+ #include <vector>
+ 
+@@ -72,17 +76,30 @@ bool run_case(int64_t ctx, int64_t nq, int reps, int64_t capacity, bool counted)
+         ck(cudaMemcpy(a.data(), ids_ref, a.size() * 4, cudaMemcpyDeviceToHost), "down");
+         ck(cudaMemcpy(b.data(), ids_new, b.size() * 4, cudaMemcpyDeviceToHost), "down");
+         int64_t n = 0;
+-        for (int64_t i = 0; i < nq; ++i) {
+-            const int64_t w = steps[(size_t) (i * k::kStepCount + k::kStepWidth)];
+-            n += std::equal(a.begin() + i * cap, a.begin() + i * cap + w, b.begin() + i * cap);
+-        }
++        for (int64_t i = 0; i < nq; ++i) n += std::equal(a.begin() + i * cap, a.begin() + (i + 1) * cap, b.begin() + i * cap);
+         return n;
+     };
++    std::vector<float> special = scores;
++    for (int64_t i = 0; i < nq; ++i) {
++        const int64_t nb = steps[(size_t) (i * k::kStepCount + k::kStepNBid)] + 1;
++        for (int64_t j = 0; j < max_blocks; ++j) {
++            float& v = special[(size_t) (i * max_blocks + j)];
++            if (j >= nb) v = std::numeric_limits<float>::infinity();   // past the query's blocks: never read
++            else if (j == nb - 1) continue;                            // the tail block as the scorer leaves it
++            else if (j % 97 == 0) v = std::numeric_limits<float>::quiet_NaN();
++            else if (j % 89 == 0) v = std::numeric_limits<float>::infinity();
++            else if (j % 83 == 0) v = -std::numeric_limits<float>::infinity();
++            else if (j % 53 == 0) v = -0.0f;
++            else if (j % 47 == 0) v = 0.0f;
++        }
++    }
++    const int64_t same_special = same(special);
+     const int64_t same_tied = same(tied), same_equal = same(equal), same_cont = same(scores);   // d_scores: continuous
+     cudaEvent_t e0, e1;
+     ck(cudaEventCreate(&e0), "event");
+     ck(cudaEventCreate(&e1), "event");
+     auto timed = [&](auto f) {
++        for (int r = 0; r < reps; ++r) f();   // warm: the clocks ramp up on the first launches
+         ck(cudaEventRecord(e0), "record");
+         for (int r = 0; r < reps; ++r) f();
+         ck(cudaEventRecord(e1), "record");
+@@ -95,13 +112,79 @@ bool run_case(int64_t ctx, int64_t nq, int reps, int64_t capacity, bool counted)
+     const float t_new = timed([&] { k::qsa_block_topk(d_scores, d_steps, nq, max_blocks, cap, s, ids_new, nullptr, active); });
+     cudaEventDestroy(e0); cudaEventDestroy(e1);
+     cudaFree(d_steps); cudaFree(d_scores); cudaFree(ids_ref); cudaFree(ids_new);
+-    const bool ok = same_cont == nq && same_tied == nq && same_equal == nq;
++    const bool ok = same_cont == nq && same_tied == nq && same_equal == nq && same_special == nq;
+     std::printf("%s context %lld under a capacity of %lld (%lld blocks), %lld queries %s: reference %.3f ms, "
+                 "dispatched %.3f ms (%.1fx); identical ids: continuous %lld/%lld, 64 levels %lld/%lld, equal scores "
+-                "%lld/%lld\n", ok ? "PASS" : "FAIL", (long long) ctx, (long long) capacity, (long long) max_blocks,
+-                (long long) nq, counted ? "with their block count" : "without a block count", t_ref, t_new, t_ref / t_new,
+-                (long long) same_cont, (long long) nq, (long long) same_tied,
+-                (long long) nq, (long long) same_equal, (long long) nq);
++                "%lld/%lld, special values %lld/%lld\n", ok ? "PASS" : "FAIL", (long long) ctx, (long long) capacity,
++                (long long) max_blocks, (long long) nq, counted ? "with their block count" : "without a block count", t_ref,
++                t_new, t_ref / t_new, (long long) same_cont, (long long) nq, (long long) same_tied, (long long) nq,
++                (long long) same_equal, (long long) nq, (long long) same_special, (long long) nq);
++    return ok;
++}
++
++// A decode call captured once and replayed while the context moves (as a verify window's graph is): every replay must
++// select what the reference selects for the steps of that moment, the whole `cap`-wide rows compared.
++bool graph_case(int64_t nq, int64_t capacity) {
++    const k::QsaShapes s = k::qsa_real_shapes();
++    const int64_t max_blocks = capacity / s.idx_block + 2, cap = k::qsa_selection_width(k::kTopkMaxCells, s);
++    int32_t *d_steps = nullptr, *ids_ref = nullptr, *ids_new = nullptr;
++    float* d_scores = nullptr;
++    ck(cudaMalloc(&d_steps, (size_t) (nq * k::kStepCount) * 4), "malloc");
++    ck(cudaMalloc(&d_scores, (size_t) (nq * max_blocks) * 4), "malloc");
++    ck(cudaMalloc(&ids_ref, (size_t) (nq * cap) * 4), "malloc");
++    ck(cudaMalloc(&ids_new, (size_t) (nq * cap) * 4), "malloc");
++    cudaStream_t cs;
++    ck(cudaStreamCreate(&cs), "stream");
++    cudaGraph_t graph;
++    cudaGraphExec_t exec;
++    ck(cudaStreamBeginCapture(cs, cudaStreamCaptureModeThreadLocal), "capture");
++    k::qsa_block_topk(d_scores, d_steps, nq, max_blocks, cap, s, ids_new, cs, -1);
++    ck(cudaStreamEndCapture(cs, &graph), "capture end");
++    ck(cudaGraphInstantiate(&exec, graph, nullptr, nullptr, 0), "instantiate");
++    std::mt19937 rng((uint32_t) (nq * 7 + capacity));
++    std::normal_distribution<float> nd(0.f, 1.f);
++    std::vector<int32_t> steps((size_t) (nq * k::kStepCount)), a((size_t) (nq * cap)), b(a.size());
++    std::vector<float> scores((size_t) (nq * max_blocks));
++    bool ok = true;
++    int runs = 0;
++    const int64_t ctxs[] = {4096, 2051, 2052 + nq, 24577, 65536, 131072, 200000, capacity, 9000};
++    for (const int64_t ctx : ctxs) {
++        if (ctx > capacity || ctx < nq) continue;
++        for (int64_t i = 0; i < nq; ++i) {
++            int32_t* st = steps.data() + i * k::kStepCount;
++            const int64_t pos = ctx - nq + i;
++            st[k::kStepPos] = (int32_t) pos;
++            st[k::kStepNKv] = (int32_t) (pos + 1);
++            st[k::kStepNBid] = (int32_t) ((pos + 1) / s.idx_block);
++            st[k::kStepWidth] = (int32_t) k::qsa_selection_width(pos + 1, s);
++            float* row = scores.data() + i * max_blocks;
++            for (int64_t j = 0; j < max_blocks; ++j) row[j] = nd(rng);
++            if (st[k::kStepNKv] % s.idx_block != 0) row[st[k::kStepNBid]] += 1e9f;
++        }
++        ck(cudaMemcpy(d_steps, steps.data(), steps.size() * 4, cudaMemcpyHostToDevice), "upload");
++        ck(cudaMemcpy(d_scores, scores.data(), scores.size() * 4, cudaMemcpyHostToDevice), "upload");
++        ck(cudaMemset(ids_ref, 0xff, a.size() * 4), "memset");
++        ck(cudaMemset(ids_new, 0xff, b.size() * 4), "memset");
++        k::qsa_block_topk_ref(d_scores, d_steps, nq, max_blocks, cap, s, ids_ref, nullptr);
++        ck(cudaDeviceSynchronize(), "sync");
++        ck(cudaGraphLaunch(exec, cs), "replay");
++        ck(cudaStreamSynchronize(cs), "sync");
++        ck(cudaMemcpy(a.data(), ids_ref, a.size() * 4, cudaMemcpyDeviceToHost), "down");
++        ck(cudaMemcpy(b.data(), ids_new, b.size() * 4, cudaMemcpyDeviceToHost), "down");
++        if (a != b) {
++            std::printf("FAIL graph replay: %lld queries under a capacity of %lld, context %lld\n", (long long) nq,
++                        (long long) capacity, (long long) ctx);
++            ok = false;
++        }
++        ++runs;
++    }
++    cudaGraphExecDestroy(exec);
++    cudaGraphDestroy(graph);
++    cudaStreamDestroy(cs);
++    cudaFree(d_steps); cudaFree(d_scores); cudaFree(ids_ref); cudaFree(ids_new);
++    if (ok)
++        std::printf("PASS graph replay: %lld queries under a capacity of %lld, %d contexts\n", (long long) nq,
++                    (long long) capacity, runs);
+     return ok;
+ }
+ }  // namespace
+@@ -119,6 +202,8 @@ int main(int argc, char** argv) {
+             ok = run_case(c[0], 8, 3, c[1], false) && ok;     // a decode window's call
+             ok = run_case(c[0], 64, 3, c[1], true) && ok;     // the prompt path's
+         }
++        for (const int64_t nq : {1, 4, 8}) ok = graph_case(nq, 262144) && ok;
++        ok = graph_case(4, 9000) && ok;
+         std::printf("%s\n", ok ? "qsa_topk_parity: PASS" : "qsa_topk_parity: FAIL");
+         return ok ? 0 : 1;
+     }

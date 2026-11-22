@@ -1,0 +1,972 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: blackhat-7 <44942105+blackhat-7@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 08:27:44 +0530
+Subject: [PATCH 20/33] STRATA_Z_CONVAB (round 9, ported): a GDN layer's
+ conv/ab launch as front blocks of its z GEMV (opt-in)
+
+The z GEMV moves up to the conv/ab launch and carries it: GEMV front roles (the g11 rows body, an X template on the
+r4 / r2 / iq3s kernels) and the conv/ab bodies shared from gdn_conv_ab.cuh (moved out of verify_kernels.cu; the same
+bodies as the port's). One fewer critical-path launch per GDN layer. Off with the side mixer's query branch (z is on
+its branch then) and where no gfx1100 GEMV kernel takes z. mmvq_g11_parity: OK, 504 conv_ab role runs bitwise.
+---
+ include/strata/kernels/iq_kernels.hpp     |   4 +
+ include/strata/kernels/native_mmvq.hpp    |  25 ++++
+ include/strata/kernels/verify_kernels.hpp |   2 +
+ src/core/verify.cpp                       |  18 ++-
+ src/kernels/cuda/gdn_conv_ab.cuh          | 148 ++++++++++++++++++++
+ src/kernels/cuda/iq_kernels.cu            |  32 ++++-
+ src/kernels/cuda/native_mmvq.cu           | 161 ++++++++++++++++------
+ src/kernels/cuda/verify_kernels.cu        | 108 +--------------
+ src/kernels/mmvq_g11_parity.cpp           |  79 +++++++++++
+ 9 files changed, 425 insertions(+), 152 deletions(-)
+ create mode 100644 src/kernels/cuda/gdn_conv_ab.cuh
+
+diff --git a/include/strata/kernels/iq_kernels.hpp b/include/strata/kernels/iq_kernels.hpp
+index 1d19800a8..d5d48c50b 100644
+--- a/include/strata/kernels/iq_kernels.hpp
++++ b/include/strata/kernels/iq_kernels.hpp
+@@ -29,6 +29,10 @@ void iq_mmvq(int ggml_type, const void* w, const void* x_q8_1, float* y, int n_i
+ /// rows; bitwise iq_mmvq's output. False when it has no kernel for n_in (2560 and 6144 only) or ncols.
+ bool iq3s_r4_mmvq(const void* w, const void* x_q8_1, float* y, int n_in, int n_out, int ncols, unsigned blocks,
+                   void* stream);
++struct GdnConvAbArgs;
++/// The same with gdn_conv_ab_multi's blocks in front (native_mmvq_conv_ab, STRATA_Z_CONVAB).
++bool iq3s_r4_mmvq(const void* w, const void* x_q8_1, float* y, int n_in, int n_out, int ncols, unsigned blocks,
++                  void* stream, const GdnConvAbArgs& ab);
+ 
+ /// Dequantize `n` contiguous values (n a multiple of 256) to fp16 / fp32; fp16 times `*scale` when given (device:
+ /// an NVFP4 expert's s_down, read by the kernel itself so the source may be released right after it).
+diff --git a/include/strata/kernels/native_mmvq.hpp b/include/strata/kernels/native_mmvq.hpp
+index 152a31b4a..cbfe69fe7 100644
+--- a/include/strata/kernels/native_mmvq.hpp
++++ b/include/strata/kernels/native_mmvq.hpp
+@@ -1,6 +1,7 @@
+ #pragma once
+ 
+ #include <cstddef>
++#include <cstdint>
+ 
+ namespace strata::kernels {
+ 
+@@ -147,6 +148,30 @@ bool native_mmvq_supported(int ggml_type) noexcept;
+ std::size_t native_mmvq_weight_bytes(int ggml_type, int n_in, int n_out);
+ void native_mmvq(int ggml_type, const void* weights, const void* x_q8_1, float* y,
+                  int n_in, int n_out, int ncols, void* stream);
++/// gdn_conv_ab_multi's arguments (its STRATA_GDN_AB_ILP kernel), for native_mmvq_conv_ab.
++struct GdnConvAbArgs {
++    float* hist;
++    const float* qkv;
++    const float* conv_w;
++    float* h;
++    int channels, qk_heads;
++    float eps;
++    int t_begin;
++    bool commit;
++    const float* x;
++    const uint16_t* wa;
++    const uint16_t* wb;
++    const float* dt;
++    const float* ssm_a;
++    float* gate;
++    float* beta;
++    int h_v, n_tok;
++};
++/// STRATA_Z_CONVAB: native_mmvq and gdn_conv_ab_multi (STRATA_GDN_AB_ILP's kernel) in ONE launch on gfx1100: the conv/ab
++/// blocks run in front of the GEMV's blocks, each part bitwise its own kernel. Returns false (nothing launched) where
++/// native_mmvq would not take a gfx1100 g11 / r4 kernel; the caller then makes the two calls.
++bool native_mmvq_conv_ab(int ggml_type, const void* weights, const void* x_q8_1, float* y, int n_in, int n_out, int ncols,
++                         const GdnConvAbArgs& ab, void* stream);
+ /// S26 STRATA_LFUSE: native_mmvq(w1 -> y1) and native_mmvq(w2 -> y2), same type / shape / input, in ONE launch,
+ /// bitwise the two calls. Returns false (nothing launched) where that is not the case (Q8_0, 2-8 columns only).
+ bool native_mmvq_pair(int ggml_type, const void* w1, const void* w2, const void* x_q8_1, float* y1, float* y2,
+diff --git a/include/strata/kernels/verify_kernels.hpp b/include/strata/kernels/verify_kernels.hpp
+index 1da466e22..921e99632 100644
+--- a/include/strata/kernels/verify_kernels.hpp
++++ b/include/strata/kernels/verify_kernels.hpp
+@@ -33,6 +33,8 @@ void gdn_conv_l2_multi(const float* history, const float* qkv, const float* conv
+ void gdn_conv_commit(float* history, const float* qkv, int channels, const int32_t* n_keep, void* stream);
+ /// alpha/beta for T columns of x (T, n_embd): gate (T, h_v), beta (T, h_v).  Bitwise `fused_gdn_ab` per column.
+ /// gdn_conv_l2_multi and gdn_ab_multi in one launch (143-amdk)
++/// Whether gdn_conv_ab_multi runs its STRATA_GDN_AB_ILP kernel for this width (what native_mmvq_conv_ab fuses).
++bool gdn_conv_ab_ilp_usable(int n_embd);
+ void gdn_conv_ab_multi(const float* history, const float* qkv, const float* conv_w, float* h, int channels, int qk_heads,
+                        float eps, int n_tok, int t_begin, bool commit, const float* x, const uint16_t* w_alpha,
+                        const uint16_t* w_beta, const float* dt, const float* ssm_a, float* gate, float* beta, int n_embd,
+diff --git a/src/core/verify.cpp b/src/core/verify.cpp
+index a80d5b634..cc5e46916 100644
+--- a/src/core/verify.cpp
++++ b/src/core/verify.cpp
+@@ -317,6 +317,8 @@ bool t1_fuse_on() { static const bool on = env_on("STRATA_T1_FUSE"); return on;
+ bool qsa_fold_on() { static const bool on = env_on("STRATA_QSA_FOLD"); return on; }
+ // STRATA_QSA_NR3 (opt-in): a QSA layer's k, q and indexer-q norm+ropes in one launch (native_qsa_rms_norm_rope3)
+ bool qsa_nr3_on() { static const bool on = env_on("STRATA_QSA_NR3"); return on; }
++// STRATA_Z_CONVAB (opt-in): a GDN layer's conv/ab launch as front blocks of its z GEMV (native_mmvq_conv_ab)
++bool z_convab_on() { static const bool on = env_on("STRATA_Z_CONVAB"); return on; }
+ #if defined(STRATA_USE_HIP)
+ const bool g_coherent = env_on("STRATA_VERIFY_COHERENT");
+ const bool g_doorbell_store = env_on("STRATA_DOORBELL_STORE");
+@@ -1635,6 +1637,19 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
+                 const bool fuse_ab = fuse_convab_on() && !br && !batch_rec_ && !prof_on_ && !sidem;   // the side mixer computes the gates on its branch
+                 if (!side_proj) mm(wqkv, qkv + (size_t) tb * C, (int) N, (int) C);   // with side_proj: above, first
+                 stamp(l, 2, grp);
++                // STRATA_Z_CONVAB: the z GEMV moves up to the conv/ab launch and carries it (z reads only xq_, written
++                // before the qkv GEMV); false when no gfx1100 GEMV kernel takes z: then the two launches as before
++                // (side_proj computes z on its branch; fuse_ab is already false with the side mixer)
++                const bool z_convab = fuse_ab && !side_proj && z_convab_on() && gdn_conv_ab_ilp_usable((int) N) &&
++                    !(g_mmvq_il() && strata::kernels::native_mmvq_il_supported(wg->native_type, n, (int) ZV)) &&
++                    strata::kernels::native_mmvq_conv_ab(
++                        wg->native_type, wg->native_data, xq_, z_ + (size_t) tb * ZV, (int) N, (int) ZV, n,
++                        strata::kernels::GdnConvAbArgs{conv, qkv, (const float*) wc->data, hb, (int) C, (int) (2 * HK), EPS,
++                                                       tb, self_commit, xm, (const uint16_t*) wa->data,
++                                                       (const uint16_t*) wb->data, (const float*) wdt->data,
++                                                       (const float*) wsa->data, gate + (size_t) tb * HV,
++                                                       beta + (size_t) tb * HV, (int) HV, n},
++                        cs);
+                 if (batch_rec_) {   // contiguous rows may be proposals for the same slot
+                     for (int t = tb; t < te;) {
+                         const int first = t;
+@@ -1646,6 +1661,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
+                                           hb + (size_t) first * C, (int) C, (int) (2 * HK), EPS, t - first, cs, 0,
+                                           keep_rows);
+                     }
++                } else if (z_convab) {
+                 } else
+                 // a one-token window keeps its token: it advances the conv history and the state itself (commit)
+                 if (fuse_ab)   // 143-amdk: the conv and the a/b projections in one launch
+@@ -1666,7 +1682,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
+                              (const float*) wsa->data, gate + (size_t) tb * HV, beta + (size_t) tb * HV, (int) N, (int) HV,
+                              n, cs);
+                 stamp(l, 4, grp);
+-                if (!side_proj) mm(wg, z_ + (size_t) tb * ZV, (int) N, (int) ZV);
++                if (!side_proj && !z_convab) mm(wg, z_ + (size_t) tb * ZV, (int) N, (int) ZV);
+                 stamp(l, 5, grp);
+                 if (side_proj && cudaStreamWaitEvent(cs, pjoin_, 0) != cudaSuccess) {
+                     err = "verify: the gate projection's branch could not join";
+diff --git a/src/kernels/cuda/gdn_conv_ab.cuh b/src/kernels/cuda/gdn_conv_ab.cuh
+new file mode 100644
+index 000000000..8f99493c5
+--- /dev/null
++++ b/src/kernels/cuda/gdn_conv_ab.cuh
+@@ -0,0 +1,148 @@
++// The GDN conv + L2 norm and the a/b projections (STRATA_GDN_AB_ILP) as block bodies: gdn_conv_ab_ilp_kernel
++// (verify_kernels.cu) runs them, and STRATA_Z_CONVAB runs the same source as front blocks of the z GEMV (native_mmvq.cu,
++// iq_kernels.cu), so both compute the same bits.
++#pragma once
++
++#include "strata/kernels/native_mmvq.hpp"
++#include <cuda_runtime.h>
++#include <cstdint>
++
++namespace strata::kernels {
++namespace {
++constexpr int kConvS = 128;   // channels a conv block (its threads)
++
++// `commit` (one token): the history then keeps it - [hist1, hist2, x_0], each thread its channel's, after reading them
++__device__ __forceinline__ void gdn_conv_l2_body(const int bx, const int by, float* hist, const float* __restrict__ qkv,
++                                                              const float* __restrict__ w, float* __restrict__ h,
++                                                              int C, int qk_heads, float eps, int t_begin, bool commit) {
++    __shared__ float part[kConvS / 32];
++    const int t = t_begin + by;
++    const int c = bx * kConvS + threadIdx.x;
++    // the window of token t: [hist0, hist1, hist2, x_0, ..., x_t], its last four entries
++    float win[3];
++#pragma unroll
++    for (int j = 0; j < 3; ++j) {
++        const int src = t + j;          // index into [hist(3) | x...]
++        win[j] = src < 3 ? hist[c * 3 + src] : qkv[(size_t) (src - 3) * C + c];
++    }
++    const float v0 = win[0], v1 = win[1], v2 = win[2], x = qkv[(size_t) t * C + c];
++    if (commit) {
++        hist[c * 3] = v1;
++        hist[c * 3 + 1] = v2;
++        hist[c * 3 + 2] = x;
++    }
++    float sum = v0 * w[c * 4] + v1 * w[c * 4 + 1] + v2 * w[c * 4 + 2] + x * w[c * 4 + 3];
++    float y = sum / (1.0f + __expf(-sum));
++    if ((int) bx < qk_heads) {
++        float sq = y * y;
++        for (int o = 16; o > 0; o >>= 1) sq += __shfl_xor_sync(0xffffffffu, sq, o);
++        if ((threadIdx.x & 31) == 0) part[threadIdx.x >> 5] = sq;
++        __syncthreads();
++        const float ss = part[0] + part[1] + part[2] + part[3];
++        y *= rsqrtf(ss + eps);
++    }
++    h[(size_t) t * C + c] = y;
++}
++
++// a lane's 8 weights of one uint4 against x[0..8), in gdn_ab_body's FMA order
++__device__ __forceinline__ float gdn_ab_dot8(const uint4 wv, const float4 xa, const float4 xb, float a) {
++    a = fmaf(__uint_as_float(wv.x << 16), xa.x, a); a = fmaf(__uint_as_float(wv.x & 0xffff0000u), xa.y, a);
++    a = fmaf(__uint_as_float(wv.y << 16), xa.z, a); a = fmaf(__uint_as_float(wv.y & 0xffff0000u), xa.w, a);
++    a = fmaf(__uint_as_float(wv.z << 16), xb.x, a); a = fmaf(__uint_as_float(wv.z & 0xffff0000u), xb.y, a);
++    a = fmaf(__uint_as_float(wv.w << 16), xb.z, a); a = fmaf(__uint_as_float(wv.w & 0xffff0000u), xb.w, a);
++    return a;
++}
++
++// the lanes' partial dots of one row -> gate or beta for every token
++template <int MAX_T, bool EXACT_T>
++__device__ __forceinline__ void gdn_ab_finish(const float (&acc)[MAX_T], int lane, bool is_beta, int r,
++                                              const float* __restrict__ dt, const float* __restrict__ ssm_a,
++                                              float* __restrict__ gate, float* __restrict__ beta, int h_v, int T) {
++#pragma unroll
++    for (int t = 0; t < MAX_T; ++t) {
++        if (!EXACT_T && t >= T) break;
++        float a = acc[t];
++#pragma unroll
++        for (int o = 16; o > 0; o >>= 1) a += __shfl_xor_sync(0xffffffffu, a, o);
++        if (lane != 0) continue;
++        if (is_beta) {
++            beta[(size_t) t * h_v + r] = 1.0f / (1.0f + __expf(-a));
++        } else {
++            const float v = a + dt[r];
++            const float sp = v > 20.0f ? v : log1pf(__expf(v));
++            gate[(size_t) t * h_v + r] = sp * ssm_a[r];
++        }
++    }
++}
++
++// STRATA_GDN_AB_ILP=1 (on by default on gfx1100, strata/core/arch_defaults.hpp): gdn_ab_body with one warp per (row,
++// token) instead of one per row, for n = 256 * IT.  gdn_ab_body's loop runs to a kernel argument, so each of a lane's
++// IT steps waits for its own loads: IT memory latencies in a row (6.7 us for 0.5 MB on a 7900 XTX).  Here a lane
++// loads its IT weight chunks and its token's 2 * IT x chunks at once, then runs that token's fmaf chain: the chain
++// gdn_ab_body's lane runs for that token (the tokens' chains never mix), followed by the same butterfly and epilogue,
++// so gate and beta are bitwise the same.  grid (rows / 2, T), 64 threads.  The conv + a/b of a verify layer, 36 layers
++// of cold weights in a graph, T 2..4: 8.4-9.4 -> 6.6-6.8 us a layer (4.2-5.0 inside STRATA_FUSE_CONVAB's launch).
++template <int IT>
++__device__ __forceinline__ void gdn_ab_body_ilp(const int bx, const int t, const float* __restrict__ x,
++                                                const uint16_t* __restrict__ wa, const uint16_t* __restrict__ wb,
++                                                const float* __restrict__ dt, const float* __restrict__ ssm_a,
++                                                float* __restrict__ gate, float* __restrict__ beta, int h_v) {
++    constexpr int n = 256 * IT;
++    const int row = bx * 2 + (threadIdx.x >> 5), lane = threadIdx.x & 31;
++    if (row >= 2 * h_v) return;
++    const bool is_beta = row >= h_v;
++    const int r = is_beta ? row - h_v : row;
++    const uint4* w4 = reinterpret_cast<const uint4*>((is_beta ? wb : wa) + (size_t) r * n) + lane;
++    const float4* x4 = reinterpret_cast<const float4*>(x + (size_t) t * n) + 2 * lane;
++    uint4 wv[IT];
++    float4 xa[IT], xb[IT];
++#pragma unroll
++    for (int i = 0; i < IT; ++i) {
++        wv[i] = __ldg(w4 + 32 * i);
++        xa[i] = __ldg(x4 + 64 * i);
++        xb[i] = __ldg(x4 + 64 * i + 1);
++    }
++    float acc[1] = {0.0f};
++#pragma unroll
++    for (int i = 0; i < IT; ++i) acc[0] = gdn_ab_dot8(wv[i], xa[i], xb[i], acc[0]);
++    gdn_ab_finish<1, true>(acc, lane, is_beta, r, dt, ssm_a, gate + (size_t) t * h_v, beta + (size_t) t * h_v, h_v, 1);
++}
++constexpr int kAbIlpIt = 10;   // n_embd 2560 (Qwen3.8 Flash-Next); another width keeps gdn_ab_body
++
++
++// one block of gdn_conv_ab_ilp_kernel's grid: the a/b blocks first, then the conv blocks
++__device__ __forceinline__ void gdn_conv_ab_ilp_block(int bx, int by, float* hist, const float* __restrict__ qkv,
++                                                      const float* __restrict__ w, float* __restrict__ h, int C,
++                                                      int qk_heads, float eps, int t_begin, bool commit,
++                                                      const float* __restrict__ x, const uint16_t* __restrict__ wa,
++                                                      const uint16_t* __restrict__ wb, const float* __restrict__ dt,
++                                                      const float* __restrict__ ssm_a, float* __restrict__ gate,
++                                                      float* __restrict__ beta, int h_v) {
++    const int ab_blocks = (2 * h_v + 1) / 2;
++    if (bx >= ab_blocks)
++        gdn_conv_l2_body(bx - ab_blocks, by, hist, qkv, w, h, C, qk_heads, eps, t_begin, commit);
++    else if (threadIdx.x < 64)
++        gdn_ab_body_ilp<kAbIlpIt>(bx, by, x, wa, wb, dt, ssm_a, gate, beta, h_v);
++}
++
++// GEMV front roles: a GEMV kernel's blocks [0, role.blocks) run role.run(blockIdx.x) and return; the rest are the GEMV's
++// own grid. NoRole has no blocks, so its kernels are the plain GEMVs.
++struct NoRole {
++    static constexpr int blocks = 0;
++    __device__ void run(int) const {}
++};
++struct ConvAbRole {   // STRATA_Z_CONVAB: gdn_conv_ab_ilp_kernel's (ab + conv, n_tok) grid, flattened row by row
++    GdnConvAbArgs a;
++    int per;      // a/b + conv blocks a token
++    int blocks;   // per * n_tok
++    __device__ __forceinline__ void run(int b) const {
++        gdn_conv_ab_ilp_block(b % per, b / per, a.hist, a.qkv, a.conv_w, a.h, a.channels, a.qk_heads, a.eps, a.t_begin,
++                              a.commit, a.x, a.wa, a.wb, a.dt, a.ssm_a, a.gate, a.beta, a.h_v);
++    }
++};
++inline ConvAbRole conv_ab_role(const GdnConvAbArgs& a) {
++    const int per = (2 * a.h_v + 1) / 2 + a.channels / kConvS;
++    return ConvAbRole{a, per, per * a.n_tok};
++}
++}  // namespace
++}  // namespace strata::kernels
+diff --git a/src/kernels/cuda/iq_kernels.cu b/src/kernels/cuda/iq_kernels.cu
+index b49a10f74..3e753bff8 100644
+--- a/src/kernels/cuda/iq_kernels.cu
++++ b/src/kernels/cuda/iq_kernels.cu
+@@ -9,6 +9,7 @@
+ #include "strata/core/sm75_series.hpp"
+ #include "strata/core/sm120_series.hpp"
+ #include "strata/kernels/gfx_arch.hpp"
++#include "gdn_conv_ab.cuh"
+ #include "strata/kernels/dp4a.hpp"
+ #include "strata/kernels/q8_1_finite.hpp"
+ #include "iq_signs.cuh"
+@@ -5329,16 +5330,25 @@ namespace {
+ // (mmvq_multi_kernel, a warp a row) gives lane l = 8 q + r the superblocks q + 4 j at iqs 2 r; lane r of a row group
+ // holds every q, one running sum each, so a row's sums are the same; the xor tree is q ^ 2 and q ^ 1 in-lane, then
+ // lane ^ 4, ^ 2 and ^ 1.
+-template <int NC, int BPR>
++template <int NC, int BPR, class X = NoRole>
+ __launch_bounds__(128) __global__ void iq3s_r4_kernel(const block_iq3_s* __restrict__ w, const block_q8_1* __restrict__ x,
+-                                                      float* __restrict__ y, int n_out) {
++                                                      float* __restrict__ y, int n_out, X role = X()) {
++    int vb = int(blockIdx.x), vg = int(gridDim.x);   // the GEMV's own grid
++    if constexpr (!std::is_same_v<X, NoRole>) {      // front role blocks (gdn_conv_ab.cuh), then the GEMV's
++        if (vb < role.blocks) {
++            role.run(vb);
++            return;
++        }
++        vb -= role.blocks;
++        vg -= role.blocks;
++    }
+     __shared__ uint32_t grid[512];
+     for (int k = int(threadIdx.x); k < 512; k += 128) grid[k] = iq3s_grid[k];
+     __syncthreads();
+     const int lane = int(threadIdx.x) & 31;
+     const int g = lane >> 3, r = lane & 7;
+     const int groups = (n_out + 3) / 4;
+-    for (int rg = int(blockIdx.x) * 4 + (int(threadIdx.x) >> 5); rg < groups; rg += int(gridDim.x) * 4) {
++    for (int rg = vb * 4 + (int(threadIdx.x) >> 5); rg < groups; rg += vg * 4) {
+         const int row = rg * 4 + g;
+         const block_iq3_s* wr = w + (size_t) min(row, n_out - 1) * BPR;
+         float s[4][NC];
+@@ -5401,11 +5411,11 @@ __launch_bounds__(128) __global__ void iq3s_r4_kernel(const block_iq3_s* __restr
+         }
+     }
+ }
+-template <int BPR>
++template <int BPR, class X = NoRole>
+ void iq3s_r4_launch(const block_iq3_s* w, const block_q8_1* x, float* y, int n_out, int ncols, unsigned blocks,
+-                    cudaStream_t s) {
++                    cudaStream_t s, const X& role = X()) {
+     switch (ncols) {
+-#define STRATA_R4(N) case N: iq3s_r4_kernel<N, BPR><<<blocks, 128, 0, s>>>(w, x, y, n_out); break;
++#define STRATA_R4(N) case N: iq3s_r4_kernel<N, BPR, X><<<blocks + role.blocks, 128, 0, s>>>(w, x, y, n_out, role); break;
+         STRATA_R4(1) STRATA_R4(2) STRATA_R4(3) STRATA_R4(4) STRATA_R4(5) STRATA_R4(6)
+ #undef STRATA_R4
+     }
+@@ -5422,6 +5432,16 @@ bool iq3s_r4_mmvq(const void* w, const void* x_q8_1, float* y, int n_in, int n_o
+     else iq3s_r4_launch<24>(W, X, y, n_out, ncols, blocks, s);
+     return true;
+ }
++bool iq3s_r4_mmvq(const void* w, const void* x_q8_1, float* y, int n_in, int n_out, int ncols, unsigned blocks,
++                  void* stream, const GdnConvAbArgs& ab) {
++    if (ncols < 1 || ncols > 6 || (n_in != 2560 && n_in != 6144)) return false;
++    const auto* W = (const block_iq3_s*) w;
++    const auto* X = (const block_q8_1*) x_q8_1;
++    const auto s = (cudaStream_t) stream;
++    if (n_in == 2560) iq3s_r4_launch<10>(W, X, y, n_out, ncols, blocks, s, conv_ab_role(ab));
++    else iq3s_r4_launch<24>(W, X, y, n_out, ncols, blocks, s, conv_ab_role(ab));
++    return true;
++}
+ #endif
+ 
+ void iq_dequant_f16(int t, const void* src, int64_t n, uint16_t* dst, void* stream, const float* scale) {
+diff --git a/src/kernels/cuda/native_mmvq.cu b/src/kernels/cuda/native_mmvq.cu
+index 834be696a..241ed49ff 100644
+--- a/src/kernels/cuda/native_mmvq.cu
++++ b/src/kernels/cuda/native_mmvq.cu
+@@ -35,6 +35,7 @@
+ #if !defined(__HIPCC__)
+ #include "q8_1_il.cuh"
+ #endif
++#include "gdn_conv_ab.cuh"
+ #include "strata/kernels/gfx_arch.hpp"
+ #include "strata/kernels/pdl.hpp"
+ 
+@@ -2600,10 +2601,10 @@ __device__ __forceinline__ void g11_stage(const typename G::Block* __restrict__
+ // long row in flight the compiler keeps far more registers than the waves can afford. A vocabulary head (HEAD) is the
+ // exception: a warp walks so many rows that keeping the activations in registers and a whole row's loads in flight
+ // pays for the waves it costs (Q5_K head, 4 columns: 947 -> 741 us; two stages instead of one: 792).
++// the rows of block vb of a vg-block grid (the kernels below: blockIdx.x of gridDim.x, or behind a front role)
+ template <class G, int NC, int BPR, bool HEAD>
+-__launch_bounds__(4 * WARP)
+-__global__ void native_mmvq_g11_kernel(const typename G::Block* __restrict__ w, const Q81Block* __restrict__ x,
+-                                       float* __restrict__ y, int n_out) {
++__device__ __forceinline__ void g11_rows(const typename G::Block* __restrict__ w, const Q81Block* __restrict__ x,
++                                         float* __restrict__ y, int n_out, int vb, int vg) {
+     constexpr int SUB = WARP / G::T;                     // superblocks a chunk covers
+     constexpr int NM = (BPR + SUB - 1) / SUB;            // chunks a row
+     constexpr int SMAX = HEAD ? NM : NC == 1 ? 8 : NC == 2 ? 6 : 4;   // each column adds its activations to a stage
+@@ -2614,7 +2615,7 @@ __global__ void native_mmvq_g11_kernel(const typename G::Block* __restrict__ w,
+     const int sb = lane / G::T;
+     // the activations are the same for every row: kept in registers across rows when they fit, else read per row
+     constexpr bool KEEP = HEAD || NC * NM * G::ACT_REGS <= 100;
+-    for (int row = int(blockIdx.x) * 4 + (int(threadIdx.x) >> 5); row < n_out; row += int(gridDim.x) * 4) {
++    for (int row = vb * 4 + (int(threadIdx.x) >> 5); row < n_out; row += vg * 4) {
+         const Q81Block* xr = x;
+         if constexpr (!KEEP) asm volatile("" : "+s"(xr));   // opaque per row: no hoisting them out of the loop
+         const Q81Cols<NC> xc{xr, BPR * 8};
+@@ -2642,6 +2643,23 @@ __global__ void native_mmvq_g11_kernel(const typename G::Block* __restrict__ w,
+         }
+     }
+ }
++template <class G, int NC, int BPR, bool HEAD>
++__launch_bounds__(4 * WARP)
++__global__ void native_mmvq_g11_kernel(const typename G::Block* __restrict__ w, const Q81Block* __restrict__ x,
++                                       float* __restrict__ y, int n_out) {
++    g11_rows<G, NC, BPR, HEAD>(w, x, y, n_out, int(blockIdx.x), int(gridDim.x));
++}
++// the same behind front role blocks (gdn_conv_ab.cuh)
++template <class G, int NC, int BPR, bool HEAD, class X>
++__launch_bounds__(4 * WARP)
++__global__ void native_mmvq_g11_role_kernel(const typename G::Block* __restrict__ w, const Q81Block* __restrict__ x,
++                                            float* __restrict__ y, int n_out, X role) {
++    if (int(blockIdx.x) < role.blocks) {
++        role.run(int(blockIdx.x));
++        return;
++    }
++    g11_rows<G, NC, BPR, HEAD>(w, x, y, n_out, int(blockIdx.x) - role.blocks, int(gridDim.x) - role.blocks);
++}
+ 
+ int g_g11 = -1;        // native_mmvq_g11_tune: -1 the environment (STRATA_MMVQ_G11), 0 off, 1 on
+ int g_g11_grid = 0;    // blocks of the grid (0: g11_blocks's choice)
+@@ -2673,30 +2691,38 @@ unsigned g11_blocks(int n_out, int ncols) {
+     if (g_g11_grid > 0) return std::min(need, unsigned(g_g11_grid));
+     return ncols == 1 ? need : std::min(need, 16 * cus);
+ }
+-template <class G, int BPR, bool HEAD>
+-void g11_launch(const void* weights, const void* x_q8_1, float* y, int n_out, int ncols, cudaStream_t s) {
++template <class G, int BPR, bool HEAD, class X = NoRole>
++void g11_launch(const void* weights, const void* x_q8_1, float* y, int n_out, int ncols, cudaStream_t s,
++                const X& role = X()) {
+     const auto* w = static_cast<const typename G::Block*>(weights);
+     const auto* x = static_cast<const Q81Block*>(x_q8_1);
+-    const unsigned blocks = g11_blocks(n_out, ncols);
++    const unsigned blocks = g11_blocks(n_out, ncols) + role.blocks;
+     switch (ncols) {
+-#define STRATA_G11_CASE(N) case N: native_mmvq_g11_kernel<G, N, BPR, HEAD><<<blocks, 4 * WARP, 0, s>>>(w, x, y, n_out); break;
++#define STRATA_G11_CASE(N)                                                                                             \
++    case N:                                                                                                            \
++        if constexpr (std::is_same_v<X, NoRole>) native_mmvq_g11_kernel<G, N, BPR, HEAD><<<blocks, 4 * WARP, 0, s>>>(w, x, y, n_out); \
++        else native_mmvq_g11_role_kernel<G, N, BPR, HEAD, X><<<blocks, 4 * WARP, 0, s>>>(w, x, y, n_out, role);        \
++        break;
+         STRATA_G11_CASE(1) STRATA_G11_CASE(2) STRATA_G11_CASE(3) STRATA_G11_CASE(4)
+ #undef STRATA_G11_CASE
+     }
+ }
+-template <class G>
+-bool g11_shape(const void* weights, const void* x_q8_1, float* y, int n_in, int n_out, int ncols, cudaStream_t s) {
++template <class G, class X = NoRole>
++bool g11_shape(const void* weights, const void* x_q8_1, float* y, int n_in, int n_out, int ncols, cudaStream_t s,
++               const X& role = X()) {
+     // the engine's dense inputs: the hidden size (heads included) and the attention / GDN value width
+     if (n_in == 2560) {
+-        if (n_out >= 65536) g11_launch<G, 10, true>(weights, x_q8_1, y, n_out, ncols, s);
+-        else g11_launch<G, 10, false>(weights, x_q8_1, y, n_out, ncols, s);
++        if (n_out >= 65536) {
++            if constexpr (std::is_same_v<X, NoRole>) g11_launch<G, 10, true>(weights, x_q8_1, y, n_out, ncols, s);
++            else return false;   // no role rides with a vocabulary head
++        } else g11_launch<G, 10, false>(weights, x_q8_1, y, n_out, ncols, s, role);
+         return true;
+     }
+     // 6144 inputs (the output projections): measured faster for IQ4_XS only; native_mmvq's own kernels are as fast or
+     // faster for the K-quants there
+     if constexpr (std::is_same_v<G, G11IQ4XS>) {
+         if (n_in == 6144) {
+-            g11_launch<G, 24, false>(weights, x_q8_1, y, n_out, ncols, s);
++            g11_launch<G, 24, false>(weights, x_q8_1, y, n_out, ncols, s, role);
+             return true;
+         }
+     }
+@@ -2742,10 +2768,19 @@ __device__ __forceinline__ void r4_tree_slots(float (&s)[4][NC], float (&out)[NC
+ // Q6_K (BPR superblocks a row). Exact layout: thread (warp v, lane l) takes superblocks v, v + 4, ... at iqs l. Lane i
+ // of a row group holds l = 4 i .. 4 i + 3 (16 bytes of ql, of qh and of both q8_1 blocks it reads, one scale pair) and
+ // walks the warps in order, a warp's superblocks loaded first, so the warp sum is a running in-lane sum.
+-template <int NC, int BPR>
++template <int NC, int BPR, class X = NoRole>
+ __launch_bounds__(4 * WARP)
+ __global__ void r4_q6k_kernel(const Q6KBlock* __restrict__ w, const Q81Block* __restrict__ x, float* __restrict__ y,
+-                              int n_out) {
++                              int n_out, X role = X()) {
++    int vb = int(blockIdx.x), vg = int(gridDim.x);   // the GEMV's own grid
++    if constexpr (!std::is_same_v<X, NoRole>) {      // front role blocks (gdn_conv_ab.cuh), then the GEMV's
++        if (vb < role.blocks) {
++            role.run(vb);
++            return;
++        }
++        vb -= role.blocks;
++        vg -= role.blocks;
++    }
+     constexpr int MAXS = (BPR + 3) / 4;                      // superblocks of warp 0
+     constexpr int STG = MAXS <= 3 ? MAXS : (MAXS + 1) / 2;   // a stage of loads (more in flight costs waves)
+     const int lane = int(threadIdx.x) & (WARP - 1);
+@@ -2756,7 +2791,7 @@ __global__ void r4_q6k_kernel(const Q6KBlock* __restrict__ w, const Q81Block* __
+     const int qhoff = 32 * (i >> 2) + 16 * (i & 1);
+     const int xoff = 16 * (i & 1);
+     const int groups = (n_out + 3) / 4;
+-    for (int rg = int(blockIdx.x) * 4 + (int(threadIdx.x) >> 5); rg < groups; rg += int(gridDim.x) * 4) {
++    for (int rg = vb * 4 + (int(threadIdx.x) >> 5); rg < groups; rg += vg * 4) {
+         const int row = rg * 4 + g;
+         const Q6KBlock* wr = w + std::size_t(min(row, n_out - 1)) * BPR;
+         float s[4][NC];
+@@ -2829,10 +2864,19 @@ __global__ void r4_q6k_kernel(const Q6KBlock* __restrict__ w, const Q81Block* __
+ // Q6_K, two rows a wave, sixteen lanes a row (twice r4's waves, for the 6144-input shapes' few rows): lane i of a row
+ // holds the exact layout's lanes 2 i and 2 i + 1, 8 contiguous bytes of ql, of qh and of each q8_1 block it reads; the
+ // tree is l ^ 16, ^ 8, ^ 4 and ^ 2 across lanes (lane ^ 8 .. ^ 1), then l ^ 1 in-lane.
+-template <int NC, int BPR>
++template <int NC, int BPR, class X = NoRole>
+ __launch_bounds__(4 * WARP)
+ __global__ void r2_q6k_kernel(const Q6KBlock* __restrict__ w, const Q81Block* __restrict__ x, float* __restrict__ y,
+-                              int n_out) {
++                              int n_out, X role = X()) {
++    int vb = int(blockIdx.x), vg = int(gridDim.x);   // the GEMV's own grid
++    if constexpr (!std::is_same_v<X, NoRole>) {      // front role blocks (gdn_conv_ab.cuh), then the GEMV's
++        if (vb < role.blocks) {
++            role.run(vb);
++            return;
++        }
++        vb -= role.blocks;
++        vg -= role.blocks;
++    }
+     constexpr int MAXS = (BPR + 3) / 4;
+     constexpr int STG = MAXS <= 3 ? MAXS : (MAXS + 1) / 2;
+     const int lane = int(threadIdx.x) & (WARP - 1);
+@@ -2843,7 +2887,7 @@ __global__ void r2_q6k_kernel(const Q6KBlock* __restrict__ w, const Q81Block* __
+     const int qhoff = 32 * (i >> 3) + 8 * (i & 3);
+     const int xoff = 8 * (i & 3);
+     const int pairs = (n_out + 1) / 2;
+-    for (int rp = int(blockIdx.x) * 4 + (int(threadIdx.x) >> 5); rp < pairs; rp += int(gridDim.x) * 4) {
++    for (int rp = vb * 4 + (int(threadIdx.x) >> 5); rp < pairs; rp += vg * 4) {
+         const int row = rp * 2 + h;
+         const Q6KBlock* wr = w + std::size_t(min(row, n_out - 1)) * BPR;
+         float s[2][NC];
+@@ -2925,10 +2969,19 @@ __global__ void r2_q6k_kernel(const Q6KBlock* __restrict__ w, const Q81Block* __
+ // Q4_K / Q5_K. Exact layout: thread (warp v, lane l = 16 h + 4 a + b) takes superblocks 2 v + h + 8 j at the q8_1 block
+ // pair 2 a, 2 a + 1, ints b and b + 4. Lane i = 4 h + a of a row group holds b = 0..3: 32 contiguous bytes of qs, all of
+ // both q8_1 blocks and one scale set; l = 4 i + b, so the tree is Q6_K's.
+-template <bool Q5, int NC, int BPR>
++template <bool Q5, int NC, int BPR, class X = NoRole>
+ __launch_bounds__(4 * WARP)
+ __global__ void r4_q45k_kernel(const void* __restrict__ w_, const Q81Block* __restrict__ x, float* __restrict__ y,
+-                               int n_out) {
++                               int n_out, X role = X()) {
++    int vb = int(blockIdx.x), vg = int(gridDim.x);   // the GEMV's own grid
++    if constexpr (!std::is_same_v<X, NoRole>) {      // front role blocks (gdn_conv_ab.cuh), then the GEMV's
++        if (vb < role.blocks) {
++            role.run(vb);
++            return;
++        }
++        vb -= role.blocks;
++        vg -= role.blocks;
++    }
+     using Block = std::conditional_t<Q5, Q5KBlock, Q4KBlock>;
+     const Block* __restrict__ w = static_cast<const Block*>(w_);
+     constexpr int MAXS = (BPR + 7) / 8;   // superblocks of warp 0 a lane
+@@ -2936,7 +2989,7 @@ __global__ void r4_q45k_kernel(const void* __restrict__ w_, const Q81Block* __re
+     const int g = lane >> 3, i = lane & 7;
+     const int h = i >> 2, a = i & 3;
+     const int groups = (n_out + 3) / 4;
+-    for (int rg = int(blockIdx.x) * 4 + (int(threadIdx.x) >> 5); rg < groups; rg += int(gridDim.x) * 4) {
++    for (int rg = vb * 4 + (int(threadIdx.x) >> 5); rg < groups; rg += vg * 4) {
+         const int row = rg * 4 + g;
+         const Block* wr = w + std::size_t(min(row, n_out - 1)) * BPR;
+         float s[4][NC];
+@@ -3037,14 +3090,23 @@ __global__ void r4_q45k_kernel(const void* __restrict__ w_, const Q81Block* __re
+ // IQ4_XS. Exact layout: thread (warp v, lane l = 8 q + r) takes superblocks 4 v + q + 16 j at ints 4 r .. 4 r + 3.
+ // Lane r of a row group holds every q, one running sum each (the warps in order); the xor tree is q ^ 2 and q ^ 1
+ // in-lane, then lane ^ 4, ^ 2 and ^ 1.
+-template <int NC, int BPR>
++template <int NC, int BPR, class X = NoRole>
+ __launch_bounds__(4 * WARP)
+ __global__ void r4_iq4xs_kernel(const IQ4XSBlock* __restrict__ w, const Q81Block* __restrict__ x, float* __restrict__ y,
+-                                int n_out) {
++                                int n_out, X role = X()) {
++    int vb = int(blockIdx.x), vg = int(gridDim.x);   // the GEMV's own grid
++    if constexpr (!std::is_same_v<X, NoRole>) {      // front role blocks (gdn_conv_ab.cuh), then the GEMV's
++        if (vb < role.blocks) {
++            role.run(vb);
++            return;
++        }
++        vb -= role.blocks;
++        vg -= role.blocks;
++    }
+     const int lane = int(threadIdx.x) & (WARP - 1);
+     const int g = lane >> 3, r = lane & 7;
+     const int groups = (n_out + 3) / 4;
+-    for (int rg = int(blockIdx.x) * 4 + (int(threadIdx.x) >> 5); rg < groups; rg += int(gridDim.x) * 4) {
++    for (int rg = vb * 4 + (int(threadIdx.x) >> 5); rg < groups; rg += vg * 4) {
+         const int row = rg * 4 + g;
+         const IQ4XSBlock* wr = w + std::size_t(min(row, n_out - 1)) * BPR;
+         float s[4][NC];
+@@ -3107,16 +3169,17 @@ __global__ void r4_iq4xs_kernel(const IQ4XSBlock* __restrict__ w, const Q81Block
+     }
+ }
+ 
+-template <int BPR>
++template <int BPR, class X = NoRole>
+ void r4_launch(int ggml_type, const void* weights, const Q81Block* x, float* y, int n_out, int ncols, unsigned blocks,
+-               cudaStream_t s) {
++               cudaStream_t s, const X& role = X()) {
+ #define STRATA_R4(N)                                                                                                    \
+     case N:                                                                                                             \
+-        if (ggml_type == 12) r4_q45k_kernel<false, N, BPR><<<blocks, 4 * WARP, 0, s>>>(weights, x, y, n_out);          \
+-        else if (ggml_type == 13) r4_q45k_kernel<true, N, BPR><<<blocks, 4 * WARP, 0, s>>>(weights, x, y, n_out);      \
++        if (ggml_type == 12) r4_q45k_kernel<false, N, BPR, X><<<blocks, 4 * WARP, 0, s>>>(weights, x, y, n_out, role);  \
++        else if (ggml_type == 13) r4_q45k_kernel<true, N, BPR, X><<<blocks, 4 * WARP, 0, s>>>(weights, x, y, n_out, role); \
+         else if (ggml_type == 14)                                                                                       \
+-            r4_q6k_kernel<N, BPR><<<blocks, 4 * WARP, 0, s>>>(static_cast<const Q6KBlock*>(weights), x, y, n_out);    \
+-        else r4_iq4xs_kernel<N, BPR><<<blocks, 4 * WARP, 0, s>>>(static_cast<const IQ4XSBlock*>(weights), x, y, n_out); \
++            r4_q6k_kernel<N, BPR, X><<<blocks, 4 * WARP, 0, s>>>(static_cast<const Q6KBlock*>(weights), x, y, n_out, role); \
++        else r4_iq4xs_kernel<N, BPR, X><<<blocks, 4 * WARP, 0, s>>>(static_cast<const IQ4XSBlock*>(weights), x, y, n_out, \
++                                                                   role);                                               \
+         break;
+     switch (ncols) { STRATA_R4(1) STRATA_R4(2) STRATA_R4(3) STRATA_R4(4) STRATA_R4(5) STRATA_R4(6) }
+ #undef STRATA_R4
+@@ -3141,8 +3204,9 @@ bool r4_on() {   // STRATA_MMVQ_R4=0 keeps the g11 / native_mmvq kernels
+ // The dense projections and the Q5_K vocabulary head (65536 rows and more: from 2 columns, where its g11 kernel falls
+ // behind); the small matrices (k / v 512, shared expert 640) keep their kernels - four rows a wave leaves them too few
+ // waves.
++template <class X = NoRole>
+ bool r4_mmvq(int ggml_type, const void* weights, const void* x_q8_1, float* y, int n_in, int n_out, int ncols,
+-             cudaStream_t s) {
++             cudaStream_t s, const X& role = X()) {
+     const bool head = n_out >= 65536;
+     if (!r4_on() || (n_in != 2560 && n_in != 6144) || n_out < 2048 || (head && ggml_type != 13) ||
+         ncols < (head ? 2 : r4_from(ggml_type, n_in)))
+@@ -3150,33 +3214,37 @@ bool r4_mmvq(int ggml_type, const void* weights, const void* x_q8_1, float* y, i
+     const auto grid = [](unsigned need) { return g_g11_grid > 0 ? std::min(need, unsigned(g_g11_grid)) : need; };
+     const unsigned blocks = grid(unsigned((n_out + 15) / 16));   // four rows a wave, four waves a block
+     const auto* x = static_cast<const Q81Block*>(x_q8_1);
+-    if (ggml_type == 21) return iq3s_r4_mmvq(weights, x_q8_1, y, n_in, n_out, ncols, blocks, s);
++    if (ggml_type == 21) {
++        if constexpr (std::is_same_v<X, NoRole>) return iq3s_r4_mmvq(weights, x_q8_1, y, n_in, n_out, ncols, blocks, s);
++        else return iq3s_r4_mmvq(weights, x_q8_1, y, n_in, n_out, ncols, blocks, s, role.a);
++    }
+     if (ggml_type == 14 && n_in == 6144 && ncols <= 5) {   // the value-width Q6_K: two rows a wave
+         const unsigned b2 = grid(unsigned((n_out + 7) / 8));
+         const auto* w = static_cast<const Q6KBlock*>(weights);
+         switch (ncols) {
+-#define STRATA_R2(N) case N: r2_q6k_kernel<N, 24><<<b2, 4 * WARP, 0, s>>>(w, x, y, n_out); break;
++#define STRATA_R2(N) case N: r2_q6k_kernel<N, 24, X><<<b2 + role.blocks, 4 * WARP, 0, s>>>(w, x, y, n_out, role); break;
+             STRATA_R2(3) STRATA_R2(4) STRATA_R2(5)
+ #undef STRATA_R2
+         }
+         return true;
+     }
+-    if (n_in == 2560) r4_launch<10>(ggml_type, weights, x, y, n_out, ncols, blocks, s);
+-    else r4_launch<24>(ggml_type, weights, x, y, n_out, ncols, blocks, s);
++    if (n_in == 2560) r4_launch<10>(ggml_type, weights, x, y, n_out, ncols, blocks + role.blocks, s, role);
++    else r4_launch<24>(ggml_type, weights, x, y, n_out, ncols, blocks + role.blocks, s, role);
+     return true;
+ }
+ // native_mmvq's gfx1100 path: true when it launched (bitwise native_mmvq's own kernels' output)
++template <class X = NoRole>
+ bool g11_mmvq(int ggml_type, const void* weights, const void* x_q8_1, float* y, int n_in, int n_out, int ncols,
+-              void* stream) {
++              void* stream, const X& role = X()) {
+     if (ncols < 1 || ncols > 6 || n_out <= 0 || !g11_on() || !g11_device()) return false;
+     if (weights == nullptr || x_q8_1 == nullptr || y == nullptr || stream == nullptr) return false;
+     const auto s = static_cast<cudaStream_t>(stream);
+-    bool ok = r4_mmvq(ggml_type, weights, x_q8_1, y, n_in, n_out, ncols, s);
++    bool ok = r4_mmvq(ggml_type, weights, x_q8_1, y, n_in, n_out, ncols, s, role);
+     if (!ok && ncols <= 4) switch (ggml_type) {
+-    case 12: ok = g11_shape<G11Q4K>(weights, x_q8_1, y, n_in, n_out, ncols, s); break;
+-    case 13: ok = g11_shape<G11Q5K>(weights, x_q8_1, y, n_in, n_out, ncols, s); break;
+-    case 14: ok = g11_shape<G11Q6K>(weights, x_q8_1, y, n_in, n_out, ncols, s); break;
+-    case 23: ok = g11_shape<G11IQ4XS>(weights, x_q8_1, y, n_in, n_out, ncols, s); break;
++    case 12: ok = g11_shape<G11Q4K>(weights, x_q8_1, y, n_in, n_out, ncols, s, role); break;
++    case 13: ok = g11_shape<G11Q5K>(weights, x_q8_1, y, n_in, n_out, ncols, s, role); break;
++    case 14: ok = g11_shape<G11Q6K>(weights, x_q8_1, y, n_in, n_out, ncols, s, role); break;
++    case 23: ok = g11_shape<G11IQ4XS>(weights, x_q8_1, y, n_in, n_out, ncols, s, role); break;
+     }
+     if (ok) {
+         const cudaError_t e = cudaGetLastError();
+@@ -4395,6 +4463,15 @@ std::size_t native_mmvq_weight_bytes(int ggml_type, int n_in, int n_out) {
+     return row_bytes * std::size_t(n_out);
+ }
+ 
++bool native_mmvq_conv_ab(int ggml_type, const void* weights, const void* x_q8_1, float* y, int n_in, int n_out, int ncols,
++                         const GdnConvAbArgs& ab, void* stream) {
++#if defined(__HIPCC__)
++    return g11_mmvq(ggml_type, weights, x_q8_1, y, n_in, n_out, ncols, stream, conv_ab_role(ab));
++#else
++    return false;
++#endif
++}
++
+ void native_mmvq(int ggml_type, const void* weights, const void* x_q8_1, float* y,
+                  int n_in, int n_out, int ncols, void* stream) {
+     // more columns than one launch takes: ceil(ncols / MAX_NCOLS) passes over the same weights.  Every column of a
+diff --git a/src/kernels/cuda/verify_kernels.cu b/src/kernels/cuda/verify_kernels.cu
+index 98510d11c..dc7afe0ff 100644
+--- a/src/kernels/cuda/verify_kernels.cu
++++ b/src/kernels/cuda/verify_kernels.cu
+@@ -11,6 +11,7 @@
+ #include "strata/kernels/dp4a.hpp"
+ #include "strata/kernels/gfx_arch.hpp"
+ #include "strata/kernels/pdl.hpp"
++#include "gdn_conv_ab.cuh"
+ 
+ #include <cuda_fp16.h>
+ #include <cuda_runtime.h>
+@@ -37,39 +38,6 @@ void check(const char* what) {
+     if (e != cudaSuccess) { std::fprintf(stderr, "%s: %s\n", what, cudaGetErrorString(e)); std::exit(1); }
+ }
+ 
+-// `commit` (one token): the history then keeps it - [hist1, hist2, x_0], each thread its channel's, after reading them
+-__device__ __forceinline__ void gdn_conv_l2_body(const int bx, const int by, float* hist, const float* __restrict__ qkv,
+-                                                              const float* __restrict__ w, float* __restrict__ h,
+-                                                              int C, int qk_heads, float eps, int t_begin, bool commit) {
+-    __shared__ float part[S / 32];
+-    const int t = t_begin + by;
+-    const int c = bx * S + threadIdx.x;
+-    // the window of token t: [hist0, hist1, hist2, x_0, ..., x_t], its last four entries
+-    float win[3];
+-#pragma unroll
+-    for (int j = 0; j < 3; ++j) {
+-        const int src = t + j;          // index into [hist(3) | x...]
+-        win[j] = src < 3 ? hist[c * 3 + src] : qkv[(size_t) (src - 3) * C + c];
+-    }
+-    const float v0 = win[0], v1 = win[1], v2 = win[2], x = qkv[(size_t) t * C + c];
+-    if (commit) {
+-        hist[c * 3] = v1;
+-        hist[c * 3 + 1] = v2;
+-        hist[c * 3 + 2] = x;
+-    }
+-    float sum = v0 * w[c * 4] + v1 * w[c * 4 + 1] + v2 * w[c * 4 + 2] + x * w[c * 4 + 3];
+-    float y = sum / (1.0f + __expf(-sum));
+-    if ((int) bx < qk_heads) {
+-        float sq = y * y;
+-        for (int o = 16; o > 0; o >>= 1) sq += __shfl_xor_sync(0xffffffffu, sq, o);
+-        if ((threadIdx.x & 31) == 0) part[threadIdx.x >> 5] = sq;
+-        __syncthreads();
+-        const float ss = part[0] + part[1] + part[2] + part[3];
+-        y *= rsqrtf(ss + eps);
+-    }
+-    h[(size_t) t * C + c] = y;
+-}
+-
+ __global__ void __launch_bounds__(S) gdn_conv_l2_multi_kernel(float* hist, const float* __restrict__ qkv,
+                                                               const float* __restrict__ w, float* __restrict__ h,
+                                                               int C, int qk_heads, float eps, int t_begin, bool commit) {
+@@ -93,37 +61,6 @@ __global__ void gdn_conv_commit_kernel(float* __restrict__ hist, const float* __
+     hist[c * 3 + 2] = seq[2];
+ }
+ 
+-// a lane's 8 weights of one uint4 against x[0..8), in gdn_ab_body's FMA order
+-__device__ __forceinline__ float gdn_ab_dot8(const uint4 wv, const float4 xa, const float4 xb, float a) {
+-    a = fmaf(__uint_as_float(wv.x << 16), xa.x, a); a = fmaf(__uint_as_float(wv.x & 0xffff0000u), xa.y, a);
+-    a = fmaf(__uint_as_float(wv.y << 16), xa.z, a); a = fmaf(__uint_as_float(wv.y & 0xffff0000u), xa.w, a);
+-    a = fmaf(__uint_as_float(wv.z << 16), xb.x, a); a = fmaf(__uint_as_float(wv.z & 0xffff0000u), xb.y, a);
+-    a = fmaf(__uint_as_float(wv.w << 16), xb.z, a); a = fmaf(__uint_as_float(wv.w & 0xffff0000u), xb.w, a);
+-    return a;
+-}
+-
+-// the lanes' partial dots of one row -> gate or beta for every token
+-template <int MAX_T, bool EXACT_T>
+-__device__ __forceinline__ void gdn_ab_finish(const float (&acc)[MAX_T], int lane, bool is_beta, int r,
+-                                              const float* __restrict__ dt, const float* __restrict__ ssm_a,
+-                                              float* __restrict__ gate, float* __restrict__ beta, int h_v, int T) {
+-#pragma unroll
+-    for (int t = 0; t < MAX_T; ++t) {
+-        if (!EXACT_T && t >= T) break;
+-        float a = acc[t];
+-#pragma unroll
+-        for (int o = 16; o > 0; o >>= 1) a += __shfl_xor_sync(0xffffffffu, a, o);
+-        if (lane != 0) continue;
+-        if (is_beta) {
+-            beta[(size_t) t * h_v + r] = 1.0f / (1.0f + __expf(-a));
+-        } else {
+-            const float v = a + dt[r];
+-            const float sp = v > 20.0f ? v : log1pf(__expf(v));
+-            gate[(size_t) t * h_v + r] = sp * ssm_a[r];
+-        }
+-    }
+-}
+-
+ template <int MAX_T = kVerifyNarrowT, bool EXACT_T = false>
+ __device__ __forceinline__ void gdn_ab_body(const int bx, const float* __restrict__ x, const uint16_t* __restrict__ wa,
+                                                           const uint16_t* __restrict__ wb,
+@@ -151,40 +88,6 @@ __device__ __forceinline__ void gdn_ab_body(const int bx, const float* __restric
+     gdn_ab_finish<MAX_T, EXACT_T>(acc, lane, is_beta, r, dt, ssm_a, gate, beta, h_v, T);
+ }
+ 
+-// STRATA_GDN_AB_ILP=1 (on by default on gfx1100, strata/core/arch_defaults.hpp): gdn_ab_body with one warp per (row,
+-// token) instead of one per row, for n = 256 * IT.  gdn_ab_body's loop runs to a kernel argument, so each of a lane's
+-// IT steps waits for its own loads: IT memory latencies in a row (6.7 us for 0.5 MB on a 7900 XTX).  Here a lane
+-// loads its IT weight chunks and its token's 2 * IT x chunks at once, then runs that token's fmaf chain: the chain
+-// gdn_ab_body's lane runs for that token (the tokens' chains never mix), followed by the same butterfly and epilogue,
+-// so gate and beta are bitwise the same.  grid (rows / 2, T), 64 threads.  The conv + a/b of a verify layer, 36 layers
+-// of cold weights in a graph, T 2..4: 8.4-9.4 -> 6.6-6.8 us a layer (4.2-5.0 inside STRATA_FUSE_CONVAB's launch).
+-template <int IT>
+-__device__ __forceinline__ void gdn_ab_body_ilp(const int bx, const int t, const float* __restrict__ x,
+-                                                const uint16_t* __restrict__ wa, const uint16_t* __restrict__ wb,
+-                                                const float* __restrict__ dt, const float* __restrict__ ssm_a,
+-                                                float* __restrict__ gate, float* __restrict__ beta, int h_v) {
+-    constexpr int n = 256 * IT;
+-    const int row = bx * 2 + (threadIdx.x >> 5), lane = threadIdx.x & 31;
+-    if (row >= 2 * h_v) return;
+-    const bool is_beta = row >= h_v;
+-    const int r = is_beta ? row - h_v : row;
+-    const uint4* w4 = reinterpret_cast<const uint4*>((is_beta ? wb : wa) + (size_t) r * n) + lane;
+-    const float4* x4 = reinterpret_cast<const float4*>(x + (size_t) t * n) + 2 * lane;
+-    uint4 wv[IT];
+-    float4 xa[IT], xb[IT];
+-#pragma unroll
+-    for (int i = 0; i < IT; ++i) {
+-        wv[i] = __ldg(w4 + 32 * i);
+-        xa[i] = __ldg(x4 + 64 * i);
+-        xb[i] = __ldg(x4 + 64 * i + 1);
+-    }
+-    float acc[1] = {0.0f};
+-#pragma unroll
+-    for (int i = 0; i < IT; ++i) acc[0] = gdn_ab_dot8(wv[i], xa[i], xb[i], acc[0]);
+-    gdn_ab_finish<1, true>(acc, lane, is_beta, r, dt, ssm_a, gate + (size_t) t * h_v, beta + (size_t) t * h_v, h_v, 1);
+-}
+-constexpr int kAbIlpIt = 10;   // n_embd 2560 (Qwen3.8 Flash-Next); another width keeps gdn_ab_body
+-
+ __global__ void __launch_bounds__(64) gdn_ab_ilp_kernel(const float* __restrict__ x, const uint16_t* __restrict__ wa,
+                                                         const uint16_t* __restrict__ wb, const float* __restrict__ dt,
+                                                         const float* __restrict__ ssm_a, float* __restrict__ gate,
+@@ -226,11 +129,8 @@ __global__ void __launch_bounds__(S) gdn_conv_ab_ilp_kernel(int conv_blocks, flo
+                                                             const uint16_t* __restrict__ wb, const float* __restrict__ dt,
+                                                             const float* __restrict__ ssm_a, float* __restrict__ gate,
+                                                             float* __restrict__ beta, int h_v) {
+-    const int ab_blocks = (2 * h_v + 1) / 2;
+-    if ((int) blockIdx.x >= ab_blocks)
+-        gdn_conv_l2_body((int) blockIdx.x - ab_blocks, (int) blockIdx.y, hist, qkv, w, h, C, qk_heads, eps, t_begin, commit);
+-    else if (threadIdx.x < 64)
+-        gdn_ab_body_ilp<kAbIlpIt>((int) blockIdx.x, (int) blockIdx.y, x, wa, wb, dt, ssm_a, gate, beta, h_v);
++    gdn_conv_ab_ilp_block((int) blockIdx.x, (int) blockIdx.y, hist, qkv, w, h, C, qk_heads, eps, t_begin, commit, x, wa, wb,
++                          dt, ssm_a, gate, beta, h_v);
+ }
+ bool ab_ilp_on() {
+     static const bool on = [] { const char* v = std::getenv("STRATA_GDN_AB_ILP"); return v != nullptr && std::atoi(v) != 0; }();
+@@ -1231,6 +1131,8 @@ void gdn_conv_l2_multi(const float* history, const float* qkv, const float* conv
+     check("gdn_conv_l2_multi");
+ }
+ 
++bool gdn_conv_ab_ilp_usable(int n_embd) { return ab_ilp_on() && n_embd == 256 * kAbIlpIt; }
++
+ void gdn_conv_ab_multi(const float* history, const float* qkv, const float* conv_w, float* h, int channels, int qk_heads,
+                        float eps, int n_tok, int t_begin, bool commit, const float* x, const uint16_t* w_alpha,
+                        const uint16_t* w_beta, const float* dt, const float* ssm_a, float* gate, float* beta, int n_embd,
+diff --git a/src/kernels/mmvq_g11_parity.cpp b/src/kernels/mmvq_g11_parity.cpp
+index cf8c517ec..75066fe75 100644
+--- a/src/kernels/mmvq_g11_parity.cpp
++++ b/src/kernels/mmvq_g11_parity.cpp
+@@ -9,6 +9,7 @@
+ // kernels are not used and the test only checks that.
+ #include "strata/kernels/iq_kernels.hpp"
+ #include "strata/kernels/native_mmvq.hpp"
++#include "strata/kernels/verify_kernels.hpp"
+ 
+ #include <cuda_runtime.h>
+ 
+@@ -16,6 +17,7 @@
+ #include <cmath>
+ #include <cstdint>
+ #include <cstdio>
++#include <cstdlib>
+ #include <cstring>
+ #include <functional>
+ #include <random>
+@@ -90,6 +92,56 @@ double time_calls(cudaStream_t s, int launches, const std::function<void(int)>&
+     return 1000.0 * t[t.size() / 2] / launches;
+ }
+ 
++// STRATA_Z_CONVAB: gdn_conv_ab_multi's inputs (the model's shape: 10240 channels, 48 value heads, 2560 inputs) and two
++// output sets, one for the plain call and one for the conv/ab blocks in front of a GEMV
++struct ConvAb {
++    static constexpr int C = 10240, HV = 48, NE = 2560, QKH = 32;
++    float *hist = nullptr, *qkv = nullptr, *cw = nullptr, *x = nullptr, *dt = nullptr, *sa = nullptr;
++    uint16_t *wa = nullptr, *wb = nullptr;
++    float* out[2][3] = {};   // [plain, role][h, gate, beta]
++    bool init(std::mt19937& rng) {
++        std::normal_distribution<float> nd(0.f, 1.f);
++        auto up = [&](float** d, std::size_t n, float scale) {
++            std::vector<float> v(n);
++            for (auto& f : v) f = scale * nd(rng);
++            return ck(cudaMalloc(d, n * 4), "malloc convab") && ck(cudaMemcpy(*d, v.data(), n * 4, cudaMemcpyHostToDevice), "copy convab");
++        };
++        auto up16 = [&](uint16_t** d, std::size_t n) {
++            std::vector<uint16_t> v(n);
++            for (auto& h : v) {
++                const float f = 0.05f * nd(rng);
++                uint32_t u;
++                std::memcpy(&u, &f, 4);
++                h = (uint16_t) (u >> 16);
++            }
++            return ck(cudaMalloc(d, n * 2), "malloc convab16") && ck(cudaMemcpy(*d, v.data(), n * 2, cudaMemcpyHostToDevice), "copy16");
++        };
++        bool ok = up(&hist, (std::size_t) C * 3, 1.f) && up(&qkv, (std::size_t) 6 * C, 1.f) && up(&cw, (std::size_t) C * 4, 0.5f) &&
++                  up(&x, (std::size_t) 6 * NE, 1.f) && up(&dt, HV, 1.f) && up(&sa, HV, 1.f) && up16(&wa, (std::size_t) HV * NE) &&
++                  up16(&wb, (std::size_t) HV * NE);
++        for (auto& o : out)
++            for (int k = 0; k < 3; ++k) ok = ok && ck(cudaMalloc(&o[k], (std::size_t) 6 * (k == 0 ? C : HV) * 4), "malloc out");
++        return ok;
++    }
++    GdnConvAbArgs args(int which, int T) const {
++        return GdnConvAbArgs{hist, qkv, cw, out[which][0], C, QKH, 1e-6f, 0, false, x, wa, wb, dt, sa, out[which][1],
++                             out[which][2], HV, T};
++    }
++    long long diff(int T) const {   // bits that differ between the two output sets
++        long long d = 0;
++        for (int k = 0; k < 3; ++k) {
++            const std::size_t n = (std::size_t) T * (k == 0 ? C : HV);
++            std::vector<uint32_t> a(n), b(n);
++            cudaMemcpy(a.data(), out[0][k], n * 4, cudaMemcpyDeviceToHost);
++            cudaMemcpy(b.data(), out[1][k], n * 4, cudaMemcpyDeviceToHost);
++            for (std::size_t i = 0; i < n; ++i) d += a[i] != b[i];
++        }
++        return d;
++    }
++};
++ConvAb g_cab;
++int g_role_runs = 0;
++
+ int run_case(const Case& c, bool bench, cudaStream_t s) {
+     const std::size_t wbytes = native_mmvq_weight_bytes(c.type, c.n_in, c.n_out);
+     std::mt19937 rng(77u + (unsigned) c.type * 31u + (unsigned) c.n_out);
+@@ -148,6 +200,29 @@ int run_case(const Case& c, bool bench, cudaStream_t s) {
+                 std::printf("FAIL %-24s T=%d grid=%d: %lld bits differ, %lld non-finite of %zu\n", c.name, T, grid, diff,
+                             nonfinite, a.size());
+             }
++            // the same GEMV with the conv/ab blocks in front (T <= 4 is where the engine fuses them; 5-6 must work too)
++            if (c.n_in == 2560) {
++                for (int k = 0; k < 2; ++k)
++                    for (int o = 0; o < 3; ++o) cudaMemsetAsync(g_cab.out[k][o], 0xff, (std::size_t) 6 * (o == 0 ? ConvAb::C : ConvAb::HV) * 4, s);
++                gdn_conv_ab_multi(g_cab.hist, g_cab.qkv, g_cab.cw, g_cab.out[0][0], ConvAb::C, ConvAb::QKH, 1e-6f, T, 0, false,
++                                  g_cab.x, g_cab.wa, g_cab.wb, g_cab.dt, g_cab.sa, g_cab.out[0][1], g_cab.out[0][2], ConvAb::NE,
++                                  ConvAb::HV, s);
++                cudaMemsetAsync(yg, 0xff, ybytes, s);
++                const bool took = native_mmvq_conv_ab(c.type, dw[0], xq, yg, c.n_in, c.n_out, T, g_cab.args(1, T), s);
++                ck(cudaStreamSynchronize(s), "role");
++                if (took) {
++                    ck(cudaMemcpy(b.data(), yg, ybytes, cudaMemcpyDeviceToHost), "read role");
++                    long long rd = 0;
++                    for (std::size_t i = 0; i < a.size(); ++i) rd += a[i] != b[i];
++                    const long long cd = g_cab.diff(T);
++                    if (rd != 0 || cd != 0) {
++                        ++bad;
++                        std::printf("FAIL %-24s T=%d grid=%d conv_ab role: GEMV %lld, conv/ab %lld bits differ\n", c.name, T,
++                                    grid, rd, cd);
++                    }
++                    ++g_role_runs;
++                }
++            }
+         }
+         if (bench && std::strstr(c.name, "odd") == nullptr) {
+             const int launches = std::max(copies, wbytes > (100u << 20) ? 8 : 64);
+@@ -177,9 +252,13 @@ int main(int argc, char** argv) {
+     cudaStream_t s;
+     cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking);
+     const char* only = std::getenv("MMVQ_G11_ONLY");   // only the cases whose name contains this
++    setenv("STRATA_GDN_AB_ILP", "1", 0);   // the conv/ab kernel the role fuses
++    std::mt19937 crng(5u);
++    if (!g_cab.init(crng)) return 1;
+     int bad = 0;
+     for (const Case& c : CASES)
+         if (only == nullptr || std::strstr(c.name, only) != nullptr) bad += run_case(c, bench, s);
++    std::printf("conv_ab role runs: %d\n", g_role_runs);
+     std::printf("%s\n", bad ? "mmvq_g11_parity: FAIL" : "mmvq_g11_parity: OK (every case, T 1-6, four grids, bitwise)");
+     return bad ? 1 : 0;
+ }

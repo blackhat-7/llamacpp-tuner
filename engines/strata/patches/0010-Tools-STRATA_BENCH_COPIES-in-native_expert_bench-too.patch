@@ -1,0 +1,263 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: blackhat-7 <44942105+blackhat-7@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 05:32:31 +0530
+Subject: [PATCH 10/33] Tools: STRATA_BENCH_COPIES in native_expert_bench,
+ tools/mtp_q2b.py
+
+Port of opt7/integrate f9c9534e and 15adaac5 onto v0.2.9: native_expert_bench's timed calls can cycle through R
+copies of the blobs (weights from VRAM, not the 96 MB Infinity Cache), with v0.2.9's BENCH_CAP launch sizing kept;
+STRATA_BENCH_DUMP writes the outputs for a cross-build bitwise compare. tools/mtp_q2b.py re-rounds the MTP routed
+experts' Q2_0 with a signed least-squares scale (drafts only; the installed drafter's experts were made with it).
+---
+ src/kernels/native_expert_bench.cpp |  32 ++++--
+ tools/mtp_q2b.py                    | 153 ++++++++++++++++++++++++++++
+ 2 files changed, 175 insertions(+), 10 deletions(-)
+ create mode 100644 tools/mtp_q2b.py
+
+diff --git a/src/kernels/native_expert_bench.cpp b/src/kernels/native_expert_bench.cpp
+index e51bf7742..06af126e4 100644
+--- a/src/kernels/native_expert_bench.cpp
++++ b/src/kernels/native_expert_bench.cpp
+@@ -101,7 +101,11 @@ int main(int argc, char** argv) {
+         const int NE = G * T;
+         // BENCH_CAP=n: the launch is sized for n possible groups (the engine passes n_tokens * K), G of them real: what the empty block rows cost
+         const int CAP = std::getenv("BENCH_CAP") ? std::max(G, std::atoi(std::getenv("BENCH_CAP"))) : G, CAPE = std::max(NE, CAP);
+-        std::vector<unsigned long long> ptr(G);
++        // STRATA_BENCH_COPIES=R: R copies of the blobs, the timed calls cycling through them, so that the weights
++        // come from VRAM as in decode rather than from the 96 MB Infinity Cache (RX 7900) or L2
++        const char* copies = std::getenv("STRATA_BENCH_COPIES");
++        const int R = copies ? std::max(1, std::atoi(copies)) : 1;
++        std::vector<unsigned long long> ptr((size_t) R * G);
+         std::vector<int32_t> start(G + 1), dst(NE), tok(NE);
+         const auto L = K::native_expert_layout(f.gu_type, f.d_type, H, FF);
+         uint8_t* dblob;
+@@ -109,18 +113,19 @@ int main(int argc, char** argv) {
+         float* dout;
+         unsigned long long* dptr;
+         int32_t *dstart, *dn, *ddst, *dtok;
+-        cudaMalloc((void**) &dblob, blobs.size());
++        cudaMalloc((void**) &dblob, (size_t) R * blobs.size());
+         cudaMalloc(&dx, x.size() * 4);
+         cudaMalloc(&dxq, (size_t) NTOK * H / 32 * 36);
+         cudaMalloc(&dscr, K::native_expert_scratch_bytes(CAPE, FF));
+         cudaMalloc((void**) &dout, (size_t) NE * H * 4);
+-        cudaMalloc((void**) &dptr, (size_t) G * 8);
++        cudaMalloc((void**) &dptr, (size_t) R * G * 8);
+         cudaMalloc((void**) &dstart, (size_t) (G + 1) * 4);
+         cudaMalloc((void**) &dn, 4);
+         cudaMalloc((void**) &ddst, (size_t) NE * 4);
+         cudaMalloc((void**) &dtok, (size_t) NE * 4);
+         for (int g = 0; g < G; ++g) {
+-            ptr[g] = (unsigned long long) (dblob + (size_t) g * f.bytes);
++            for (int c = 0; c < R; ++c)
++                ptr[(size_t) c * G + g] = (unsigned long long) (dblob + (size_t) c * blobs.size() + (size_t) g * f.bytes);
+             start[g] = g * T;
+             for (int j = 0; j < T; ++j) {
+                 dst[g * T + j] = g * T + j;
+@@ -128,17 +133,17 @@ int main(int argc, char** argv) {
+             }
+         }
+         start[G] = NE;
+-        cudaMemcpy(dblob, blobs.data(), blobs.size(), cudaMemcpyHostToDevice);
++        for (int c = 0; c < R; ++c) cudaMemcpy(dblob + (size_t) c * blobs.size(), blobs.data(), blobs.size(), cudaMemcpyHostToDevice);
+         cudaMemcpy(dx, x.data(), x.size() * 4, cudaMemcpyHostToDevice);
+-        cudaMemcpy(dptr, ptr.data(), (size_t) G * 8, cudaMemcpyHostToDevice);
++        cudaMemcpy(dptr, ptr.data(), (size_t) R * G * 8, cudaMemcpyHostToDevice);
+         cudaMemcpy(dstart, start.data(), (size_t) (G + 1) * 4, cudaMemcpyHostToDevice);
+         cudaMemcpy(dn, &G, 4, cudaMemcpyHostToDevice);
+         cudaMemcpy(ddst, dst.data(), (size_t) NE * 4, cudaMemcpyHostToDevice);
+         cudaMemcpy(dtok, tok.data(), (size_t) NE * 4, cudaMemcpyHostToDevice);
+         K::quantize_q8_1_rows((const float*) dx, NTOK, H, dxq, s);
+-        auto run = [&](int m, int phase) {
++        auto run = [&](int m, int phase, int c = 0) {
+             K::native_expert_set_mode(m, phase);
+-            K::native_expert_grouped(L, dptr, dstart, dn, ddst, dtok, CAP, CAPE, dxq, dscr, dout, s);
++            K::native_expert_grouped(L, dptr + (size_t) (c % R) * G, dstart, dn, ddst, dtok, CAP, CAPE, dxq, dscr, dout, s);
+         };
+         std::vector<float> ref((size_t) NE * H), got((size_t) NE * H);
+         cudaMemsetAsync(dout, 0xff, got.size() * 4, s);
+@@ -148,6 +153,13 @@ int main(int argc, char** argv) {
+         run(mode, 0);
+         cudaMemcpyAsync(got.data(), dout, got.size() * 4, cudaMemcpyDeviceToHost, s);
+         if (cudaStreamSynchronize(s) != cudaSuccess) { std::printf("layer %d: CUDA error\n", l); return 1; }
++        // STRATA_BENCH_DUMP=<prefix>: the mode's outputs to <prefix>.<layer>.bin, to compare two builds bit for bit
++        if (const char* dump = std::getenv("STRATA_BENCH_DUMP")) {
++            if (FILE* fp = std::fopen((std::string(dump) + "." + std::to_string(l) + ".bin").c_str(), "wb")) {
++                std::fwrite(got.data(), 4, got.size(), fp);
++                std::fclose(fp);
++            }
++        }
+         size_t ndiff = 0;
+         double worst = 0;
+         for (size_t i = 0; i < ref.size(); ++i)
+@@ -156,9 +168,9 @@ int main(int argc, char** argv) {
+                 worst = std::fmax(worst, std::fabs((double) ref[i] - got[i]) / (std::fabs((double) ref[i]) + 1e-6));
+             }
+         auto time = [&](int m, int phase) {
+-            for (int i = 0; i < 10; ++i) run(m, phase);
++            for (int i = 0; i < 10; ++i) run(m, phase, i);
+             cudaEventRecord(e0, s);
+-            for (int i = 0; i < iters; ++i) run(m, phase);
++            for (int i = 0; i < iters; ++i) run(m, phase, i);
+             cudaEventRecord(e1, s);
+             cudaEventSynchronize(e1);
+             float ms = 0;
+diff --git a/tools/mtp_q2b.py b/tools/mtp_q2b.py
+new file mode 100644
+index 000000000..7a1d1eeeb
+--- /dev/null
++++ b/tools/mtp_q2b.py
+@@ -0,0 +1,153 @@
++"""tools/mtp_q2b.py - the MTP draft layer's routed experts as experts.bin (Q2_0 blobs) with a closer Q2_0 rounding.
++
++mtp_pack.py picks each 64-weight block's scale d in [0.5, 1.0] * amax with d > 0 (relative RMS error ~0.42 on these
++experts). The Q2_0 grid {-1, 0, 1, 2} * d is asymmetric, so a NEGATIVE d puts the 2x level on the negative tail, and
++scales below amax / 2 clip the extreme weight but fit the bulk better. This searches both signs over f in
++[0.15, 1.0] * amax, then refines d by least squares for the chosen codes (two Lloyd steps), always against the stored
++fp16 scale: relative RMS error ~0.355, the same format and size. Drafts only: verification decides every token.
++
++    python tools/mtp_q2b.py --tensors <Strata-data>/mtp/tensors --out <Strata-data>/mtp/rt-q2b
++    python tools/mtp_q2b.py --tensors ... --check <Strata-data>/mtp/rt/experts.bin   (layout + error report)
++
++--tensors is the BF16 directory tools/mtp_fetch.py writes. The output directory takes dense.bin, dense.txt and
++draft_vocab.bin from an existing rt directory (copy or link them); only experts.bin is written here.
++"""
++from __future__ import annotations
++
++import argparse
++import os
++from multiprocessing import Pool
++from pathlib import Path
++
++import numpy as np
++
++H, FF, NE = 2560, 640, 512
++BLOB = 3 * (H * FF * 18 // 64)
++GU = DN = None   # BF16 memmaps, opened per process by _open
++
++
++def _open(tensors: str) -> None:
++    global GU, DN
++    t = Path(tensors)
++    GU = np.memmap(t / "mtp.layers.0.mlp.experts.gate_up_proj.bin", dtype="<u2", mode="r", shape=(NE, 2 * FF, H))
++    DN = np.memmap(t / "mtp.layers.0.mlp.experts.down_proj.bin", dtype="<u2", mode="r", shape=(NE, H, FF))
++
++
++def f32(u: np.ndarray) -> np.ndarray:
++    return (np.asarray(u).astype(np.uint32) << 16).view(np.float32)
++
++
++def quant(x: np.ndarray, fs=np.linspace(0.15, 1.0, 35, dtype=np.float32), lloyd: int = 2):
++    """x: (n, 64) float32 -> (d16 (n,) float16, codes (n, 64) uint8 0..3)"""
++    amax = np.abs(x).max(axis=1, keepdims=True)
++    best = np.full((x.shape[0], 1), np.inf, dtype=np.float32)
++    bd = np.zeros_like(amax)
++    for sgn in (1.0, -1.0):
++        for f in fs:
++            d = (amax * (f * sgn)).astype(np.float16).astype(np.float32)
++            inv = np.where(d != 0, 1.0 / np.where(d != 0, d, 1.0), 0.0)
++            q = np.clip(np.rint(x * inv), -1, 2)
++            err = ((q * d - x) ** 2).sum(axis=1, keepdims=True)
++            m = err < best
++            best = np.where(m, err, best)
++            bd = np.where(m, d, bd)
++    for _ in range(lloyd):
++        inv = np.where(bd != 0, 1.0 / np.where(bd != 0, bd, 1.0), 0.0)
++        q = np.clip(np.rint(x * inv), -1, 2)
++        qq = (q * q).sum(axis=1, keepdims=True)
++        dn = np.where(qq > 0, (q * x).sum(axis=1, keepdims=True) / np.where(qq > 0, qq, 1.0), bd)
++        dn = dn.astype(np.float16).astype(np.float32)
++        inv = np.where(dn != 0, 1.0 / np.where(dn != 0, dn, 1.0), 0.0)
++        q2 = np.clip(np.rint(x * inv), -1, 2)
++        err = ((q2 * dn - x) ** 2).sum(axis=1, keepdims=True)
++        m = err < best
++        best = np.where(m, err, best)
++        bd = np.where(m, dn, bd)
++    d16 = bd.astype(np.float16)
++    d = d16.astype(np.float32)
++    inv = np.where(d != 0, 1.0 / np.where(d != 0, d, 1.0), 0.0)
++    codes = (np.clip(np.rint(x * inv), -1, 2) + 1).astype(np.uint8)
++    return d16.reshape(-1), codes
++
++
++def rows_q2(w: np.ndarray) -> np.ndarray:
++    """(rows, n) float32 -> (rows, n // 64, 18) uint8 Q2_0 blocks (fp16 d, then 16 bytes of codes, LSB first)"""
++    r, n = w.shape
++    d16, codes = quant(w.reshape(-1, 64))
++    c = codes.reshape(-1, 16, 4)
++    packed = (c[:, :, 0] | (c[:, :, 1] << 2) | (c[:, :, 2] << 4) | (c[:, :, 3] << 6)).astype(np.uint8)
++    out = np.empty((r * n // 64, 18), dtype=np.uint8)
++    out[:, :2] = d16.view(np.uint8).reshape(-1, 2)
++    out[:, 2:] = packed
++    return out.reshape(r, n // 64, 18)
++
++
++def blob_of(gub: np.ndarray, dnb: np.ndarray) -> bytes:
++    """mtp_rt.blob_of on block arrays: gate rows 0..639 / up rows 640..1279 interleaved, codes then scales"""
++    inter = np.empty_like(gub)
++    inter[0::2] = gub[:FF]
++    inter[1::2] = gub[FF:]
++    out = b"".join([inter[:, :, 2:].tobytes(), dnb[:, :, 2:].tobytes(), inter[:, :, :2].tobytes(), dnb[:, :, :2].tobytes()])
++    assert len(out) == BLOB
++    return out
++
++
++def unblob(b: bytes):
++    """BLOB bytes -> (gate_up (1280, 2560), down (2560, 640)) float32"""
++    b = np.frombuffer(b, dtype=np.uint8)
++    ngu, nd = 2 * FF * (H // 64), H * (FF // 64)
++    cg = b[:ngu * 16].reshape(2 * FF, H // 64, 16)
++    cd = b[ngu * 16: ngu * 16 + nd * 16].reshape(H, FF // 64, 16)
++    o = ngu * 16 + nd * 16
++    sg = b[o: o + ngu * 2].copy().view(np.float16).astype(np.float32).reshape(2 * FF, H // 64, 1)
++    sd = b[o + ngu * 2: o + ngu * 2 + nd * 2].copy().view(np.float16).astype(np.float32).reshape(H, FF // 64, 1)
++
++    def dec(c, s):
++        codes = np.stack([(c >> k) & 3 for k in (0, 2, 4, 6)], axis=3).reshape(c.shape[0], c.shape[1], 64)
++        return ((codes.astype(np.float32) - 1.0) * s).reshape(c.shape[0], -1)
++
++    inter = dec(cg, sg)
++    gu = np.empty_like(inter)
++    gu[:FF] = inter[0::2]
++    gu[FF:] = inter[1::2]
++    return gu, dec(cd, sd)
++
++
++def rel(a: np.ndarray, b: np.ndarray) -> float:
++    return float(np.sqrt(((a - b) ** 2).sum() / (b ** 2).sum()))
++
++
++def one(e: int) -> bytes:
++    return blob_of(rows_q2(f32(GU[e])), rows_q2(f32(DN[e])))
++
++
++def main() -> int:
++    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
++    ap.add_argument("--tensors", required=True, help="the BF16 tensor directory from tools/mtp_fetch.py")
++    ap.add_argument("--out", help="directory to write experts.bin into")
++    ap.add_argument("--check", help="an existing experts.bin: compare experts 0, 1, 300 with this rounding")
++    ap.add_argument("--jobs", type=int, default=os.cpu_count() or 4)
++    a = ap.parse_args()
++    _open(a.tensors)
++    if a.check:
++        with open(a.check, "rb") as f:
++            for e in (0, 1, 300):
++                f.seek(e * BLOB)
++                gu, dn = unblob(f.read(BLOB))
++                ngu, ndn = unblob(one(e))
++                print(f"expert {e}: given rel err gate_up {rel(gu, f32(GU[e])):.4f} down {rel(dn, f32(DN[e])):.4f}; "
++                      f"this rounding gate_up {rel(ngu, f32(GU[e])):.4f} down {rel(ndn, f32(DN[e])):.4f}", flush=True)
++        return 0
++    out = Path(a.out)
++    out.mkdir(parents=True, exist_ok=True)
++    with Pool(a.jobs, initializer=_open, initargs=(a.tensors,)) as p, open(out / "experts.bin", "wb") as f:
++        for i, b in enumerate(p.imap(one, range(NE), chunksize=4)):
++            f.write(b)
++            if i % 64 == 0:
++                print("expert", i, flush=True)
++    print("wrote", out / "experts.bin")
++    return 0
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())

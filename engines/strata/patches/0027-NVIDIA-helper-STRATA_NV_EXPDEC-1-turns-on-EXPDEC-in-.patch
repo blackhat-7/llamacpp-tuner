@@ -1,0 +1,25 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: blackhat-7 <44942105+blackhat-7@users.noreply.github.com>
+Date: Mon, 16 Nov 2026 03:30:58 +0530
+Subject: [PATCH 27/33] NVIDIA helper: STRATA_NV_EXPDEC=1 turns on EXPDEC in
+ the plugin only (a setter, not the shared env switch)
+
+---
+ src/core/nv_helper_plugin.cu | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/src/core/nv_helper_plugin.cu b/src/core/nv_helper_plugin.cu
+index c12119ef3..dd1ae5c71 100644
+--- a/src/core/nv_helper_plugin.cu
++++ b/src/core/nv_helper_plugin.cu
+@@ -125,6 +125,10 @@ int p_open(int device, uint64_t pool_bytes, int cap_rows, int h, int ff, uint64_
+         ok(cudaMalloc((void**) &S.d_xr, (size_t) CAP * h * sizeof(float)), "rotated input") &&
+         ok(cudaMalloc((void**) &S.d_out, (size_t) CAP * h * sizeof(float)), "result") &&
+         ok(cudaMalloc(&S.d_scratch, scratch), "scratch");
++    // STRATA_NV_EXPDEC=1: the plugin's grouped experts stage their activations in LDS (EXPDEC, bitwise the same sums);
++    // a setter, not STRATA_EXPDEC, so the HIP engine's own kernels keep theirs
++    const char* xd = std::getenv("STRATA_NV_EXPDEC");
++    if (xd != nullptr && xd[0] == '1') strata::kernels::native_expert_set_expdec(1);
+     const char* tv = std::getenv("STRATA_NV_TIMING");
+     if (good && tv != nullptr && tv[0] == '1') {
+         cudaEventCreate(&S.t0);

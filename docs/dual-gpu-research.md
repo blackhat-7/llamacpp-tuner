@@ -213,12 +213,12 @@ decouple it fully. Keep PM4 graph replay off: its page faults kill the server ei
 - **4-bit experts (quality route):** today's routed experts are 2-bit (gate/up IQ2_XS/IQ2_XXS, down IQ4_NL/Q2_0).
   Hybrid pack `Strata-data/packs/swift-abl-hybrid-iq4_xs` = the abliterated dense weights + Swift 1.5 IQ4_XS experts
   (`ukisai/Swift-1.5-Qwen3.8-Flash-Next-GGUF`, 91 GiB, sha256 checked; the 96 router tensors are byte-identical, so
-  it is one model). Builder: `tmp/dual/hybrid/make_hybrid.py`. With the helper, resident RAM mode, `--spec 6`: code
+  it is one model). Builder: `engines/strata/tools/make_hybrid.py`. With the helper, resident RAM mode, `--spec 6`: code
   113 t/s (-28% vs 158): the CPU computes 3.1 bigger experts a layer. In resident mode the 4070's tier must stay
   static (`STRATA_NV_ADAPT_SWAPS=0`, `STRATA_DISJOINT_ADAPT=1`): its evicted experts are in no RAM copy, so the CPU
   re-read them from the SSD (28 t/s).
 
-### Quality: the 2-bit `down` projections were the damage (`bench/strata-packs/`, Strata's `tools/quant_quality.py`)
+### Quality: the 2-bit `down` projections were the damage (`engines/strata/tools/`, Strata's `tools/quant_quality.py`)
 
 Teacher-forced on Strata's fixed set (code, docs, English, multilingual, agent transcripts; 4,995 positions), the full
 4-bit hybrid as reference. Perplexity of the text, lower is better. Expert bytes vs today's 40.0 GiB.
@@ -234,7 +234,7 @@ Teacher-forced on Strata's fixed set (code, docs, English, multilingual, agent t
 | full: ukisai IQ4_XS (gate/up IQ4_XS, down IQ4_NL, all layers) | 60.9 | reference | reference | 3.986 |
 
 Rank by top-1 and KL (`quant_quality.py compare ... --segments`): the perplexity over all five segments is noisy (the
-agent segment), and it hid that B halves D's KL again. mixD (`Strata-data/packs/swift-abl-mixD`, `mix_down.py`: v4
+agent segment), and it hid that B halves D's KL again. mixD (`Strata-data/packs/swift-abl-mixD`, `engines/strata/tools/mix_down.py`: v4
 per-role shards, gate/up from the abliterated GGUF, down from the IQ4_XS shards) is the pick at today's speed; B
 (`swift-abl-mixB`, built) is the next candidate: +9.4 GiB of arena, server speed untested. The full 4-bit set does not
 fit RAM as an arena (resident mode: code 113 t/s). With the dual configs' tail skip + HC_Q8, mixD stays at 85.3% / 0.184.

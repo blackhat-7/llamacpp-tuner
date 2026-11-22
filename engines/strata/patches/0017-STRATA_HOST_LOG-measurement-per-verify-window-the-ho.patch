@@ -1,0 +1,70 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: blackhat-7 <44942105+blackhat-7@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 07:40:57 +0530
+Subject: [PATCH 17/33] STRATA_HOST_LOG (measurement): per verify window, the
+ host ms and the host thread's faults, context switches and CPU time
+
+A line per window with a CLOCK_MONOTONIC stamp, so a slow window can be matched to what the kernel and the
+disk did at that moment (tmp/strata-opt/r11/hostwatch.py samples beside it). Used to find that the
+spoiled decode runs of this box wait on PLE pages whose SSD read is in flight while other processes write
+to the same drive, not on memory compaction.
+---
+ src/program/generate.cpp | 24 ++++++++++++++++++++++++
+ 1 file changed, 24 insertions(+)
+
+diff --git a/src/program/generate.cpp b/src/program/generate.cpp
+index 0b0959e42..90bd9810a 100644
+--- a/src/program/generate.cpp
++++ b/src/program/generate.cpp
+@@ -108,6 +108,7 @@
+ #include <execinfo.h>
+ #include <fcntl.h>
+ #include <signal.h>
++#include <sys/resource.h>
+ #include <unistd.h>
+ #endif
+ #include "strata/program/pipe_probe.hpp"
+@@ -18618,6 +18619,14 @@ int main(int argc, char** argv) {
+         // STRATA_SPEC_LOG=<file> (measurement): a line per window - position, size, MTP part, lookup, drafts accepted,
+         // drafts made after it, round / verify / draft ms, then the draft probabilities the window was sized from
+         std::FILE* const spec_log = [] { const char* e = std::getenv("STRATA_SPEC_LOG"); return e && *e ? std::fopen(e, "w") : nullptr; }();
++#if defined(__linux__)
++        // STRATA_HOST_LOG=<file> (measurement): a line per window - CLOCK_MONOTONIC ms at its end, position, size, round ms,
++        // the verifier's host ms, and over the round the host thread's minor / major page faults, voluntary / involuntary
++        // context switches and user / system CPU ms (getrusage RUSAGE_THREAD), to tell a host stall's cause apart
++        std::FILE* const host_log = [] { const char* e = std::getenv("STRATA_HOST_LOG"); return e && *e ? std::fopen(e, "w") : nullptr; }();
++        struct rusage ru0 {};
++        double host_ms0 = 0;
++#endif
+         std::vector<float> wprob;
+         strata::spec::DraftCumAdapt cum_adapt;   // STRATA_SPEC_CUM_ADAPT: this run's threshold
+         int n_drafts_last = 0;   // the drafts the last mtp.draft made (STRATA_SPEC_LOG)
+@@ -18685,6 +18694,9 @@ int main(int argc, char** argv) {
+         int win_cap = o.spec;   // the widest window the VRAM allows (lowered on an out-of-memory capture, see below)
+         while ((int64_t) produced.size() < max_new) {
+             const Clock::time_point t0 = Clock::now();
++#if defined(__linux__)
++            if (host_log != nullptr) { getrusage(RUSAGE_THREAD, &ru0); host_ms0 = ver.ms_host; }
++#endif
+         retry_round:
+             strata::core::progress_at("spec loop: choosing the window", (int64_t) produced.size());
+             int T = S_mtp;
+@@ -18887,6 +18899,18 @@ int main(int argc, char** argv) {
+                 for (int i = 0; i < S_mtp - 1; ++i) std::fprintf(spec_log, " %.4f", wprob[(size_t) i]);
+                 std::fprintf(spec_log, "\n");
+             }
++#if defined(__linux__)
++            if (host_log != nullptr) {
++                struct rusage ru1 {};
++                getrusage(RUSAGE_THREAD, &ru1);
++                auto tv_ms = [](const timeval& a, const timeval& b) { return (double) (b.tv_sec - a.tv_sec) * 1e3 + (double) (b.tv_usec - a.tv_usec) / 1e3; };
++                timespec now {};
++                clock_gettime(CLOCK_MONOTONIC, &now);
++                std::fprintf(host_log, "H %.3f %lld %d %.3f %.3f %ld %ld %ld %ld %.3f %.3f\n", (double) now.tv_sec * 1e3 + (double) now.tv_nsec / 1e6,
++                             (long long) p, T, round_ms, ver.ms_host - host_ms0, ru1.ru_minflt - ru0.ru_minflt, ru1.ru_majflt - ru0.ru_majflt,
++                             ru1.ru_nvcsw - ru0.ru_nvcsw, ru1.ru_nivcsw - ru0.ru_nivcsw, tv_ms(ru0.ru_utime, ru1.ru_utime), tv_ms(ru0.ru_stime, ru1.ru_stime));
++            }
++#endif
+             x = outv[(size_t) a];
+             p += a + 1;
+             total_ms += round_ms;

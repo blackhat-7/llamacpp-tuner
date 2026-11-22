@@ -1,0 +1,40 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: blackhat-7 <44942105+blackhat-7@users.noreply.github.com>
+Date: Mon, 16 Nov 2026 02:49:38 +0530
+Subject: [PATCH 25/33] NVIDIA helper: STRATA_NV_RESERVE_MIB (default 1536)
+ stays free on the card
+
+The 4070 also drives the desktop; 512 MiB (the CUDA helpers' allowance on a card of their own) left a browser
+little room.
+---
+ src/core/remote_experts.cpp | 10 +++++++---
+ 1 file changed, 7 insertions(+), 3 deletions(-)
+
+diff --git a/src/core/remote_experts.cpp b/src/core/remote_experts.cpp
+index 76025dae3..e149a831e 100644
+--- a/src/core/remote_experts.cpp
++++ b/src/core/remote_experts.cpp
+@@ -385,8 +385,11 @@ bool RemoteExperts::open_nv(int slots, int64_t layers, int64_t experts,
+         return fail("need ranked experts and a positive slot count");
+     size_t free_bytes = 0;
+     if (nv->preflight(nv_device(), nv_spin() ? 1 : 0, &free_bytes) != 0) return fail(nv->last_error());
+-    // the staging, scratch and the CUDA context's later allocations: keep 512 MiB free, as the CUDA helpers do
+-    const uint64_t keep = (512ull << 20) + (uint64_t) CAP * H * sizeof(float) * 3;
++    // the staging, scratch, the CUDA context's later allocations and the desktop this card may also drive:
++    // STRATA_NV_RESERVE_MIB stays free (default 1536; the CUDA helpers keep 512 on a card of their own)
++    const char* rv = std::getenv("STRATA_NV_RESERVE_MIB");
++    const uint64_t reserve_mib = rv != nullptr && rv[0] != '\0' ? (uint64_t) std::atoll(rv) : 1536;
++    const uint64_t keep = (reserve_mib << 20) + (uint64_t) CAP * H * sizeof(float) * 3;
+     std::vector<std::pair<int32_t, int32_t>> selected;
+     std::vector<uint64_t> off;
+     std::vector<uint8_t> picked(claimed.size(), 0);
+@@ -404,7 +407,8 @@ bool RemoteExperts::open_nv(int slots, int64_t layers, int64_t experts,
+         if ((int) selected.size() >= slots) break;
+     }
+     if (selected.empty()) return fail("no unclaimed expert fits");
+-    if (needed + keep > free_bytes) return fail("the slots leave less than 512 MiB free; lower --expert-cache-device1");
++    if (needed + keep > free_bytes)
++        return fail("the slots leave less than STRATA_NV_RESERVE_MIB free; lower --expert-cache-device1");
+     if (nv->open(nv_device(), needed, (int) CAP, (int) H, (int) FF, sizeof(RemoteMeta)) != 0)
+         return fail(nv->last_error());
+     nv_ = nv;

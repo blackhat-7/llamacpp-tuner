@@ -1,0 +1,1106 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: blackhat-7 <44942105+blackhat-7@users.noreply.github.com>
+Date: Mon, 16 Nov 2026 01:27:06 +0530
+Subject: [PATCH 23/33] NVIDIA helper for the HIP engine: a CUDA plugin serves
+ --expert-cache-device1
+
+STRATA_NV_HELPER=libstrata_nvhelper.so (target strata_nvhelper in a CUDA build of this tree) makes the helper tier an
+NVIDIA card while the primary stays HIP: the plugin is dlopen'ed (RTLD_LOCAL, only snv_api exported), owns the card's
+expert slots, and runs the grouped expert kernels on it; everything crosses through pinned host memory, as the
+same-make helpers do.  Measured on an RX 7900 XTX + RTX 4070 (Swift IQ3_XXS, generate mode, priced windows):
+static ranking code +11%, prose +20%, edit +40%; with the adaptive tiers on code +4%, prose +3%, edit +26%.
+
+- per layer: the engine quantizes the rows to q8_1 on the CPU (bit for bit the GPU quantizer: tmp parity test), one
+  kernel stages metadata and rows onto the card, the grouped kernels run, one kernel writes the rows back in 16-byte
+  stores (the down kernel's 4-byte writes over the chipset's x4 link cost 3x the compute)
+- adaptive tier on the card (adapt_nv): hot CPU misses replace its coldest experts and its copies of experts the
+  primary now holds; fills on their own copy stream from the arena, pinned for CUDA too
+- the launch runs inside the CPU pool's first phase (pool pre-drain hook); STRATA_NV_PRE_DRAIN=0 for the old order
+- STRATA_NV_TIMING=1: the card's own time per step; STRATA_NV_ADAPT_SWAPS: its swaps a round
+- sm_89 joins sm_120 in the fused gate/up + SwiGLU default (CUDA builds only)
+---
+ CMakeLists.txt                         |  10 +
+ include/strata/core/nv_helper_abi.h    |  59 +++++
+ include/strata/core/remote_experts.hpp |  41 ++-
+ include/strata/kernels/cpu/pool.hpp    |   7 +
+ src/core/expert_source.cpp             |  28 +-
+ src/core/nv_helper_plugin.cu           | 251 ++++++++++++++++++
+ src/core/remote_experts.cpp            | 347 ++++++++++++++++++++++++-
+ src/kernels/cpu/pool.cpp               |   5 +
+ src/kernels/cuda/iq_kernels.cu         |   3 +-
+ src/program/generate.cpp               |  40 ++-
+ 10 files changed, 776 insertions(+), 15 deletions(-)
+ create mode 100644 include/strata/core/nv_helper_abi.h
+ create mode 100644 src/core/nv_helper_plugin.cu
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index ea6c7dc7a..80fe789e0 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -509,6 +509,16 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
+                           src/ngram/ple_reader.cpp
+                           src/platform/direct_file.cpp)
+   target_link_libraries(strata_kernels PUBLIC strata_core strata_artifact)
++  # The cross-vendor expert helper's CUDA side (include/strata/core/nv_helper_abi.h): a plugin a HIP engine loads
++  # with dlopen (STRATA_NV_HELPER) to compute the experts an NVIDIA card holds.  Built on request only.
++  if(STRATA_ENABLE_CUDA)
++    add_library(strata_nvhelper SHARED EXCLUDE_FROM_ALL src/core/nv_helper_plugin.cu)
++    target_link_libraries(strata_nvhelper PRIVATE strata_kernels CUDA::cudart_static)
++    set_target_properties(strata_nvhelper PROPERTIES CUDA_VISIBILITY_PRESET hidden CXX_VISIBILITY_PRESET hidden
++                                                     POSITION_INDEPENDENT_CODE ON)
++    # only snv_api leaves the plugin: the kernels' symbols must not bind to the HIP engine's namesakes
++    target_link_options(strata_nvhelper PRIVATE -Wl,--exclude-libs,ALL -Wl,-Bsymbolic -Wl,--no-undefined)
++  endif()
+   # Exact gfx1100 prompt scorer (PR1825 method port): optional standalone test,
+   # also available where the published source omits tests/.
+   option(STRATA_PARITY_GFX1100_QSA_SCORES "Build the exact gfx1100 QSA score/ID check" OFF)
+diff --git a/include/strata/core/nv_helper_abi.h b/include/strata/core/nv_helper_abi.h
+new file mode 100644
+index 000000000..a3bf09cb0
+--- /dev/null
++++ b/include/strata/core/nv_helper_abi.h
+@@ -0,0 +1,59 @@
++// include/strata/core/nv_helper_abi.h - the cross-vendor expert helper: an NVIDIA card serving a HIP engine's
++// --expert-cache-device1 tier.  HIP and CUDA cannot share a build, so the CUDA side is a plugin
++// (libstrata_nvhelper.so, built by tools/nvhelper/build.sh) that the HIP engine loads with dlopen when
++// STRATA_NV_HELPER names it.  Everything crosses through pinned host memory, as the same-make helpers do.
++// Plain C: the two sides are built by different compilers.
++#pragma once
++
++#include <stddef.h>
++#include <stdint.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++#define SNV_ABI 5
++
++/// One layer's expert format (strata::kernels::cpu::NativeFmt's fields the GPU kernels read).
++typedef struct SnvFmt {
++    int gu_type, d_type;
++    int64_t n_embd, n_ff;
++    int had_gu, had_d, had_block;
++} SnvFmt;
++
++typedef struct SnvApi {
++    int abi;
++    /// Card number as CUDA counts it; spin = busy-wait syncs (the layer waits on this card).  Fills *free_bytes.
++    int (*preflight)(int device, int spin, size_t* free_bytes);
++    /// pool_bytes of VRAM for expert slots, staging for cap_rows rows of h floats, meta_bytes of group metadata.
++    int (*open)(int device, uint64_t pool_bytes, int cap_rows, int h, int ff, uint64_t meta_bytes);
++    void (*close)(void);
++    uint64_t (*pool_base)(void);   ///< device address of slot offset 0, for the metadata's blob pointers
++    float* (*host_x)(void);        ///< pinned: the layer's activations, n_tok x h
++    float* (*host_out)(void);      ///< pinned: the computed rows, packed in metadata order
++    void* (*host_meta)(void);      ///< pinned: the group metadata, copied to the card at each launch
++    int (*fill)(uint64_t off, const void* src, uint64_t bytes, int wait);
++    /// Pin host memory for the card's copy engine (the expert arena), so swap fills are DMA, not staged.
++    int (*register_host)(void* p, uint64_t bytes);
++    /// The adaptive tier: queue a slot fill on the card's own copy stream (beside the experts' launches)...
++    int (*swap_fill)(uint64_t off, const void* src, uint64_t bytes);
++    /// ...and 1 once every queued swap fill has landed, 0 while one is in flight, -1 on an error.
++    int (*swap_done)(void);
++    int (*read)(uint64_t off, void* dst, uint64_t bytes);   ///< card -> host, waits
++    int (*set_signs)(const float* sx, int h, const float* sh, int ff);
++    /// Run the grouped experts on host_x, write host_out.  x_q8: host_x holds the n_tok rows as q8_1 blocks (the
++    /// engine quantized them), else as floats the card quantizes.  Returns at once; wait() joins.
++    int (*launch)(const SnvFmt* fmt, int n_tok, int groups, int rows, int x_q8);
++    int (*wait)(void);
++    /// STRATA_NV_TIMING=1: the card's own time from a launch's first copy to its last write, summed over the launches
++    /// waited for (cudaEvent stamps; 0 when off).
++    double (*gpu_ms)(void);
++    const char* (*last_error)(void);
++} SnvApi;
++
++/// The plugin's one exported symbol.
++const SnvApi* snv_api(void);
++
++#ifdef __cplusplus
++}
++#endif
+diff --git a/include/strata/core/remote_experts.hpp b/include/strata/core/remote_experts.hpp
+index ed24d17fb..86830fb1b 100644
+--- a/include/strata/core/remote_experts.hpp
++++ b/include/strata/core/remote_experts.hpp
+@@ -12,6 +12,8 @@
+ #include <utility>
+ #include <vector>
+ 
++struct SnvApi;   // strata/core/nv_helper_abi.h
++
+ namespace strata::core {
+ class RemoteExpertOpt;
+ 
+@@ -27,6 +29,10 @@ public:
+     /// Initialise the device before the host expert arena registers
+     /// tens of GiB of portable mapped memory with CUDA.
+     static bool preflight(int device, double& free_gib, std::string& err);
++    /// STRATA_NV_HELPER=path/libstrata_nvhelper.so: the helper tier lives on an NVIDIA card (CUDA ordinal
++    /// STRATA_NV_DEVICE, default 0) served by the CUDA plugin, so a HIP engine gets a CUDA helper.  Loaded once;
++    /// nullptr when unset, or when loading failed (`err` says why).
++    static const SnvApi* nv_helper(std::string* err = nullptr);
+     bool open(int device, int slots, int64_t layers, int64_t experts,
+               const std::vector<std::pair<int32_t, int32_t>>& ranked,
+               const ExpertCache& primary, ExpertSource& source,
+@@ -38,15 +44,20 @@ public:
+     bool begin(int64_t layer, const float* x, const int32_t* ids, int64_t n_tok,
+                int64_t k, const int32_t* kind, const int32_t* primary_res,
+                std::string& err);
++    /// begin() in two steps: claim() decides this helper's rows (owns() answers after it), dispatch() stages
++    /// them and launches, so a caller can launch while the CPU pool already works.
++    bool claim(int64_t layer, const int32_t* ids, int64_t n_tok, int64_t k, const int32_t* kind,
++               const int32_t* primary_res, std::string& err);
++    bool dispatch(int64_t layer, const float* x, int64_t n_tok, std::string& err);
+     bool owns(int64_t index) const { return owned_[(size_t) index] != 0; }
+     /// This helper's cache holds (layer, expert): begin() will take its rows unless the plan gave them away.
+-    bool holds(int64_t layer, int32_t expert) const { return cache_.slot_of(layer, expert) >= 0; }
++    bool holds(int64_t layer, int32_t expert) const { return slot_of(layer, expert) >= 0; }
+     bool optimized_decode() const { return remote_opt_ != nullptr; }
+     bool finish(float* out, std::string& err);
+-    int64_t resident() const { return cache_.resident(); }
++    int64_t resident() const { return nv_ ? (int64_t) nv_off_.size() : cache_.resident(); }
+     int64_t computed() const { return computed_; }
+     int64_t launched_layers() const { return launched_layers_; }
+-    double gib() const { return cache_.gib(); }
++    double gib() const { return nv_ ? (double) nv_pool_bytes_ / 1073741824.0 : cache_.gib(); }
+     uint64_t returned_bytes() const { return returned_bytes_; }
+     uint64_t full_row_bytes() const { return full_row_bytes_; }
+     /// host time spent in begin() (staging + launches) and in finish() (waiting for this GPU), cumulative
+@@ -62,12 +73,36 @@ public:
+     bool copy_cached_blobs(const int32_t* layers, const int32_t* experts, uint8_t* const* dst, size_t n,
+                            uint8_t* hit, std::string& err);
+ 
++    /// The NVIDIA helper's adaptive tier, at the primary's adapt rounds: per layer, experts no GPU holds (routed
++    /// `usage` >= 2) replace the helper's least-routed ones, and first its copies of experts the primary now holds
++    /// (`primary_res` >= 0 or in `pending`, the primary's swaps in flight).  The fills run on the card's copy stream;
++    /// a swapped-in expert is used once its fill has landed (checked at the next round), the evicted one at once
++    /// goes back to the CPU.  Up to `max_swaps` a round, by gain.  No-op outside NV mode.
++    bool adapt_nv(const std::vector<float>& usage, const std::vector<int32_t>& primary_res,
++                  const std::vector<std::pair<int32_t, int32_t>>& pending, int max_swaps, float min_gain,
++                  ExpertSource& source, std::string& err);
++    int64_t swapped() const { return nv_swapped_; }
++    double nv_gpu_ms() const;   ///< STRATA_NV_TIMING=1: the NVIDIA card's own time in the launches (0 otherwise)
++
+ private:
+     friend class RemoteExpertOpt;
++    int32_t slot_of(int64_t layer, int32_t expert) const {
++        return nv_ ? nv_res_[(size_t) layer * (size_t) n_expert_ + (size_t) expert] : cache_.slot_of(layer, expert);
++    }
++    bool open_nv(int slots, int64_t layers, int64_t experts, const std::vector<std::pair<int32_t, int32_t>>& ranked,
++                 const ExpertCache& primary, ExpertSource& source, std::vector<uint8_t>& claimed, std::string& err,
++                 bool auto_size);
++    const SnvApi* nv_ = nullptr;          ///< set: the slots live on an NVIDIA card (nv_helper())
++    std::vector<int32_t> nv_res_;         ///< NV: (layer, expert) -> slot, or -1
++    std::vector<uint64_t> nv_off_;        ///< NV: slot -> byte offset in the plugin's pool
++    uint64_t nv_pool_bytes_ = 0;
++    std::vector<std::pair<int32_t, int32_t>> nv_landing_;   ///< NV swaps in flight: (residency index, slot)
++    int64_t nv_swapped_ = 0;
+     RemoteExpertOpt* remote_opt_ = nullptr;
+     int device_ = -1;
+     int64_t n_expert_ = 0;
+     int32_t groups_ = 0;
++    int64_t claimed_n_ = 0;   ///< the window's routed entries at the last claim()
+     int64_t computed_ = 0;
+     int64_t launched_layers_ = 0;
+     uint64_t returned_bytes_ = 0;
+diff --git a/include/strata/kernels/cpu/pool.hpp b/include/strata/kernels/cpu/pool.hpp
+index d51377a8e..b04108ffa 100644
+--- a/include/strata/kernels/cpu/pool.hpp
++++ b/include/strata/kernels/cpu/pool.hpp
+@@ -252,6 +252,11 @@ public:
+     void run_split_multi_native(const NativeFmt& f, ExpertJobMulti* jobs, int n,
+                                 NativeArithmetic arithmetic = NativeArithmetic::Default);
+     static constexpr int kMaxSplitMulti = 96;
++    /// Run once by the host thread right after the next phase's tasks are published, before it drains its own share:
++    /// the workers start meanwhile.  The NVIDIA helper's launch goes here, off the layer's critical path.
++    void set_pre_drain(void (*fn)(void*), void* ctx) { pre_drain_fn_ = fn; pre_drain_ctx_ = ctx; }
++    /// Whether a hook set by set_pre_drain has not run yet (the call took no phase).
++    bool pre_drain_pending() const { return pre_drain_fn_ != nullptr; }
+     /// run_split_multi's phases, accumulated ms: gate/up rows, the intermediate quantization, down rows.
+     double ms_multi_gu = 0, ms_multi_q = 0, ms_multi_down = 0;
+     int64_t multi_bytes = 0;
+@@ -287,6 +292,8 @@ public:
+     static constexpr std::chrono::seconds kStall{60};
+ 
+ private:
++    void (*pre_drain_fn_)(void*) = nullptr;
++    void* pre_drain_ctx_ = nullptr;
+     /// STRATA_POOL_PROF=1: where each thread's time in the rows phases goes - computing, waking after the publish,
+     /// waiting for the phase's last task - printed when the pool ends.  Off, it costs one branch per task.
+     struct alignas(64) ThreadProf {
+diff --git a/src/core/expert_source.cpp b/src/core/expert_source.cpp
+index f4d41e180..e1f466489 100644
+--- a/src/core/expert_source.cpp
++++ b/src/core/expert_source.cpp
+@@ -5055,10 +5055,25 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
+             return;
+         }
+     }
++    // the helpers' rows first (claim); their launch (dispatch) waits for the CPU pool's first phase below, when the
++    // pool has work: the workers start meanwhile, so the launch leaves the layer's critical path
++    struct HelperLaunch {
++        ExpertDispatch* d;
++        const float* x;
++        int64_t n_tok;
++        bool failed = false, done = false;
++        static void run(void* p) {
++            auto& h = *(HelperLaunch*) p;
++            h.done = true;
++            static thread_local std::string e;
++            for (int r = 0; r < h.d->remote_count && !h.failed; ++r)
++                if (!h.d->remote[r]->dispatch(h.d->layers, h.x, h.n_tok, e)) { h.failed = true; h.d->fail = e.c_str(); }
++        }
++    } helper_launch{&d, x_f, n_tok};
+     if (d.remote_count > 0) {
+         static thread_local std::string remote_error;
+         for (int r = 0; r < d.remote_count; ++r) {
+-            if (!d.remote[r]->begin(d.layers, x_f, ids, n_tok, k, kind, d.host_res, remote_error)) {
++            if (!d.remote[r]->claim(d.layers, ids, n_tok, k, kind, d.host_res, remote_error)) {
+                 d.failed = true; d.fail = remote_error.c_str(); d.fail_layer = d.layers; return;
+             }
+             for (int64_t i = 0; i < n; ++i) if (d.remote[r]->owns(i)) kind[i] = 2;
+@@ -5123,6 +5138,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
+             }
+         }
+     }
++    if (d.remote_count > 0 && npend > 0) HelperLaunch::run(&helper_launch);   // 149-cold batches: launch before them
+     // the CPU's experts this batch takes: all (mode 0, or no read), else by their state (want 0: the ready ones,
+     // want 2: those that landed since the last batch)
+     auto take = [&](int64_t e, uint8_t want) {
+@@ -5263,10 +5279,20 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
+     const auto c3 = std::chrono::steady_clock::now();
+     if (d.plan != nullptr) d.plan->cpu_jobs = njobs;
+     pt("run", njobs);
++    // STRATA_NV_PRE_DRAIN=0: launch the helpers before the pool instead (the old order, for A/B)
++    static const bool pre_drain = [] { const char* v = std::getenv("STRATA_NV_PRE_DRAIN"); return !(v && v[0] == '0'); }();
++    if (d.remote_count > 0 && !helper_launch.done && !pre_drain) HelperLaunch::run(&helper_launch);
++    if (d.remote_count > 0 && !helper_launch.done && njobs > 0 && npend == 0)
++        d.pool->set_pre_drain(&HelperLaunch::run, &helper_launch);
+     if (njobs > 0 && npend == 0) {
+         if (native) d.pool->run_split_multi_native(lay.fmt[(size_t) d.layers], d.jobs_multi.data(), njobs, arithmetic);
+         else d.pool->run_split_multi(d.jobs_multi.data(), njobs);
+     }
++    if (d.remote_count > 0 && !helper_launch.done) {   // no pool phase ran: launch now
++        d.pool->set_pre_drain(nullptr, nullptr);
++        HelperLaunch::run(&helper_launch);
++    }
++    if (helper_launch.failed) { d.failed = true; d.fail_layer = d.layers; return; }
+     if (d.remote_count > 0) {
+         static thread_local std::string remote_error;
+         for (int r = 0; r < d.remote_count; ++r)
+diff --git a/src/core/nv_helper_plugin.cu b/src/core/nv_helper_plugin.cu
+new file mode 100644
+index 000000000..c12119ef3
+--- /dev/null
++++ b/src/core/nv_helper_plugin.cu
+@@ -0,0 +1,251 @@
++// src/core/nv_helper_plugin.cu - the CUDA side of the cross-vendor expert helper (nv_helper_abi.h).  Built into
++// libstrata_nvhelper.so by the CUDA configuration (target strata_nvhelper); a HIP engine loads it to compute the
++// experts an NVIDIA card holds.  It runs the same kernels the CUDA engine's RemoteExperts runs, on one stream.
++#include "strata/core/nv_helper_abi.h"
++#include "strata/kernels/iq_kernels.hpp"
++#include "strata/kernels/window_limits.hpp"
++
++#include <cuda_runtime.h>
++
++#include <algorithm>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <string>
++
++namespace {
++constexpr int CAP = strata::kernels::kWindowMaxT * 10;   // a window's rows x top-10, as RemoteExperts sizes it
++
++// RemoteExperts' metadata layout (remote_experts.cpp), filled by the HIP side in host_meta().
++struct Meta {
++    unsigned long long ptr[CAP];
++    int32_t start[CAP + 1];
++    int32_t dst[CAP];
++    int32_t tok[CAP];
++    int32_t count;
++};
++
++struct State {
++    int dev = -1, h = 0, ff = 0;
++    cudaStream_t s = nullptr, rs = nullptr, fs = nullptr;
++    cudaEvent_t fill_ev = nullptr, t0 = nullptr, t1 = nullptr, tq = nullptr, tg = nullptr;   // STRATA_NV_TIMING
++    double gpu_ms = 0, q_ms = 0, g_ms = 0, c_ms = 0;
++    bool fills_queued = false;
++    uint8_t* pool = nullptr;
++    float *h_x = nullptr, *h_out = nullptr, *z_x = nullptr, *z_out = nullptr, *d_xr = nullptr, *d_out = nullptr;
++    void *h_meta = nullptr, *z_meta = nullptr, *d_meta = nullptr, *d_scratch = nullptr;
++    uint8_t* d_q8 = nullptr;
++    const float *d_sx = nullptr, *d_sh = nullptr;
++    std::string err;
++} S;
++
++// A layer's inputs onto the card in one pass over the link: the metadata's used entries and the q8_1 rows.  The
++// grouped kernels then read card memory; read in place, every block would cross the link again for them.
++__global__ void stage_in(const Meta* __restrict__ hm, Meta* __restrict__ dm, const int4* __restrict__ hx,
++                         int4* __restrict__ dx, int groups, int rows, int nx16) {
++    const int t = blockIdx.x * blockDim.x + threadIdx.x, nt = gridDim.x * blockDim.x;
++    for (int i = t; i < nx16; i += nt) dx[i] = hx[i];
++    for (int i = t; i < groups; i += nt) dm->ptr[i] = hm->ptr[i];
++    for (int i = t; i <= groups; i += nt) dm->start[i] = hm->start[i];
++    for (int i = t; i < rows; i += nt) { dm->dst[i] = hm->dst[i]; dm->tok[i] = hm->tok[i]; }
++    if (t == 0) dm->count = hm->count;
++}
++
++// The rows to the host in 16-byte stores: the down kernel writes one float per warp, and 4-byte writes over the
++// chipset's PCIe x4 link cost several times the whole layer's compute.
++__global__ void rows_to_host(const float4* __restrict__ src, float4* __restrict__ dst, int n4) {
++    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n4; i += gridDim.x * blockDim.x) dst[i] = src[i];
++}
++
++bool ok(cudaError_t e, const char* what) {
++    if (e == cudaSuccess) return true;
++    S.err = std::string(what) + ": " + cudaGetErrorString(e);
++    cudaGetLastError();
++    return false;
++}
++
++int p_preflight(int device, int spin, size_t* free_bytes) {
++    // The layer waits on this card from the CPU pool's critical path: spin instead of sleeping (only possible
++    // before the context exists).
++    if (spin) cudaInitDevice(device, cudaDeviceScheduleSpin | cudaDeviceMapHost, 0);
++    cudaGetLastError();
++    size_t total = 0;
++    if (!ok(cudaSetDevice(device), "cudaSetDevice") || !ok(cudaMemGetInfo(free_bytes, &total), "cudaMemGetInfo"))
++        return -1;
++    return 0;
++}
++
++
++void p_close() {
++    if (S.dev < 0) return;
++    cudaSetDevice(S.dev);
++    if (S.s) cudaStreamSynchronize(S.s);
++    if (S.rs) cudaStreamSynchronize(S.rs);
++    if (S.fs) cudaStreamSynchronize(S.fs);
++    for (void* p : {(void*) S.pool, S.d_meta, (void*) S.d_scratch, (void*) S.d_q8, (void*) S.d_xr, (void*) S.d_out})
++        if (p) cudaFree(p);
++    for (void* p : {(void*) S.h_x, (void*) S.h_out, S.h_meta})
++        if (p) cudaFreeHost(p);
++    if (S.s) cudaStreamDestroy(S.s);
++    if (S.rs) cudaStreamDestroy(S.rs);
++    if (S.fs) cudaStreamDestroy(S.fs);
++    if (S.fill_ev) cudaEventDestroy(S.fill_ev);
++    if (S.t0) cudaEventDestroy(S.t0);
++    if (S.t1) cudaEventDestroy(S.t1);
++    if (S.tq) cudaEventDestroy(S.tq);
++    if (S.tg) cudaEventDestroy(S.tg);
++    S = State{};
++}
++
++int p_open(int device, uint64_t pool_bytes, int cap_rows, int h, int ff, uint64_t meta_bytes) {
++    p_close();
++    if (cap_rows != CAP || meta_bytes != sizeof(Meta)) {
++        S.err = "the engine and the plugin were built with different window sizes (STRATA_VERIFY_MAX_T)";
++        return -1;
++    }
++    S.dev = device;
++    S.h = h;
++    S.ff = ff;
++    const size_t scratch = strata::kernels::native_expert_scratch_bytes(CAP, ff);
++    const bool good =
++        ok(cudaSetDevice(device), "cudaSetDevice") &&
++        ok(cudaStreamCreateWithFlags(&S.s, cudaStreamNonBlocking), "stream") &&
++        ok(cudaStreamCreateWithFlags(&S.rs, cudaStreamNonBlocking), "read stream") &&
++        ok(cudaStreamCreateWithFlags(&S.fs, cudaStreamNonBlocking), "swap stream") &&
++        ok(cudaEventCreateWithFlags(&S.fill_ev, cudaEventDisableTiming), "swap event") &&
++        ok(cudaMalloc((void**) &S.pool, pool_bytes), "expert slots") &&
++        ok(cudaHostAlloc((void**) &S.h_x, (size_t) CAP * h * sizeof(float), cudaHostAllocPortable | cudaHostAllocMapped), "input staging") &&
++        ok(cudaHostAlloc((void**) &S.h_out, (size_t) CAP * h * sizeof(float), cudaHostAllocPortable | cudaHostAllocMapped), "result staging") &&
++        ok(cudaHostAlloc(&S.h_meta, sizeof(Meta), cudaHostAllocPortable | cudaHostAllocMapped), "metadata staging") &&
++        ok(cudaHostGetDevicePointer(&S.z_meta, S.h_meta, 0), "mapped metadata") &&
++        ok(cudaMalloc(&S.d_meta, sizeof(Meta)), "group metadata") &&
++        ok(cudaHostGetDevicePointer((void**) &S.z_x, S.h_x, 0), "mapped input") &&
++        ok(cudaHostGetDevicePointer((void**) &S.z_out, S.h_out, 0), "mapped result") &&
++        ok(cudaMalloc((void**) &S.d_q8, (size_t) CAP * (h / 32) * 36), "activation") &&
++        ok(cudaMalloc((void**) &S.d_xr, (size_t) CAP * h * sizeof(float)), "rotated input") &&
++        ok(cudaMalloc((void**) &S.d_out, (size_t) CAP * h * sizeof(float)), "result") &&
++        ok(cudaMalloc(&S.d_scratch, scratch), "scratch");
++    const char* tv = std::getenv("STRATA_NV_TIMING");
++    if (good && tv != nullptr && tv[0] == '1') {
++        cudaEventCreate(&S.t0);
++        cudaEventCreate(&S.t1);
++        cudaEventCreate(&S.tq);
++        cudaEventCreate(&S.tg);
++    }
++    if (!good) {
++        const std::string e = S.err;
++        p_close();
++        S.err = e;
++        return -1;
++    }
++    return 0;
++}
++
++int p_fill(uint64_t off, const void* src, uint64_t bytes, int wait) {
++    cudaSetDevice(S.dev);
++    if (!ok(cudaMemcpyAsync(S.pool + off, src, bytes, cudaMemcpyHostToDevice, S.s), "slot fill")) return -1;
++    return wait && !ok(cudaStreamSynchronize(S.s), "slot fill wait") ? -1 : 0;
++}
++
++int p_register_host(void* p, uint64_t bytes) {
++    return ok(cudaHostRegister(p, bytes, cudaHostRegisterPortable), "cudaHostRegister") ? 0 : -1;
++}
++
++int p_swap_fill(uint64_t off, const void* src, uint64_t bytes) {
++    cudaSetDevice(S.dev);
++    if (!ok(cudaMemcpyAsync(S.pool + off, src, bytes, cudaMemcpyHostToDevice, S.fs), "swap fill")) return -1;
++    S.fills_queued = true;
++    return 0;
++}
++
++int p_swap_done() {
++    cudaSetDevice(S.dev);
++    if (S.fills_queued) {   // the event after the last batch: one query answers for all of them
++        if (!ok(cudaEventRecord(S.fill_ev, S.fs), "swap event")) return -1;
++        S.fills_queued = false;
++    }
++    const cudaError_t e = cudaEventQuery(S.fill_ev);
++    if (e == cudaErrorNotReady) { cudaGetLastError(); return 0; }
++    return ok(e, "swap wait") ? 1 : -1;
++}
++
++int p_read(uint64_t off, void* dst, uint64_t bytes) {
++    cudaSetDevice(S.dev);
++    return ok(cudaMemcpyAsync(dst, S.pool + off, bytes, cudaMemcpyDeviceToHost, S.rs), "slot read") &&
++                   ok(cudaStreamSynchronize(S.rs), "slot read wait")
++               ? 0 : -1;
++}
++
++int p_set_signs(const float* sx, int h, const float* sh, int ff) {
++    cudaSetDevice(S.dev);
++    S.d_sx = strata::kernels::hadamard_device_signs(sx, h);
++    S.d_sh = strata::kernels::hadamard_device_signs(sh, ff);
++    return ok(cudaGetLastError(), "hadamard signs") ? 0 : -1;
++}
++
++// No copy-engine work on this path (kernels move the bytes), so the adaptive tier's slot fills never queue in front
++// of a layer.
++int p_launch(const SnvFmt* f, int n_tok, int groups, int rows, int x_q8) {
++    cudaSetDevice(S.dev);
++    if (S.t0) cudaEventRecord(S.t0, S.s);
++    const int nx16 = x_q8 ? n_tok * (S.h / 32) * 36 / 16 : 0;
++    stage_in<<<8, 256, 0, S.s>>>((const Meta*) S.z_meta, (Meta*) S.d_meta, (const int4*) S.z_x, (int4*) S.d_q8,
++                                 groups, rows, nx16);
++    if (!x_q8) {   // floats from pinned host memory (zero-copy), quantized here
++        const float* xe = S.z_x;
++        if (f->had_gu) {
++            strata::kernels::hadamard_rows(xe, S.d_xr, n_tok, S.h, f->had_block, S.d_sx, S.s);
++            xe = S.d_xr;
++        }
++        strata::kernels::quantize_q8_1_rows(xe, n_tok, S.h, S.d_q8, S.s);
++    }
++    if (S.tq) cudaEventRecord(S.tq, S.s);
++    auto L = strata::kernels::native_expert_layout(f->gu_type, f->d_type, f->n_embd, f->n_ff);
++    if (f->had_d) {
++        L.had_block = f->had_block;
++        L.d_signs = S.d_sh;
++    }
++    auto* m = (Meta*) S.d_meta;
++    strata::kernels::native_expert_grouped(L, m->ptr, m->start, &m->count, m->dst, m->tok, groups, rows, S.d_q8,
++                                           S.d_scratch, S.d_out, S.s);
++    if (S.tg) cudaEventRecord(S.tg, S.s);
++    const int n4 = rows * S.h / 4;
++    rows_to_host<<<std::min(64, (n4 + 255) / 256), 256, 0, S.s>>>((const float4*) S.d_out, (float4*) S.z_out, n4);
++    if (S.t1) cudaEventRecord(S.t1, S.s);
++    return ok(cudaGetLastError(), "expert launch") ? 0 : -1;
++}
++
++int p_wait() {
++    cudaError_t e;
++    while ((e = cudaStreamQuery(S.s)) == cudaErrorNotReady) {
++    }
++    if (!ok(e, "expert wait")) return -1;
++    if (S.t1) {
++        float ms = 0;
++        if (cudaEventElapsedTime(&ms, S.t0, S.t1) == cudaSuccess) S.gpu_ms += ms;
++        if (cudaEventElapsedTime(&ms, S.t0, S.tq) == cudaSuccess) S.q_ms += ms;
++        if (cudaEventElapsedTime(&ms, S.tq, S.tg) == cudaSuccess) S.g_ms += ms;
++        if (cudaEventElapsedTime(&ms, S.tg, S.t1) == cudaSuccess) S.c_ms += ms;
++        cudaGetLastError();
++    }
++    return 0;
++}
++
++const SnvApi kApi = {
++    SNV_ABI, p_preflight, p_open, p_close,
++    [] { return (uint64_t) (uintptr_t) S.pool; },
++    [] { return S.h_x; },
++    [] { return S.h_out; },
++    [] { return S.h_meta; },
++    p_fill, p_register_host, p_swap_fill, p_swap_done, p_read, p_set_signs, p_launch, p_wait,
++    [] {
++        if (S.gpu_ms > 0)   // STRATA_NV_TIMING: the split, once, where the engine prints its totals
++            std::fprintf(stderr, "strata nvhelper: card ms: quantize %.1f, experts %.1f, rows out %.1f, total %.1f\n",
++                         S.q_ms, S.g_ms, S.c_ms, S.gpu_ms);
++        return S.gpu_ms;
++    },
++    [] { return S.err.c_str(); },
++};
++} // namespace
++
++extern "C" __attribute__((visibility("default"))) const SnvApi* snv_api(void) { return &kApi; }
+diff --git a/src/core/remote_experts.cpp b/src/core/remote_experts.cpp
+index c2791540c..fdcaebc19 100644
+--- a/src/core/remote_experts.cpp
++++ b/src/core/remote_experts.cpp
+@@ -1,6 +1,7 @@
+ #include "strata/core/remote_experts.hpp"
+ #include "strata/core/device.hpp"   // primary_device() (STRATA_PRIMARY_DEVICE)
+ #include "strata/core/remote_expert_opt.hpp"
++#include "strata/core/nv_helper_abi.h"
+ 
+ #include "strata/kernels/cpu/expert_layout.hpp"
+ #include "strata/kernels/cpu/hadamard.hpp"
+@@ -9,6 +10,11 @@
+ #include "strata/kernels/s2_expert_grouped.hpp"
+ #include "strata/kernels/window_limits.hpp"
+ 
++#include <dlfcn.h>
++#include <immintrin.h>
++
++#include <cmath>
++
+ #include <algorithm>
+ #include <chrono>
+ #include <cstdio>
+@@ -68,7 +74,95 @@ bool check(cudaError_t result, const char* what, std::string& err, int device) {
+ 
+ RemoteExperts::~RemoteExperts() { close(); }
+ 
++const SnvApi* RemoteExperts::nv_helper(std::string* err) {
++    static std::string why;
++    static const SnvApi* api = [] () -> const SnvApi* {
++        const char* path = std::getenv("STRATA_NV_HELPER");
++        if (path == nullptr || path[0] == '\0') return nullptr;
++        // RTLD_LOCAL: the plugin's CUDA kernels share names with this engine's HIP ones
++        void* lib = dlopen(path, RTLD_NOW | RTLD_LOCAL);
++        if (lib == nullptr) { why = std::string("STRATA_NV_HELPER: ") + dlerror(); return nullptr; }
++        auto get = (const SnvApi* (*)()) dlsym(lib, "snv_api");
++        const SnvApi* a = get ? get() : nullptr;
++        if (a == nullptr || a->abi != SNV_ABI) {
++            why = std::string("STRATA_NV_HELPER: ") + path + " is not a plugin of this engine (ABI " +
++                  std::to_string(a ? a->abi : -1) + ", want " + std::to_string(SNV_ABI) + ")";
++            return nullptr;
++        }
++        return a;
++    }();
++    if (err != nullptr) *err = why;
++    return api;
++}
++
++namespace {
++// q8_1 blocks of `n_tok` rows of H floats, bit for bit the GPU's quantize_q8_1_rows (iq_kernels.cu, IEEE division):
++// d = amax / 127 and the block sum taken in its warp's XOR-butterfly order (lane j + lane j^16, then ^8, ^4, ^2, ^1;
++// a + b == b + a, so every lane holds lane 0's sum), both kept finite as fp16 (q8_1_finite.hpp); codes roundf'ed.
++__attribute__((target("avx2,f16c"))) void quantize_q8_1_host(const float* x, int64_t n_tok, void* out) {
++    struct Blk { uint16_t d, s; int8_t qs[32]; };
++    static_assert(sizeof(Blk) == 36, "block_q8_1");
++    const __m256 sign = _mm256_set1_ps(-0.0f), half = _mm256_set1_ps(0.5f), one = _mm256_set1_ps(1.0f);
++    const __m256 hmax = _mm256_set1_ps(65504.0f);
++    auto finite = [](float v) { return std::fabs(v) > 65504.0f ? std::copysign(65504.0f, v) : v; };
++    auto* b = (Blk*) out;
++    for (int64_t i = 0; i < n_tok * H / 32; ++i, ++b) {
++        const float* p = x + i * 32;
++        const __m256 v0 = _mm256_loadu_ps(p), v1 = _mm256_loadu_ps(p + 8), v2 = _mm256_loadu_ps(p + 16),
++                     v3 = _mm256_loadu_ps(p + 24);
++        __m256 m = _mm256_max_ps(_mm256_max_ps(_mm256_andnot_ps(sign, v0), _mm256_andnot_ps(sign, v1)),
++                                 _mm256_max_ps(_mm256_andnot_ps(sign, v2), _mm256_andnot_ps(sign, v3)));
++        m = _mm256_max_ps(m, _mm256_permute2f128_ps(m, m, 1));
++        m = _mm256_max_ps(m, _mm256_shuffle_ps(m, m, 0x4E));
++        m = _mm256_max_ps(m, _mm256_shuffle_ps(m, m, 0xB1));
++        const float amax = _mm256_cvtss_f32(m);
++        __m256 t = _mm256_add_ps(_mm256_add_ps(v0, v2), _mm256_add_ps(v1, v3));    // ^16, then ^8
++        t = _mm256_add_ps(t, _mm256_permute2f128_ps(t, t, 1));                      // ^4
++        t = _mm256_add_ps(t, _mm256_shuffle_ps(t, t, 0x4E));                        // ^2
++        t = _mm256_add_ps(t, _mm256_shuffle_ps(t, t, 0xB1));                        // ^1
++        const float d = std::fabs(amax / 127.0f) > 65504.0f ? 65504.0f : amax / 127.0f;
++        const __m256 dv = _mm256_set1_ps(d), lim = _mm256_set1_ps(127.0f);
++        __m256i q[4];
++        const __m256 vs[4] = {v0, v1, v2, v3};
++        for (int k = 0; k < 4; ++k) {
++            const __m256 y = _mm256_div_ps(vs[k], dv);
++            __m256 r = _mm256_round_ps(y, _MM_FROUND_TO_ZERO | _MM_FROUND_NO_EXC);   // roundf: half away from zero
++            const __m256 up = _mm256_cmp_ps(_mm256_andnot_ps(sign, _mm256_sub_ps(y, r)), half, _CMP_GE_OQ);
++            r = _mm256_add_ps(r, _mm256_and_ps(up, _mm256_or_ps(one, _mm256_and_ps(sign, y))));
++            r = _mm256_min_ps(_mm256_max_ps(r, _mm256_sub_ps(_mm256_setzero_ps(), lim)), lim);
++            q[k] = _mm256_cvtps_epi32(amax == 0.0f ? _mm256_setzero_ps() : r);
++        }
++        const __m256i w01 = _mm256_packs_epi32(q[0], q[1]), w23 = _mm256_packs_epi32(q[2], q[3]);
++        const __m256i b8 = _mm256_permutevar8x32_epi32(_mm256_packs_epi16(w01, w23), _mm256_setr_epi32(0, 4, 1, 5, 2, 6, 3, 7));
++        _mm256_storeu_si256((__m256i*) b->qs, b8);
++        (void) hmax;
++        b->d = _cvtss_sh(d, _MM_FROUND_TO_NEAREST_INT);
++        b->s = _cvtss_sh(finite(_mm256_cvtss_f32(t)), _MM_FROUND_TO_NEAREST_INT);
++    }
++}
++
++int nv_device() {
++    const char* v = std::getenv("STRATA_NV_DEVICE");
++    return v != nullptr && v[0] != '\0' ? std::atoi(v) : 0;
++}
++bool nv_spin() {
++    const char* v = std::getenv("STRATA_REMOTE_SPIN");
++    return !(v != nullptr && v[0] == '0');
++}
++} // namespace
++
+ bool RemoteExperts::preflight(int device, double& free_gib, std::string& err) {
++    std::string why;
++    if (const SnvApi* nv = nv_helper(&why)) {
++        size_t free_bytes = 0;
++        if (nv->preflight(nv_device(), nv_spin() ? 1 : 0, &free_bytes) != 0) {
++            err = std::string("NVIDIA helper: ") + nv->last_error();
++            return false;
++        }
++        free_gib = (double) free_bytes / 1073741824.0;
++        return true;
++    }
++    if (!why.empty()) { err = why; return false; }
+     int count = 0;
+     if (!check(cudaGetDeviceCount(&count), "cudaGetDeviceCount", err, device)) return false;
+     if (device < 0 || device >= count) {
+@@ -99,6 +193,19 @@ bool RemoteExperts::preflight(int device, double& free_gib, std::string& err) {
+ 
+ void RemoteExperts::close() {
+     if (device_ < 0) return;
++    if (nv_) {
++        nv_->close();
++        nv_ = nullptr;
++        nv_res_.clear();
++        nv_off_.clear();
++        nv_pool_bytes_ = 0;
++        h_x_ = h_out_ = nullptr;
++        h_meta_ = nullptr;
++        device_ = -1;
++        original_row_.clear();
++        layers_present_.clear();
++        return;
++    }
+     DeviceScope scope(device_);
+     if (scope.ok) {
+         if (stream_) cudaStreamSynchronize(stream_);
+@@ -138,6 +245,10 @@ bool RemoteExperts::open(int device, int slots, int64_t layers, int64_t experts,
+                          const ExpertCache& primary, ExpertSource& source,
+                          std::vector<uint8_t>& claimed, std::string& err, bool auto_size) {
+     close();
++    if (nv_helper() != nullptr) {
++        device_ = device;
++        return open_nv(slots, layers, experts, ranked, primary, source, claimed, err, auto_size);
++    }
+     int count = 0;
+     if (!check(cudaGetDeviceCount(&count), "cudaGetDeviceCount", err, device)) return false;
+     if (device < 0 || device >= count || slots <= 0 || ranked.empty() ||
+@@ -262,13 +373,187 @@ bool RemoteExperts::open(int device, int slots, int64_t layers, int64_t experts,
+     return true;
+ }
+ 
++bool RemoteExperts::open_nv(int slots, int64_t layers, int64_t experts,
++                            const std::vector<std::pair<int32_t, int32_t>>& ranked, const ExpertCache& primary,
++                            ExpertSource& source, std::vector<uint8_t>& claimed, std::string& err, bool auto_size) {
++    const SnvApi* nv = nv_helper();
++    const auto& lay = strata::kernels::cpu::expert_layout();
++    auto fail = [&](const std::string& why) { err = "NVIDIA helper: " + why; nv->close(); device_ = -1; return false; };
++    if (!lay.native) return fail("needs a native (GGUF) expert pack");
++    if (slots <= 0 || ranked.empty() || layers <= 0 || experts <= 0 ||
++        claimed.size() != (size_t) layers * (size_t) experts)
++        return fail("need ranked experts and a positive slot count");
++    size_t free_bytes = 0;
++    if (nv->preflight(nv_device(), nv_spin() ? 1 : 0, &free_bytes) != 0) return fail(nv->last_error());
++    // the staging, scratch and the CUDA context's later allocations: keep 512 MiB free, as the CUDA helpers do
++    const uint64_t keep = (512ull << 20) + (uint64_t) CAP * H * sizeof(float) * 3;
++    std::vector<std::pair<int32_t, int32_t>> selected;
++    std::vector<uint64_t> off;
++    std::vector<uint8_t> picked(claimed.size(), 0);
++    uint64_t needed = 0;
++    for (const auto& pair : ranked) {
++        if (pair.first < 0 || pair.first >= layers || pair.second < 0 || pair.second >= experts) continue;
++        const size_t index = (size_t) pair.first * (size_t) experts + (size_t) pair.second;
++        if (primary.slot_of(pair.first, pair.second) >= 0 || claimed[index] || picked[index]) continue;
++        const uint64_t bytes = (lay.blob_bytes(pair.first) + 255) / 256 * 256;
++        if (auto_size && needed + bytes + keep > free_bytes) break;
++        selected.push_back(pair);
++        off.push_back(needed);
++        needed += bytes;
++        picked[index] = 1;
++        if ((int) selected.size() >= slots) break;
++    }
++    if (selected.empty()) return fail("no unclaimed expert fits");
++    if (needed + keep > free_bytes) return fail("the slots leave less than 512 MiB free; lower --expert-cache-device1");
++    if (nv->open(nv_device(), needed, (int) CAP, (int) H, (int) FF, sizeof(RemoteMeta)) != 0)
++        return fail(nv->last_error());
++    nv_ = nv;
++    n_expert_ = experts;
++    nv_res_.assign((size_t) layers * (size_t) experts, -1);
++    {   // the arena pinned for this card too, when it is one block, so the adaptive tier's fills are plain DMA
++        uintptr_t lo = UINTPTR_MAX, hi = 0;
++        uint64_t total = 0;
++        for (int64_t l = 0; l < layers && lo != 0; ++l)
++            for (int64_t e = 0; e < experts; ++e) {
++                const uint8_t* b = source.blob(l, e);
++                if (b == nullptr) { lo = 0; break; }
++                lo = std::min(lo, (uintptr_t) b);
++                hi = std::max(hi, (uintptr_t) b + (uintptr_t) lay.blob_bytes(l));
++                total += lay.blob_bytes(l);
++            }
++        const bool block = lo != 0 && hi > lo && hi - lo <= total + total / 64;
++        const char* why = !block ? "the arena is not one block" : nv->register_host((void*) lo, hi - lo) != 0 ? nv->last_error() : nullptr;
++        std::fprintf(stderr, "strata generate: NVIDIA helper: %s\n",
++                     why ? (std::string("arena not pinned for it (") + why + "); its swaps copy through staging").c_str()
++                         : (std::to_string((hi - lo) >> 20) + " MiB of expert arena pinned for its copy engine").c_str());
++    }
++    for (size_t i = 0; i < selected.size(); ++i) {
++        const auto& [l, e] = selected[i];
++        const uint8_t* blob = source.blob(l, e);
++        if (blob == nullptr || nv->fill(off[i], blob, lay.blob_bytes(l), i + 1 == selected.size()) != 0) {
++            const std::string why = blob ? nv->last_error() : "the expert source has no blob";
++            close();
++            return fail(why);
++        }
++        nv_res_[(size_t) l * (size_t) experts + (size_t) e] = (int32_t) i;
++    }
++    nv_off_ = std::move(off);
++    nv_pool_bytes_ = needed;
++    {   // the first slot back, byte for byte: proves the copies and the offsets
++        const auto& [l, e] = selected.front();
++        std::vector<uint8_t> back(lay.blob_bytes(l));
++        if (nv->read(nv_off_[0], back.data(), back.size()) != 0 ||
++            std::memcmp(back.data(), source.blob(l, e), back.size()) != 0) {
++            close();
++            return fail("slot 0 did not read back as written");
++        }
++    }
++    if (strata::kernels::cpu::hadamard_spec().any() &&
++        nv->set_signs(strata::kernels::cpu::hadamard_signs((int) H), (int) H,
++                      strata::kernels::cpu::hadamard_signs((int) FF), (int) FF) != 0) {
++        const std::string why = nv->last_error();
++        close();
++        return fail(why);
++    }
++    h_x_ = nv->host_x();
++    h_out_ = nv->host_out();
++    h_meta_ = nv->host_meta();
++    zero_copy_ = true;   // the plugin's kernels read h_x_ and write h_out_ in place
++    owned_.resize(CAP);
++    layers_present_.assign((size_t) layers, 0);
++    group_of_.resize(CAP);
++    group_id_.reserve(CAP);
++    ptr_.reserve(CAP);
++    start_.reserve(CAP + 1);
++    dst_.reserve(CAP);
++    tok_.reserve(CAP);
++    original_row_.reserve(CAP);
++    computed_ = 0;
++    launched_layers_ = 0;
++    returned_bytes_ = full_row_bytes_ = 0;
++    for (const auto& pair : selected) {
++        layers_present_[(size_t) pair.first] = 1;
++        claimed[(size_t) pair.first * (size_t) experts + (size_t) pair.second] = 1;
++    }
++    return true;
++}
++
++double RemoteExperts::nv_gpu_ms() const { return nv_ ? nv_->gpu_ms() : 0.0; }
++
++bool RemoteExperts::adapt_nv(const std::vector<float>& usage, const std::vector<int32_t>& primary_res,
++                             const std::vector<std::pair<int32_t, int32_t>>& pending, int max_swaps, float min_gain,
++                             ExpertSource& source, std::string& err) {
++    if (nv_ == nullptr || max_swaps <= 0) return true;
++    if (!nv_landing_.empty()) {   // the last round's fills first: their experts are used from now on
++        const int done = nv_->swap_done();
++        if (done < 0) { err = std::string("NVIDIA helper: ") + nv_->last_error(); return false; }
++        if (done == 0) return true;
++        for (const auto& [i, slot] : nv_landing_) nv_res_[(size_t) i] = slot;
++        nv_landing_.clear();
++    }
++    const auto& lay = strata::kernels::cpu::expert_layout();
++    const int64_t L = (int64_t) layers_present_.size(), E = n_expert_;
++    std::vector<uint8_t> incoming((size_t) (L * E), 0);
++    for (const auto& pr : pending) incoming[(size_t) pr.first] = 1;
++    struct Swap { float gain; int32_t layer, in, out; };
++    std::vector<Swap> swaps;
++    std::vector<std::pair<float, int32_t>> cand, vict;
++    for (int64_t l = 0; l < L; ++l) {
++        cand.clear();
++        vict.clear();
++        for (int32_t e = 0; e < (int32_t) E; ++e) {
++            const size_t i = (size_t) (l * E + e);
++            const bool primary = primary_res[i] >= 0 || incoming[i];
++            if (nv_res_[i] >= 0) vict.emplace_back(primary ? -1.0f : usage[i], e);   // a copy the primary holds: free
++            else if (!primary && usage[i] >= 2.0f) cand.emplace_back(usage[i], e);
++        }
++        if (cand.empty() || vict.empty()) continue;
++        const size_t n = std::min(cand.size(), vict.size());
++        std::partial_sort(cand.begin(), cand.begin() + (ptrdiff_t) n, cand.end(), [](auto& a, auto& b) { return a.first > b.first; });
++        std::partial_sort(vict.begin(), vict.begin() + (ptrdiff_t) n, vict.end(), [](auto& a, auto& b) { return a.first < b.first; });
++        for (size_t k = 0; k < n && cand[k].first >= vict[k].first + min_gain; ++k)
++            swaps.push_back({cand[k].first - vict[k].first, (int32_t) l, cand[k].second, vict[k].second});
++    }
++    std::sort(swaps.begin(), swaps.end(), [](const Swap& a, const Swap& b) { return a.gain > b.gain; });
++    if ((int) swaps.size() > max_swaps) swaps.resize((size_t) max_swaps);
++    for (const Swap& w : swaps) {
++        const size_t out = (size_t) w.layer * (size_t) E + (size_t) w.out, in = (size_t) w.layer * (size_t) E + (size_t) w.in;
++        const uint8_t* blob = source.blob(w.layer, w.in);
++        if (blob == nullptr) continue;
++        const int32_t slot = nv_res_[out];
++        nv_res_[out] = -1;   // from now on the CPU computes it; the slot is the fill's
++        if (nv_->swap_fill(nv_off_[(size_t) slot], blob, lay.blob_bytes(w.layer)) != 0) {
++            err = std::string("NVIDIA helper: ") + nv_->last_error();
++            return false;
++        }
++        nv_landing_.emplace_back((int32_t) in, slot);
++        layers_present_[(size_t) w.layer] = 1;
++        ++nv_swapped_;
++    }
++    if (!nv_landing_.empty() && nv_->swap_done() < 0) { err = std::string("NVIDIA helper: ") + nv_->last_error(); return false; }
++    return true;
++}
++
++namespace {
++// cumulative host time in claim() and dispatch() (staging and launches), reported per request by the driver
++struct BeginTimer {
++    double& acc;
++    std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
++    ~BeginTimer() { acc += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count(); }
++};
++} // namespace
++
+ bool RemoteExperts::begin(int64_t layer, const float* x, const int32_t* ids, int64_t n_tok,
+                           int64_t k, const int32_t* kind, const int32_t* primary_res,
+                           std::string& err) {
+-    // cumulative host time in here (staging and launches), reported per request by the driver
+-    struct Timer { double& acc; std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
+-        ~Timer() { acc += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count(); } } timer{ms_begin_};
++    return claim(layer, ids, n_tok, k, kind, primary_res, err) && dispatch(layer, x, n_tok, err);
++}
++
++bool RemoteExperts::claim(int64_t layer, const int32_t* ids, int64_t n_tok, int64_t k, const int32_t* kind,
++                          const int32_t* primary_res, std::string& err) {
++    BeginTimer timer{ms_begin_};
+     const int64_t n = n_tok * k;
++    claimed_n_ = 0;
+     if (n <= 0 || n > CAP || n_tok > strata::kernels::kWindowMaxT || k != 10 || layer < 0 ||
+         (size_t) layer >= layers_present_.size() || device_ < 0) {
+         err = "CUDA" + std::to_string(device_) + " experts: invalid layer, routing width or window size";
+@@ -282,7 +567,7 @@ bool RemoteExperts::begin(int64_t layer, const float* x, const int32_t* ids, int
+         const int32_t e = ids[i];
+         if ((kind && kind[i] != -1) || e < 0 || e >= n_expert_ ||
+             (primary_res && primary_res[(size_t) layer * (size_t) n_expert_ + (size_t) e] >= 0)) continue;
+-        const int32_t slot = cache_.slot_of(layer, e);
++        const int32_t slot = slot_of(layer, e);
+         if (slot < 0) continue;
+         owned_[(size_t) i] = 1;
+         int32_t group = -1;
+@@ -291,7 +576,8 @@ bool RemoteExperts::begin(int64_t layer, const float* x, const int32_t* ids, int
+         if (group < 0) {
+             group = (int32_t) group_id_.size();
+             group_id_.push_back(e);
+-            ptr_.push_back((unsigned long long) cache_.device_slot(slot));
++            ptr_.push_back(nv_ ? (unsigned long long) (nv_->pool_base() + nv_off_[(size_t) slot])
++                               : (unsigned long long) cache_.device_slot(slot));
+         }
+         group_of_[(size_t) i] = group;
+         ++computed_;
+@@ -308,9 +594,22 @@ bool RemoteExperts::begin(int64_t layer, const float* x, const int32_t* ids, int
+         }
+     }
+     start_.push_back((int32_t) dst_.size());
++    claimed_n_ = n;
++    return true;
++}
++
++bool RemoteExperts::dispatch(int64_t layer, const float* x, int64_t n_tok, std::string& err) {
++    if (group_id_.empty()) return true;
++    BeginTimer timer{ms_begin_};
++    const int64_t n = claimed_n_;
+     // Private pinned buffers survive until this GPU has consumed them. The CPU
+     // pool can write other output rows without a cross-device race.
+-    std::memcpy(h_x_, x, (size_t) n_tok * H * sizeof(float));
++    const auto& lfmt = strata::kernels::cpu::expert_layout().fmt[(size_t) layer];
++    // NVIDIA helper: the rows cross its PCIe x4 link as q8_1 (a third of the bytes); a Hadamard-folded layer (APR)
++    // still sends floats for the card to rotate before quantizing
++    const bool x_q8 = nv_ != nullptr && !lfmt.had_gu;
++    if (x_q8) quantize_q8_1_host(x, n_tok, h_x_);
++    else std::memcpy(h_x_, x, (size_t) n_tok * H * sizeof(float));
+     auto* meta = (RemoteMeta*) h_meta_;
+     std::memcpy(meta->ptr, ptr_.data(), ptr_.size() * sizeof(ptr_[0]));
+     std::memcpy(meta->start, start_.data(), start_.size() * sizeof(start_[0]));
+@@ -319,6 +618,19 @@ bool RemoteExperts::begin(int64_t layer, const float* x, const int32_t* ids, int
+     meta->count = (int32_t) group_id_.size();
+     const bool reduce = remote_opt_ && remote_opt_->active();
+     if (reduce) remote_opt_->prepare(*this, meta + 1);
++    if (nv_) {
++        const SnvFmt f{lfmt.gu_type, lfmt.d_type, lfmt.n_embd, lfmt.n_ff, lfmt.had_gu ? 1 : 0, lfmt.had_d ? 1 : 0,
++                       lfmt.had_block};
++        groups_ = (int32_t) group_id_.size();
++        if (nv_->launch(&f, (int) n_tok, groups_, (int) dst_.size(), x_q8 ? 1 : 0) != 0) {
++            err = std::string("NVIDIA helper: ") + nv_->last_error();
++            return false;
++        }
++        ++launched_layers_;
++        returned_bytes_ += (uint64_t) dst_.size() * H * sizeof(float);
++        full_row_bytes_ += (uint64_t) n * H * sizeof(float);
++        return true;
++    }
+     DeviceScope scope(device_);
+     if (!scope.ok) { err = scope.error(device_); return false; }
+     groups_ = (int32_t) group_id_.size();
+@@ -360,6 +672,14 @@ bool RemoteExperts::begin(int64_t layer, const float* x, const int32_t* ids, int
+ 
+ bool RemoteExperts::finish(float* out, std::string& err) {
+     if (group_id_.empty()) return true;
++    if (nv_) {
++        const auto w0 = std::chrono::steady_clock::now();
++        if (nv_->wait() != 0) { err = std::string("NVIDIA helper: ") + nv_->last_error(); return false; }
++        ms_wait_ += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - w0).count();
++        for (size_t i = 0; i < original_row_.size(); ++i)
++            std::memcpy(out + (size_t) original_row_[i] * H, h_out_ + i * H, (size_t) H * sizeof(float));
++        return true;
++    }
+     DeviceScope scope(device_);
+     if (!scope.ok) { err = scope.error(device_); return false; }
+     const auto w0 = std::chrono::steady_clock::now();
+@@ -394,6 +714,21 @@ bool RemoteExperts::finish(float* out, std::string& err) {
+ bool RemoteExperts::copy_cached_blobs(const int32_t* layers, const int32_t* experts, uint8_t* const* dst,
+                                       size_t n, uint8_t* hit, std::string& err) {
+     std::fill(hit, hit + n, 0);
++    if (nv_) {
++        const auto& lay = strata::kernels::cpu::expert_layout();
++        std::lock_guard<std::mutex> lock(read_mu_);
++        for (size_t i = 0; i < n; ++i) {
++            if (dst[i] == nullptr) continue;
++            const int32_t slot = slot_of(layers[i], experts[i]);
++            if (slot < 0) continue;
++            if (nv_->read(nv_off_[(size_t) slot], dst[i], lay.blob_bytes(layers[i])) != 0) {
++                err = std::string("NVIDIA helper: ") + nv_->last_error();
++                return false;   // the reads before it completed (each one waits)
++            }
++            hit[i] = 1;
++        }
++        return true;
++    }
+     if (device_ < 0 || read_stream_ == nullptr || n == 0) return true;
+     const auto& lay = strata::kernels::cpu::expert_layout();
+     DeviceScope scope(device_);
+diff --git a/src/kernels/cpu/pool.cpp b/src/kernels/cpu/pool.cpp
+index 795f3adef..ae7282e14 100644
+--- a/src/kernels/cpu/pool.cpp
++++ b/src/kernels/cpu/pool.cpp
+@@ -1376,6 +1376,11 @@ void ExpertPool::run_phase(int mode, int n_tasks) {
+     njobs_ = n_tasks;
+     const uint64_t t_pub = prof_on_ ? now_ns() : 0;
+     const uint32_t e = begin_batch(n_tasks);
++    if (pre_drain_fn_ != nullptr) {
++        void (*fn)(void*) = pre_drain_fn_;
++        pre_drain_fn_ = nullptr;
++        fn(pre_drain_ctx_);
++    }
+     if (host_works_) drain(-1, host_scratch_, e);
+     wait_done(n_tasks);
+     const uint64_t t_done = prof_on_ ? now_ns() : 0;
+diff --git a/src/kernels/cuda/iq_kernels.cu b/src/kernels/cuda/iq_kernels.cu
+index 3e753bff8..4396fbc0a 100644
+--- a/src/kernels/cuda/iq_kernels.cu
++++ b/src/kernels/cuda/iq_kernels.cu
+@@ -4209,7 +4209,8 @@ bool gu_swiglu_on() {
+         const bool ok = cudaDeviceGetAttribute(&maj, cudaDevAttrComputeCapabilityMajor, dev) == cudaSuccess &&
+                         cudaDeviceGetAttribute(&mnr, cudaDevAttrComputeCapabilityMinor, dev) == cudaSuccess;
+         if (!ok) cudaGetLastError();
+-        per_dev[dev] = ok && strata::sm120_default(maj, mnr) ? 2 : 1;
++        // sm_89 too: the 4070 as a HIP engine's expert helper (nv_helper_plugin.cu), 3-4 experts a call: 34 -> 31 us
++        per_dev[dev] = ok && (strata::sm120_default(maj, mnr) || (maj == 8 && mnr == 9)) ? 2 : 1;
+     }
+     return per_dev[dev] == 2;
+ #endif
+diff --git a/src/program/generate.cpp b/src/program/generate.cpp
+index 90bd9810a..3c9a8c478 100644
+--- a/src/program/generate.cpp
++++ b/src/program/generate.cpp
+@@ -2836,6 +2836,13 @@ static void prime_hw_queues() {
+ // verifier gets the gated measure (core/gated_proposal.hpp).  That is exact only where the window choice cannot see a draw or a
+ // timing that the next rounds draw again.  Where it cannot be kept, say why and return false: the caller keeps the older rule
+ // (a warning, not a refusal).
++// STRATA_NV_ADAPT_SWAPS: the NVIDIA helper tier's swaps per adapt round (default a sixth of --adapt-swaps: each one
++// crosses the chipset's PCIe x4 link)
++static int nv_adapt_swaps(int adapt_swaps) {
++    static const int env = [] { const char* v = std::getenv("STRATA_NV_ADAPT_SWAPS"); return v && *v ? std::atoi(v) : -1; }();
++    return env >= 0 ? env : adapt_swaps / 6;
++}
++
+ static bool gated_proposal_usable(bool serial_single_device, int lookup_chain, int adapt_swaps, bool pcie_share, bool own_window_rule,
+                                   int window, double min_p) {
+     const char* why = nullptr;
+@@ -3789,8 +3796,9 @@ int main(int argc, char** argv) {
+         // card would otherwise fail later with "invalid device function")
+         std::vector<int> used{primary_device};   // STRATA_PRIMARY_DEVICE: the primary is not always 0
+         if (multi_gpu) used.insert(used.end(), split_devs.begin(), split_devs.end());
+-        for (int r = 0; r < 3; ++r)
+-            if (o.expert_cache_remote[(size_t) r] > 0) used.push_back(remote_dev[r]);
++        for (int r = 0; r < 3; ++r)   // an NVIDIA helper (STRATA_NV_HELPER) is no HIP device
++            if (o.expert_cache_remote[(size_t) r] > 0 && !strata::core::RemoteExperts::nv_helper())
++                used.push_back(remote_dev[r]);
+         for (const int d : used) {
+             if (const std::string why = strata::core::gpu_arch_problem(d); !why.empty()) {
+                 std::fprintf(stderr, "strata generate: %s\n", why.c_str());
+@@ -7637,6 +7645,11 @@ int main(int argc, char** argv) {
+ 
+     std::array<strata::core::RemoteExperts, 3> remote_experts;
+     std::unique_ptr<strata::core::RemoteExpertOpt> remote_opt;
++    if (o.remote_expert_opt && o.expert_cache_remote[0] > 0 && strata::core::RemoteExperts::nv_helper()) {
++        // its reduce and adaptive swaps run on the helper's stream, which is the plugin's here
++        std::fprintf(stderr, "strata generate: --remote-expert-opt is off: not with an NVIDIA helper (STRATA_NV_HELPER)\n");
++        o.remote_expert_opt = false;
++    }
+     if (o.remote_expert_opt && o.expert_cache_remote[0] > 0) remote_opt = std::make_unique<strata::core::RemoteExpertOpt>();
+     const bool multi_remote = o.expert_cache_remote[1] > 0 || o.expert_cache_remote[2] > 0;
+     if (o.expert_cache_remote[0] > 0) {
+@@ -11525,6 +11538,14 @@ int main(int argc, char** argv) {
+         auto adapt = [&]() -> bool {
+             if (!pending.empty()) return true;   // the previous swaps are still in flight
+             if (remote_opt && !remote_opt->adapt(drive.d.usage, host_res, pending, o.adapt_swaps, *srcp)) return false;
++            for (int r = 0; r < drive.d.remote_count; ++r) {   // the NVIDIA helper's own tier (no-op otherwise)
++                std::string aerr;
++                if (!drive.d.remote[r]->adapt_nv(drive.d.usage, host_res, pending, nv_adapt_swaps(o.adapt_swaps),
++                                                 o.adapt_min_gain, *srcp, aerr)) {
++                    std::fprintf(stderr, "strata serve: %s\n", aerr.c_str());
++                    return false;
++                }
++            }
+             struct Swap { float gain; int32_t layer, in, out; };
+             std::vector<Swap> swaps;
+             std::vector<std::pair<float, int32_t>> cand, vict;
+@@ -18423,6 +18444,14 @@ int main(int argc, char** argv) {
+                 return true;   // the previous swaps are still in flight
+             }
+             if (trace_adapt) std::fprintf(stderr, "strata: ADAPT round=%lld considering\n", (long long) adapt_rounds);
++            for (int r = 0; r < drive.d.remote_count; ++r) {   // the NVIDIA helper's own tier (no-op otherwise)
++                std::string aerr;
++                if (!drive.d.remote[r]->adapt_nv(drive.d.usage, host_res, pending, nv_adapt_swaps(o.adapt_swaps),
++                                                 o.adapt_min_gain, *srcp, aerr)) {
++                    std::fprintf(stderr, "strata generate: %s\n", aerr.c_str());
++                    return false;
++                }
++            }
+             struct Swap { float gain; int32_t layer, in, out; };
+             std::vector<Swap> swaps;
+             std::vector<std::pair<float, int32_t>> cand, vict;
+@@ -19183,8 +19212,11 @@ int main(int argc, char** argv) {
+         }
+         std::printf("%-24s %lld blobs read\n", "  expert blobs", (long long) srcp->reads());
+         for (int r = 0; r < 3; ++r) if (o.expert_cache_remote[(size_t) r] > 0)
+-            std::printf("  CUDA%d experts           %lld routed entries computed\n",
+-                        r + 1, (long long) remote_experts[(size_t) r].computed());
++            std::printf("  CUDA%d experts           %lld routed entries computed over %lld layer launches; host %.3f ms in "
++                        "begin, %.3f ms waiting; %lld swapped in; card %.3f ms\n", r + 1, (long long) remote_experts[(size_t) r].computed(),
++                        (long long) remote_experts[(size_t) r].launched_layers(), remote_experts[(size_t) r].ms_begin(),
++                        remote_experts[(size_t) r].ms_wait(), (long long) remote_experts[(size_t) r].swapped(),
++                        remote_experts[(size_t) r].nv_gpu_ms());
+         // ---- **R4's DISPATCH MEASUREMENT: h, ON THE ENGINE'S OWN ROUTING.**  No offline trace, no corpus
+         // question, no k-fold - these are the ids the router actually produced on this run.  Reported as
+         // hits/lookups so it can be read directly as the h the cache would deliver, and alongside `refused`

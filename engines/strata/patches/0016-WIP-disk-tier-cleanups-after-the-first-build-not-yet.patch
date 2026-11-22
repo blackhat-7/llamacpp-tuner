@@ -1,0 +1,240 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: blackhat-7 <44942105+blackhat-7@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 23:47:06 +0530
+Subject: [PATCH 16/33] WIP disk tier: cleanups after the first build (not yet
+ built with HIP; the unit test passes)
+
+- per_block()/divides() instead of chunk_bytes() with an out-parameter
+- a temporary file is tmp-<final name> (one writer per folder); manifests are named by the
+  writer's own generator: no global random state
+- drop the never-read stats (restored, dropped, read_bytes)
+- a written image is freed outside the store's lock; the log line goes out before finish() returns
+
+build-hip/strata is still b16c1ade's.
+---
+ include/strata/core/conversation_disk.hpp |  4 +-
+ src/core/conversation_disk.cpp            | 82 ++++++++---------------
+ 2 files changed, 31 insertions(+), 55 deletions(-)
+
+diff --git a/include/strata/core/conversation_disk.hpp b/include/strata/core/conversation_disk.hpp
+index 9cfc83200..4e92b3aee 100644
+--- a/include/strata/core/conversation_disk.hpp
++++ b/include/strata/core/conversation_disk.hpp
+@@ -37,8 +37,8 @@ public:
+         uint64_t bytes = 0;    // the RAM load() allocates, for the caller's admission check
+     };
+     struct Stats {
+-        size_t conversations = 0, written = 0, restored = 0, dropped = 0;
+-        uint64_t disk_bytes = 0, written_bytes = 0, read_bytes = 0;
++        size_t conversations = 0, written = 0;   // stored now; written since open()
++        uint64_t disk_bytes = 0, written_bytes = 0;
+     };
+ 
+     ConversationDisk();
+diff --git a/src/core/conversation_disk.cpp b/src/core/conversation_disk.cpp
+index 528b20792..52fceea55 100644
+--- a/src/core/conversation_disk.cpp
++++ b/src/core/conversation_disk.cpp
+@@ -81,16 +81,18 @@ struct Layer {
+     std::array<uint64_t, 5> sizes{};   // k, v, k_scale, v_scale, pooled
+ };
+ 
+-// The bytes of part `p` that fall in one block; 0 for an empty part.  Parts 0-3 hold the same number of bytes for
+-// every cell, the pooled part one row per kIndexBlock cells.  False when the part does not divide evenly.
+-bool chunk_bytes(const Layer& l, size_t p, uint64_t& out) {
+-    out = 0;
+-    if (!l.sizes[p]) return true;
+-    const int64_t units = p == 4 ? l.pooled_rows : l.cells;
+-    if (units <= 0 || l.sizes[p] % (uint64_t) units) return false;
+-    out = l.sizes[p] / (uint64_t) units * (uint64_t) (p == 4 ? kBlockTokens / kIndexBlock : kBlockTokens);
++// Parts 0-3 hold the same number of bytes for every cell, the pooled part one row per kIndexBlock cells.
++int64_t units(const Layer& l, size_t p) { return p == 4 ? l.pooled_rows : l.cells; }
++bool divides(const Layer& l) {
++    for (size_t p = 0; p < 5; ++p)
++        if (l.sizes[p] && (units(l, p) <= 0 || l.sizes[p] % (uint64_t) units(l, p))) return false;
+     return true;
+ }
++// The bytes of part `p` that fall in one block (0: an empty part), for a layer that divides().
++uint64_t per_block(const Layer& l, size_t p) {
++    if (!l.sizes[p]) return 0;
++    return l.sizes[p] / (uint64_t) units(l, p) * (uint64_t) (p == 4 ? kBlockTokens / kIndexBlock : kBlockTokens);
++}
+ 
+ struct Slice {
+     size_t layer, part;
+@@ -103,8 +105,7 @@ uint64_t block_slices(const std::vector<Layer>& layers, uint64_t j, std::vector<
+     uint64_t to = 0;
+     for (size_t li = 0; li < layers.size(); ++li)
+         for (size_t p = 0; p < 5; ++p) {
+-            uint64_t c = 0;
+-            chunk_bytes(layers[li], p, c);
++            const uint64_t c = per_block(layers[li], p);
+             if (!c || j * c >= layers[li].sizes[p]) continue;
+             const uint64_t n = std::min(c, layers[li].sizes[p] - j * c);
+             out.push_back({li, p, j * c, n, to});
+@@ -116,11 +117,8 @@ uint64_t block_slices(const std::vector<Layer>& layers, uint64_t j, std::vector<
+ uint64_t block_count(const std::vector<Layer>& layers) {
+     uint64_t n = 0;
+     for (const auto& l : layers)
+-        for (size_t p = 0; p < 5; ++p) {
+-            uint64_t c = 0;
+-            chunk_bytes(l, p, c);
+-            if (c) n = std::max(n, (l.sizes[p] + c - 1) / c);
+-        }
++        for (size_t p = 0; p < 5; ++p)
++            if (const uint64_t c = per_block(l, p)) n = std::max(n, (l.sizes[p] + c - 1) / c);
+     return n;
+ }
+ 
+@@ -208,10 +206,7 @@ bool decode(const uint8_t* p, size_t n, Manifest& m) {
+     for (const auto& c : m.checks)
+         if (c.len == 0 || c.len > m.ids.size()) return false;
+     for (const auto& l : m.layers)
+-        for (size_t q = 0; q < 5; ++q) {
+-            uint64_t c = 0;
+-            if (!chunk_bytes(l, q, c)) return false;
+-        }
++        if (!divides(l)) return false;
+     if (m.blocks.size() != block_count(m.layers)) return false;
+     std::vector<Slice> slices;
+     for (uint64_t j = 0; j < m.blocks.size(); ++j)
+@@ -318,16 +313,9 @@ void sync_dir(const std::string& dir) {
+     if (fd >= 0) { ::fsync(fd); ::close(fd); }
+ }
+ 
+-uint64_t random64() {
+-    static std::mt19937_64 g{std::random_device{}()};
+-    static std::mutex m;
+-    std::lock_guard<std::mutex> lk(m);
+-    return g();
+-}
+-
+ // Writes the payload at buf + kPage (`bytes` of it, of hash `hash`; buf holds round_up(kPage + bytes)) as dir/name:
+-// under a temporary name first, flushed, then renamed, so the name never refers to a partial file.  `go` is asked
+-// before each write request; false gives up.
++// as tmp-name first, flushed, then renamed, so the name never refers to a partial file (one writer per folder: the
++// temporary name is free).  `go` is asked before each write request; false gives up.
+ bool write_file(const std::string& dir, const std::string& name, uint8_t* buf, uint64_t hash, uint64_t bytes,
+                 const std::function<bool()>& go, std::string& err) {
+     Header h{};
+@@ -339,9 +327,7 @@ bool write_file(const std::string& dir, const std::string& name, uint8_t* buf, u
+     std::memset(buf, 0, kPage);
+     std::memcpy(buf, &h, sizeof h);
+     std::memset(buf + total, 0, padded - total);
+-    char tmp[32];
+-    std::snprintf(tmp, sizeof tmp, "/tmp-%016llx", (unsigned long long) random64());
+-    const std::string tmp_path = dir + tmp;
++    const std::string tmp_path = dir + "/tmp-" + name;
+     bool direct = false;
+     const int fd = open_direct(tmp_path, O_WRONLY | O_CREAT | O_EXCL, direct);
+     if (fd < 0) { err = "create " + tmp_path + ": " + std::strerror(errno); return false; }
+@@ -449,8 +435,9 @@ struct ConversationDisk::Impl {
+     uint64_t next_id = 1, clock = 0, used_bytes = 0, queued_bytes = 0;
+     bool stop = false, working = false, urgent = false;
+     Stats stats;
+-    // the writer's own: its buffer, and the engine's heartbeat count it saw last and since when
++    // the writer's own: its buffer, the manifests' names, and the engine's heartbeat count it saw last and since when
+     AlignedBuf wbuf;
++    std::mt19937_64 rng{std::random_device{}()};
+     uint64_t beats = 0;
+     Clock::time_point quiet{};
+     std::thread writer;
+@@ -482,7 +469,6 @@ struct ConversationDisk::Impl {
+         used_bytes -= it->second.file_bytes;
+         release_locked(blobs_of(it->second.m));
+         entries.erase(it);
+-        ++stats.dropped;
+     }
+     // A blob that failed its check: gone, and so is every conversation that needs it.
+     void drop_blob_locked(const std::string& name) {
+@@ -613,9 +599,9 @@ struct ConversationDisk::Impl {
+                 err = x.what();
+             }
+             const size_t tokens = image->live.ids.size();
+-            image.reset();
+             lk.lock();
+-            queued_bytes -= e.ram;   // the image counts against the queue cap until it is gone from RAM
++            queued_bytes -= e.ram;   // the image counts against the queue cap until it is gone from RAM (just below)
++            e.image.reset();         // (the last reference is `image`: freed outside the lock)
+             std::string line;
+             if (!ok) {
+                 release_locked(held);
+@@ -627,7 +613,6 @@ struct ConversationDisk::Impl {
+                 e.file_bytes = done.file_bytes;
+                 e.used = ++clock;
+                 e.state = Entry::ready;
+-                e.image.reset();
+                 used_bytes += done.file_bytes;
+                 std::vector<uint64_t> old;
+                 for (const auto& [oid, o] : entries)
+@@ -643,13 +628,12 @@ struct ConversationDisk::Impl {
+                               (double) used_bytes / 1073741824.0, (double) budget / 1073741824.0);
+                 line = b;
+             }
+-            working = false;
++            lk.unlock();
++            image.reset();
++            if (log) log(line);
++            lk.lock();
++            working = false;   // (finish() returns once the line is out)
+             cv.notify_all();
+-            if (log) {
+-                lk.unlock();
+-                log(line);
+-                lk.lock();
+-            }
+         }
+     }
+ 
+@@ -662,11 +646,8 @@ struct ConversationDisk::Impl {
+         for (const auto& k : img.kv) {
+             Layer l{k.format, k.cells, k.heads, k.head_dim, k.page_size, k.pooled_rows, k.idx_dim, {}};
+             const auto p = parts_of(k);
+-            for (size_t q = 0; q < 5; ++q) {
+-                l.sizes[q] = p[q]->size();
+-                uint64_t c = 0;
+-                if (!chunk_bytes(l, q, c)) { err = "a K/V part does not divide into cells"; return false; }
+-            }
++            for (size_t q = 0; q < 5; ++q) l.sizes[q] = p[q]->size();
++            if (!divides(l)) { err = "a K/V part does not divide into cells"; return false; }
+             m.layers.push_back(l);
+         }
+         m.blocks.resize(block_count(m.layers));
+@@ -746,7 +727,7 @@ struct ConversationDisk::Impl {
+         uint8_t* p = wbuf.get(kPage + w.b.size());
+         std::memcpy(p + kPage, w.b.data(), w.b.size());
+         char name[40];
+-        std::snprintf(name, sizeof name, "c-%016llx.chat", (unsigned long long) random64());
++        std::snprintf(name, sizeof name, "c-%016llx.chat", (unsigned long long) rng());
+         sync_dir(dir);
+         if (!write_file(dir, name, p, session_hash64(w.b.data(), w.b.size(), kSeed), w.b.size(), go, err)) return false;
+         sync_dir(dir);
+@@ -901,7 +882,6 @@ bool ConversationDisk::load(const Match& match, SavedConversation& out, const Se
+         err = name + ": not the blob its name says";
+         return false;
+     };
+-    uint64_t read = 0;
+     std::string err;
+     auto bad = [&](const std::string& name) {
+         error = "disk tier: " + err;
+@@ -912,7 +892,6 @@ bool ConversationDisk::load(const Match& match, SavedConversation& out, const Se
+         const StateRef& s = i == 0 ? m.live.state : m.checks[i - 1].state;
+         const std::string name = blob_name('s', s.hash, s.bytes());
+         if (!read_blob(name, s.hash, s.bytes(), bufs[0], err)) return bad(name);
+-        read += kPage + s.bytes();
+         const uint8_t* p = bufs[0].get(0) + kPage;
+         const auto v = state_of(i == 0 ? r.live : r.checkpoints[i - 1]);
+         for (size_t q = 0; q < 5; ++q) {
+@@ -945,12 +924,9 @@ bool ConversationDisk::load(const Match& match, SavedConversation& out, const Se
+                 std::memcpy(p, src + s.to + (at - (size_t) s.at), n);
+                 return true;
+             });
+-        read += kPage + m.blocks[j].bytes;
+     }
+     e.used = ++d.clock;
+     ::utimensat(AT_FDCWD, d.path(e.name).c_str(), nullptr, 0);   // recency survives a restart
+-    ++d.stats.restored;
+-    d.stats.read_bytes += read;
+     out = std::move(r);
+     return true;
+ }

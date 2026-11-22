@@ -1,0 +1,380 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: blackhat-7 <44942105+blackhat-7@users.noreply.github.com>
+Date: Tue, 17 Nov 2026 08:03:29 +0530
+Subject: [PATCH 33/33] STRATA_NV_PSUM (opt-in): the NVIDIA helper returns one
+ weighted sum per token (the router publishes its weights; the host puts each
+ sum on the token's heaviest helper row), rounding-level
+
+---
+ include/strata/core/nv_helper_abi.h      |  5 +--
+ include/strata/core/remote_experts.hpp   |  7 +++++
+ include/strata/core/remote_meta.hpp      |  1 +
+ include/strata/core/verify.hpp           |  6 ++++
+ include/strata/kernels/native_router.hpp |  3 +-
+ src/core/nv_helper_plugin.cu             | 39 +++++++++++++++++++++---
+ src/core/remote_experts.cpp              | 38 ++++++++++++++++++++++-
+ src/core/verify.cpp                      |  5 +--
+ src/kernels/cuda/native_router.cu        |  9 +++---
+ src/program/generate.cpp                 |  6 ++++
+ 10 files changed, 104 insertions(+), 15 deletions(-)
+
+diff --git a/include/strata/core/nv_helper_abi.h b/include/strata/core/nv_helper_abi.h
+index 262f1cd33..d71ed120f 100644
+--- a/include/strata/core/nv_helper_abi.h
++++ b/include/strata/core/nv_helper_abi.h
+@@ -12,7 +12,7 @@
+ extern "C" {
+ #endif
+ 
+-#define SNV_ABI 5
++#define SNV_ABI 6
+ 
+ /// One layer's expert format (strata::kernels::cpu::NativeFmt's fields the GPU kernels read).
+ typedef struct SnvFmt {
+@@ -43,7 +43,8 @@ typedef struct SnvApi {
+     int (*set_signs)(const float* sx, int h, const float* sh, int ff);
+     /// Run the grouped experts on host_x, write host_out.  x_q8: host_x holds the n_tok rows as q8_1 blocks (the
+     /// engine quantized them), else as floats the card quantizes.  Returns at once; wait() joins.
+-    int (*launch)(const SnvFmt* fmt, int n_tok, int groups, int rows, int x_q8);
++    /// psum (STRATA_NV_PSUM): host_out gets n_tok rows, each token's rows summed with the metadata's weights, instead.
++    int (*launch)(const SnvFmt* fmt, int n_tok, int groups, int rows, int x_q8, int psum);
+     int (*wait)(void);
+     /// STRATA_NV_TIMING=1: the card's own time from a launch's first copy to its last write, summed over the launches
+     /// waited for (cudaEvent stamps; 0 when off).
+diff --git a/include/strata/core/remote_experts.hpp b/include/strata/core/remote_experts.hpp
+index 54954f0b0..9a62227e1 100644
+--- a/include/strata/core/remote_experts.hpp
++++ b/include/strata/core/remote_experts.hpp
+@@ -64,6 +64,10 @@ public:
+     double ms_begin() const { return ms_begin_; }
+     double ms_wait() const { return ms_wait_; }
+     double ms_copy() const { return ms_copy_; }   ///< NVIDIA helper: host time copying its rows into the window's rows
++    /// STRATA_NV_PSUM (NVIDIA helper only): the verifier's mapped input rows (the `x` dispatch receives) and its mapped
++    /// routing weights at the same token index; the card then returns one weighted sum per token (rounding-level).
++    void set_psum(const float* x_base, const float* w_base) { ps_x_base_ = x_base; ps_w_base_ = w_base; }
++    static bool psum_wanted();   ///< STRATA_NV_PSUM=1
+ 
+     /// STRATA_PREFILL_HELPER_SOURCE (opt-in): copy up to `n` cached blobs into the host buffers `dst[i]`
+     /// on this helper's own stream and wait.  `hit[i]` is set where this helper held (layer, expert); the
+@@ -141,6 +145,9 @@ private:
+     std::vector<int32_t> group_of_, group_id_;
+     std::vector<int32_t> start_, dst_, tok_, original_row_;
+     std::vector<unsigned long long> ptr_;
++    const float* ps_x_base_ = nullptr;   ///< STRATA_NV_PSUM: the verifier's mapped input rows
++    const float* ps_w_base_ = nullptr;   ///< ... and its mapped routing weights (null: off)
++    int64_t ps_ntok_ = 0;                ///< the last dispatch's tokens
+ };
+ 
+ /// STRATA_PREFILL_HELPER_SOURCE (opt-in): the prompt path's view of the expert tiers, where a blob a helper
+diff --git a/include/strata/core/remote_meta.hpp b/include/strata/core/remote_meta.hpp
+index 512b4ff4d..db0f00903 100644
+--- a/include/strata/core/remote_meta.hpp
++++ b/include/strata/core/remote_meta.hpp
+@@ -18,6 +18,7 @@ struct RemoteMeta {
+     int32_t dst[kRemoteCap];
+     int32_t tok[kRemoteCap];
+     int32_t count;
++    float w[kRemoteCap];   // STRATA_NV_PSUM: each row's routing weight (the NVIDIA helper sums rows per token)
+ };
+ 
+ }  // namespace strata::core
+diff --git a/include/strata/core/verify.hpp b/include/strata/core/verify.hpp
+index 9fea77154..c0915598f 100644
+--- a/include/strata/core/verify.hpp
++++ b/include/strata/core/verify.hpp
+@@ -86,6 +86,11 @@ public:
+     Verifier(const Verifier&) = delete;
+     Verifier& operator=(const Verifier&) = delete;
+     void set_remote_expert_opt(RemoteExpertOpt* opt) { remote_opt_ = opt; } // before init/capture
++    /// STRATA_NV_PSUM (before init/capture): every window publishes its routing weights to host_w_rows() before the
++    /// ring, so the NVIDIA helper can return one weighted sum per token instead of a row per expert.
++    void set_nv_psum(bool on) { nv_psum_ = on; }
++    const float* host_x_rows() const { return h_x_; }
++    const float* host_w_rows() const { return h_w_; }
+ 
+     /// The watchdog's view of the window in flight (issue #31): the layer, the GPU's sequence, the flags.
+     void diag(std::FILE* f) const;
+@@ -681,6 +686,7 @@ private:
+     std::function<bool(cudaStream_t, std::string&)> pre_launch_;   // set_pre_launch
+     int groups_[strata::kernels::kWindowMaxT + 1] = {};
+     float* h_ymiss_ = nullptr;   float* m_ymiss_ = nullptr;     // T * k * n_embd
++    bool nv_psum_ = false;       // STRATA_NV_PSUM (set_nv_psum)
+ 
+     // device
+     void* arena_ = nullptr;
+diff --git a/include/strata/kernels/native_router.hpp b/include/strata/kernels/native_router.hpp
+index c31faa830..de584e4f1 100644
+--- a/include/strata/kernels/native_router.hpp
++++ b/include/strata/kernels/native_router.hpp
+@@ -29,9 +29,10 @@ bool router_tail_on();
+ /// when no expert is a miss.  `ticket`: a zeroed device word, left zero.  n_tok 2..4, n_in 2560 only; false (nothing
+ /// launched) otherwise or without the HIP DPP router.  STRATA_SH_GATE_TAIL: with `w_sg` (one bf16 row of n_in) the
+ /// launch also writes sg_out[t], bitwise bf16_gemv_fp32_mmvf_multi(x, n_in, w_sg, sg_out, 1, n_in, 1, n_tok).
++/// `weights_out` (optional, mapped): the routing weights too, before the ring (STRATA_NV_PSUM).
+ bool native_router_tail(const float* x, const uint16_t* w, float* logits, int32_t* ids, float* weights, float* x_out,
+                         int32_t* ids_out, uint32_t* seq, unsigned* ticket, int n_tok, int n_in, void* stream,
+-                        const uint16_t* w_sg = nullptr, float* sg_out = nullptr);
++                        const uint16_t* w_sg = nullptr, float* sg_out = nullptr, float* weights_out = nullptr);
+ /// STRATA_ROUTE_RESIDENT: swap non-resident tail-rank experts for resident ones within `margin` logits (see the .cu).
+ /// `stats` is nullptr or 4 device uint64 counters: tail entries seen, swaps, non-resident before, non-resident after.
+ void native_route_resident(const float* logits, int32_t* ids, float* weights, const int32_t* res_layer, int n_tok, float margin,
+diff --git a/src/core/nv_helper_plugin.cu b/src/core/nv_helper_plugin.cu
+index 6b2ded781..8c84f6397 100644
+--- a/src/core/nv_helper_plugin.cu
++++ b/src/core/nv_helper_plugin.cu
+@@ -40,10 +40,30 @@ __global__ void stage_in(const Meta* __restrict__ hm, Meta* __restrict__ dm, con
+     for (int i = t; i < nx16; i += nt) dx[i] = hx[i];
+     for (int i = t; i < groups; i += nt) dm->ptr[i] = hm->ptr[i];
+     for (int i = t; i <= groups; i += nt) dm->start[i] = hm->start[i];
+-    for (int i = t; i < rows; i += nt) { dm->dst[i] = hm->dst[i]; dm->tok[i] = hm->tok[i]; }
++    for (int i = t; i < rows; i += nt) { dm->dst[i] = hm->dst[i]; dm->tok[i] = hm->tok[i]; dm->w[i] = hm->w[i]; }
+     if (t == 0) dm->count = hm->count;
+ }
+ 
++// STRATA_NV_PSUM: token t's rows summed with their routing weights, in row order (rounding-level vs the engine's own
++// combine order); one block row per token, so the x4 link carries n_tok rows instead of one per routed expert.
++__global__ void psum_rows(const float4* __restrict__ rows, const Meta* __restrict__ m, float4* __restrict__ out, int n_rows,
++                          int n4) {
++    const int tk = blockIdx.y;
++    for (int c = blockIdx.x * blockDim.x + threadIdx.x; c < n4; c += gridDim.x * blockDim.x) {
++        float4 acc = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
++        for (int i = 0; i < n_rows; ++i) {
++            if (m->tok[i] != tk) continue;
++            const float w = m->w[i];
++            const float4 r = rows[(size_t) m->dst[i] * n4 + c];
++            acc.x = fmaf(r.x, w, acc.x);
++            acc.y = fmaf(r.y, w, acc.y);
++            acc.z = fmaf(r.z, w, acc.z);
++            acc.w = fmaf(r.w, w, acc.w);
++        }
++        out[(size_t) tk * n4 + c] = acc;
++    }
++}
++
+ // The rows to the host in 16-byte stores: the down kernel writes one float per warp, and 4-byte writes over the
+ // chipset's PCIe x4 link cost several times the whole layer's compute.
+ __global__ void rows_to_host(const float4* __restrict__ src, float4* __restrict__ dst, int n4) {
+@@ -119,7 +139,7 @@ int p_open(int device, uint64_t pool_bytes, int cap_rows, int h, int ff, uint64_
+         ok(cudaHostGetDevicePointer((void**) &S.z_out, S.h_out, 0), "mapped result") &&
+         ok(cudaMalloc((void**) &S.d_q8, (size_t) CAP * (h / 32) * 36), "activation") &&
+         ok(cudaMalloc((void**) &S.d_xr, (size_t) CAP * h * sizeof(float)), "rotated input") &&
+-        ok(cudaMalloc((void**) &S.d_out, (size_t) CAP * h * sizeof(float)), "result") &&
++        ok(cudaMalloc((void**) &S.d_out, (size_t) (CAP + strata::kernels::kWindowMaxT) * h * sizeof(float)), "result") &&
+         ok(cudaMalloc(&S.d_scratch, scratch), "scratch");
+     // STRATA_NV_EXPDEC=1: the plugin's grouped experts stage their activations in LDS (EXPDEC, bitwise the same sums);
+     // a setter, not STRATA_EXPDEC, so the HIP engine's own kernels keep theirs
+@@ -188,7 +208,7 @@ int p_set_signs(const float* sx, int h, const float* sh, int ff) {
+ 
+ // No copy-engine work on this path (kernels move the bytes), so the adaptive tier's slot fills never queue in front
+ // of a layer.
+-int p_launch(const SnvFmt* f, int n_tok, int groups, int rows, int x_q8) {
++int p_launch(const SnvFmt* f, int n_tok, int groups, int rows, int x_q8, int psum) {
+     cudaSetDevice(S.dev);
+     if (S.t0) cudaEventRecord(S.t0, S.s);
+     const int nx16 = x_q8 ? n_tok * (S.h / 32) * 36 / 16 : 0;
+@@ -211,12 +231,21 @@ int p_launch(const SnvFmt* f, int n_tok, int groups, int rows, int x_q8) {
+     auto* m = (Meta*) S.d_meta;
+     strata::kernels::native_expert_grouped(L, m->ptr, m->start, &m->count, m->dst, m->tok, groups, rows, S.d_q8,
+                                            S.d_scratch, S.d_out, S.s);
++    const float* back = S.d_out;
++    int back_rows = rows;
++    if (psum) {   // the per-token sums go after the rows (d_out has room for a window's tokens there)
++        float* sums = S.d_out + (size_t) CAP * S.h;
++        psum_rows<<<dim3((unsigned) ((S.h / 4 + 255) / 256), (unsigned) n_tok), 256, 0, S.s>>>(
++            (const float4*) S.d_out, (const Meta*) S.d_meta, (float4*) sums, rows, S.h / 4);
++        back = sums;
++        back_rows = n_tok;
++    }
+     if (S.tg) cudaEventRecord(S.tg, S.s);
+-    const int n4 = rows * S.h / 4;
++    const int n4 = back_rows * S.h / 4;
+     // STRATA_X_NV_DELAY_US (measurement only): this card's layer this much longer, for causal profiling
+     static const int nv_delay = [] { const char* e = std::getenv("STRATA_X_NV_DELAY_US"); return e ? std::atoi(e) : 0; }();
+     if (nv_delay > 0) strata::kernels::spin_delay(nv_delay, S.s);
+-    rows_to_host<<<std::min(64, (n4 + 255) / 256), 256, 0, S.s>>>((const float4*) S.d_out, (float4*) S.z_out, n4);
++    rows_to_host<<<std::min(64, (n4 + 255) / 256), 256, 0, S.s>>>((const float4*) back, (float4*) S.z_out, n4);
+     if (S.t1) cudaEventRecord(S.t1, S.s);
+     return ok(cudaGetLastError(), "expert launch") ? 0 : -1;
+ }
+diff --git a/src/core/remote_experts.cpp b/src/core/remote_experts.cpp
+index 541a7fc16..10f5e9d65 100644
+--- a/src/core/remote_experts.cpp
++++ b/src/core/remote_experts.cpp
+@@ -608,6 +608,11 @@ bool RemoteExperts::claim(int64_t layer, const int32_t* ids, int64_t n_tok, int6
+     return true;
+ }
+ 
++bool RemoteExperts::psum_wanted() {
++    static const bool on = [] { const char* v = std::getenv("STRATA_NV_PSUM"); return v && v[0] == '1'; }();
++    return on;
++}
++
+ bool RemoteExperts::dispatch(int64_t layer, const float* x, int64_t n_tok, std::string& err) {
+     if (group_id_.empty()) return true;
+     BeginTimer timer{ms_begin_};
+@@ -631,13 +636,24 @@ bool RemoteExperts::dispatch(int64_t layer, const float* x, int64_t n_tok, std::
+     std::memcpy(meta->dst, dst_.data(), dst_.size() * sizeof(dst_[0]));
+     std::memcpy(meta->tok, tok_.data(), tok_.size() * sizeof(tok_[0]));
+     meta->count = (int32_t) group_id_.size();
++    const bool psum = nv_ != nullptr && ps_w_base_ != nullptr;
++    if (psum) {   // each packed row's routing weight, from the window's published weights at this group's tokens
++        const int64_t off = x - ps_x_base_;
++        if (off < 0 || off % H != 0 || off / H + n_tok > strata::kernels::kWindowMaxT) {
++            err = "STRATA_NV_PSUM: the expert rows are not the verifier's window rows";
++            return false;
++        }
++        const float* w = ps_w_base_ + (off / H) * 10;
++        for (size_t i = 0; i < original_row_.size(); ++i) meta->w[i] = w[original_row_[i]];
++        ps_ntok_ = n_tok;
++    }
+     const bool reduce = remote_opt_ && remote_opt_->active();
+     if (reduce) remote_opt_->prepare(*this, meta + 1);
+     if (nv_) {
+         const SnvFmt f{lfmt->gu_type, lfmt->d_type, lfmt->n_embd, lfmt->n_ff, lfmt->had_gu ? 1 : 0,
+                        lfmt->had_d ? 1 : 0, lfmt->had_block};
+         groups_ = (int32_t) group_id_.size();
+-        if (nv_->launch(&f, (int) n_tok, groups_, (int) dst_.size(), x_q8 ? 1 : 0) != 0) {
++        if (nv_->launch(&f, (int) n_tok, groups_, (int) dst_.size(), x_q8 ? 1 : 0, psum ? 1 : 0) != 0) {
+             err = std::string("NVIDIA helper: ") + nv_->last_error();
+             return false;
+         }
+@@ -692,6 +708,26 @@ bool RemoteExperts::finish(float* out, std::string& err) {
+         if (nv_->wait() != 0) { err = std::string("NVIDIA helper: ") + nv_->last_error(); return false; }
+         const auto w1 = std::chrono::steady_clock::now();
+         ms_wait_ += std::chrono::duration<double, std::milli>(w1 - w0).count();
++        if (ps_w_base_ != nullptr) {
++            // one weighted sum per token: it rides on the token's heaviest helper row, divided by that row's weight (the
++            // combine multiplies it back); the token's other helper rows are zero
++            const auto* meta = (const RemoteMeta*) h_meta_;
++            for (int64_t t = 0; t < ps_ntok_; ++t) {
++                int64_t carrier = -1;
++                for (size_t i = 0; i < original_row_.size(); ++i)
++                    if (original_row_[i] / 10 == t && (carrier < 0 || std::fabs(meta->w[i]) > std::fabs(meta->w[carrier])))
++                        carrier = (int64_t) i;
++                if (carrier < 0) continue;
++                for (size_t i = 0; i < original_row_.size(); ++i) {
++                    if (original_row_[i] / 10 != t) continue;
++                    float* dst = out + (size_t) original_row_[i] * H;
++                    if ((int64_t) i != carrier) { std::memset(dst, 0, (size_t) H * sizeof(float)); continue; }
++                    const float wc = meta->w[i];
++                    const float* sum = h_out_ + t * H;
++                    for (int64_t c = 0; c < H; ++c) dst[c] = sum[c] / wc;
++                }
++            }
++        } else
+         for (size_t i = 0; i < original_row_.size(); ++i)
+             std::memcpy(out + (size_t) original_row_[i] * H, h_out_ + i * H, (size_t) H * sizeof(float));
+         ms_copy_ += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - w1).count();
+diff --git a/src/core/verify.cpp b/src/core/verify.cpp
+index 422f26724..2fae60dfa 100644
+--- a/src/core/verify.cpp
++++ b/src/core/verify.cpp
+@@ -2263,7 +2263,8 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
+                     published = native_router_tail(mixed_ + tb * N, (const uint16_t*) w_router->data, logits_ + tb * NE,
+                                                    ids_ + tb * K, w_ + tb * K, m_x_ + tb * N, m_ids_ + tb * K, m_seq_,
+                                                    tail_ticket_, n, (int) N, cs,
+-                                                   w_sgt ? (const uint16_t*) w_sgt->data : nullptr, w_sgt ? sh_g_ + tb : nullptr);
++                                                   w_sgt ? (const uint16_t*) w_sgt->data : nullptr, w_sgt ? sh_g_ + tb : nullptr,
++                                                   nv_psum_ ? m_w_ + tb * K : nullptr);
+                     sg_tail = published && w_sgt != nullptr;
+                 }
+                 if (!published) {
+@@ -2322,7 +2323,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
+ #endif
+             // #578: the helper GPUs reduce with the routing weights - publish them; set_always_publish: the rows
+             // whatever the device's residency table says (pipelined windows)
+-            if (remote_opt_ || always_publish_)
++            if (remote_opt_ || always_publish_ || (nv_psum_ && !published))   // STRATA_NV_PSUM: the weights too
+                 doorbell_publish(xm, ids_ + tb * K, w_ + tb * K, (int64_t) n * N, (int64_t) n * K, m_x_ + tb * N,
+                                  m_ids_ + tb * K, m_w_ + tb * K, m_seq_, cs);
+             else if (!published) {
+diff --git a/src/kernels/cuda/native_router.cu b/src/kernels/cuda/native_router.cu
+index 302d55b48..1f504d7fa 100644
+--- a/src/kernels/cuda/native_router.cu
++++ b/src/kernels/cuda/native_router.cu
+@@ -355,7 +355,7 @@ template <int NT, int R>
+ __global__ void __launch_bounds__(256) router_tail_kernel(const float* x, const uint16_t* __restrict__ w, float* logits,
+                                                           int32_t* ids, float* weights, float* x_out, int32_t* ids_out,
+                                                           uint32_t* seq, unsigned* ticket, const uint16_t* __restrict__ w_sg,
+-                                                          float* sg_out) {
++                                                          float* sg_out, float* weights_out) {
+ #if defined(STRATA_ROUTE_DPP_DEVICE)
+     if (blockIdx.x < 512 / R) {
+         if constexpr (R == 1) mmvf_multi_block<256, NT, true>(x, kTailIn, w, logits, 512, kTailIn, NT);
+@@ -386,6 +386,7 @@ __global__ void __launch_bounds__(256) router_tail_kernel(const float* x, const
+         for (int i = 0; i < 16; ++i) values[i] = row[lane + i * 32];
+         const int id = route_values_dpp(values, ids + warp * 10, weights + warp * 10, lane);
+         if (lane < 10) ids_out[warp * 10 + lane] = id;
++        if (weights_out != nullptr && lane < 10) weights_out[warp * 10 + lane] = weights[warp * 10 + lane];   // this lane wrote it
+     }
+     __threadfence_system();
+     __syncthreads();
+@@ -460,7 +461,7 @@ bool router_tail_on() {
+ }
+ bool native_router_tail(const float* x, const uint16_t* w, float* logits, int32_t* ids, float* weights, float* x_out,
+                         int32_t* ids_out, uint32_t* seq, unsigned* ticket, int n_tok, int n_in, void* stream,
+-                        const uint16_t* w_sg, float* sg_out) {
++                        const uint16_t* w_sg, float* sg_out, float* weights_out) {
+ #if defined(STRATA_ROUTE_DPP_BUILT)
+     if (!stream || n_tok < 1 || n_tok > 4 || n_in != kTailIn || !ticket || !seq || !valid(w, (size_t) 512 * kTailIn * 2) ||
+         !valid(logits, (size_t) n_tok * 512 * 4) || !valid(ids, (size_t) n_tok * 10 * 4) || !valid(weights, (size_t) n_tok * 10 * 4) ||
+@@ -475,7 +476,7 @@ bool native_router_tail(const float* x, const uint16_t* w, float* logits, int32_
+         return r == 2 || r == 4 || r == 8 ? r : 1;
+     }();
+     const unsigned blocks = (unsigned) (512 / rows) + (w_sg != nullptr ? 1u : 0u);
+-#define STRATA_TAIL(NT, R) router_tail_kernel<NT, R><<<blocks, 256, 0, st>>>(x, w, logits, ids, weights, x_out, ids_out, seq, ticket, w_sg, sg_out)
++#define STRATA_TAIL(NT, R) router_tail_kernel<NT, R><<<blocks, 256, 0, st>>>(x, w, logits, ids, weights, x_out, ids_out, seq, ticket, w_sg, sg_out, weights_out)
+ #define STRATA_TAIL_R(NT) switch (rows) { case 2: STRATA_TAIL(NT, 2); break; case 4: STRATA_TAIL(NT, 4); break; \
+                                          case 8: STRATA_TAIL(NT, 8); break; default: STRATA_TAIL(NT, 1); break; }
+     switch (n_tok) {
+@@ -491,7 +492,7 @@ bool native_router_tail(const float* x, const uint16_t* w, float* logits, int32_
+     return true;
+ #else
+     (void) x; (void) w; (void) logits; (void) ids; (void) weights; (void) x_out; (void) ids_out; (void) seq; (void) ticket;
+-    (void) n_tok; (void) n_in; (void) stream; (void) w_sg; (void) sg_out;
++    (void) n_tok; (void) n_in; (void) stream; (void) w_sg; (void) sg_out; (void) weights_out;
+     return false;
+ #endif
+ }
+diff --git a/src/program/generate.cpp b/src/program/generate.cpp
+index 2c6831f03..e3851dd57 100644
+--- a/src/program/generate.cpp
++++ b/src/program/generate.cpp
+@@ -7745,6 +7745,8 @@ int main(int argc, char** argv) {
+                          (long long) remote_experts[(size_t) r].resident(), remote_experts[(size_t) r].gib());
+         }
+     }
++    // STRATA_NV_PSUM: the NVIDIA helper returns one weighted sum per token (the verifier publishes its routing weights)
++    const bool nv_psum = strata::core::RemoteExperts::psum_wanted() && o.expert_cache_remote[0] > 0 && remote_experts[0].nv();
+ 
+     // ---- Multi-GPU: the second GPU's expert tier, filled with the ranked pairs the primary does not hold
+     strata::core::PeerExperts peer;
+@@ -10241,6 +10243,7 @@ int main(int argc, char** argv) {
+             for (int st = 0; st + 1 < n_stages; ++st) stage_ver_p(st, 1).set_next(&stage_ver_p(st + 1, 1), &split_drive_b);
+         }
+         ver.set_remote_expert_opt(remote_opt.get());
++        ver.set_nv_psum(nv_psum);
+         if (pcie_balance() && n_stages == 1) ver.set_pcie_balance(&drive.d.pcie_model);
+         if (batch_mtp) ver.set_batch_graph_limit(64);   // --batch-mtp only: slot rotation makes many layouts (LRU); 0.1.39 keeps all
+         if (!ver.init(wt, g, ss, vh, native_head.loaded() || prefill_head_alias_bound ? &native_head : nullptr,
+@@ -10250,6 +10253,7 @@ int main(int argc, char** argv) {
+             std::fprintf(stderr, "strata serve: %s\n", err.c_str());
+             return 1;
+         }
++        if (nv_psum) remote_experts[0].set_psum(ver.host_x_rows(), ver.host_w_rows());
+         if (prefill_head_alias_bound) mtp.set_window_R(ver.final_R_all());
+         if (pipe) mtp.set_source_R(ver.final_R_all());   // the serial decode's rows (the last stage's even verifier)
+         auto free_slot_mtp_rows = [](float* p) { if (p != nullptr) (void) cudaFree(p); };
+@@ -18304,10 +18308,12 @@ int main(int argc, char** argv) {
+ #if defined(STRATA_HAVE_DFLASH2)
+         if (use_df2) ver.set_taps(df2.tap_layers());
+ #endif
++        ver.set_nv_psum(nv_psum);
+         if (!ver.init(wt, g, ss, vh, native_head.loaded() ? &native_head : nullptr, o.spec, err)) {
+             std::fprintf(stderr, "strata generate: %s\n", err.c_str());
+             return 1;
+         }
++        if (nv_psum) remote_experts[0].set_psum(ver.host_x_rows(), ver.host_w_rows());
+         const bool use_mtp = !o.mtp.empty();
+         if (use_mtp && !mtp.bind(wt, &native_head, ver.final_R_all(), err)) {
+             std::fprintf(stderr, "strata generate: %s\n", err.c_str());

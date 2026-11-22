@@ -1,0 +1,404 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: blackhat-7 <44942105+blackhat-7@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 04:46:09 +0530
+Subject: [PATCH 04/33] i-quant signs and IQ4 table lookups with v_perm on HIP
+
+Port of opt7/integrate d17c9e38 3acec79d onto v0.2.9: the IQ2/IQ3 sign step as v_perm_b32 byte selects
+(iq_signs.cuh) instead of the emulated __vcmpne4 / __vsub4, and the IQ4 codebook lookups in the v_perm form on every
+HIP target. Bitwise the old form on every codebook word (tests/hip/iq_signs.cu, target hip_iq_signs). v0.2.9's
+staged sign-mask tables (STRATA_IQ_STAGE_TABLES, opt-in) keep their own path.
+Measured on 0.1.43: expert kernels -12 to -16% (real weights, T=1-4), GPU rings -0.3 to -0.6 ms a round.
+---
+ CMakeLists.txt                           |  8 +++
+ include/strata/hip_compat/intrinsics.hpp |  8 ++-
+ src/kernels/cuda/iq_kernels.cu           | 77 +++++++-----------------
+ src/kernels/cuda/iq_signs.cuh            | 58 ++++++++++++++++++
+ src/kernels/cuda/native_mmvq.cu          |  2 +-
+ tests/hip/iq_signs.cu                    | 77 ++++++++++++++++++++++++
+ 6 files changed, 170 insertions(+), 60 deletions(-)
+ create mode 100644 src/kernels/cuda/iq_signs.cuh
+ create mode 100644 tests/hip/iq_signs.cu
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 7d1a0236b..2f3e9872a 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -1038,6 +1038,14 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
+       add_test(NAME hip_intrinsics COMMAND hip_intrinsics)
+       list(APPEND _strata_hip_tests hip_intrinsics)
+     endif()
++    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/hip/iq_signs.cu")
++      # the decode kernels' i-quant sign step against llama.cpp's __vcmpne4 / __vsub4 form, bitwise, all codebook words
++      add_executable(hip_iq_signs tests/hip/iq_signs.cu)
++      target_include_directories(hip_iq_signs PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/third_party/ggml")
++      target_link_libraries(hip_iq_signs PRIVATE strata_hip_runtime)
++      add_test(NAME hip_iq_signs COMMAND hip_iq_signs)
++      list(APPEND _strata_hip_tests hip_iq_signs)
++    endif()
+     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/hip/handoff.cpp")
+       add_executable(hip_handoff tests/hip/handoff.cpp)
+       target_link_libraries(hip_handoff PRIVATE strata_kernels strata_hip_runtime)
+diff --git a/include/strata/hip_compat/intrinsics.hpp b/include/strata/hip_compat/intrinsics.hpp
+index a3d13c328..bafbbd487 100644
+--- a/include/strata/hip_compat/intrinsics.hpp
++++ b/include/strata/hip_compat/intrinsics.hpp
+@@ -56,10 +56,12 @@ __device__ __forceinline__ int dp4a(int a, int b, int c) {
+ // CUDA's __byte_perm (default mode): result byte i is byte s.nibble[i] & 7 of the pair {y:x}, x the low word.
+ // HIP's own version indexes a byte array in private memory, which becomes scratch traffic in the i-quant table
+ // lookups; v_perm_b32 is the same selection in one instruction (selector bytes 0-3 pick from its second
+-// operand, 4-7 from its first), so the nibble selector is spread to bytes and masked to 0-7.
++// operand, 4-7 from its first), so the nibble selector is spread to bytes and masked to 0-7.  The spread is a first
++// v_perm (s's two low bytes to bytes 0 and 2; selector 12 gives 0) and one shift-or: 3 VALU ops for a
++// data-dependent selector where masks and shifts took 8 (the Q2_0 and IQ4 decode); a constant one still folds.
+ __device__ __forceinline__ uint32_t byte_perm(uint32_t x, uint32_t y, uint32_t s) {
+-    const uint32_t sel = (s & 0x7u) | ((s & 0x70u) << 4) | ((s & 0x700u) << 8) | ((s & 0x7000u) << 12);
+-    return __builtin_amdgcn_perm(y, x, sel);
++    const uint32_t t = __builtin_amdgcn_perm(0u, s, 0x0c010c00u);
++    return __builtin_amdgcn_perm(y, x, (t | (t << 4)) & 0x07070707u);
+ }
+ 
+ // The packed byte operations below work on all four lanes at once (SWAR, Hacker's Delight 2-18): gfx11/gfx12 have
+diff --git a/src/kernels/cuda/iq_kernels.cu b/src/kernels/cuda/iq_kernels.cu
+index 8262f5662..b6caeaa6f 100644
+--- a/src/kernels/cuda/iq_kernels.cu
++++ b/src/kernels/cuda/iq_kernels.cu
+@@ -11,6 +11,7 @@
+ #include "strata/kernels/gfx_arch.hpp"
+ #include "strata/kernels/dp4a.hpp"
+ #include "strata/kernels/q8_1_finite.hpp"
++#include "iq_signs.cuh"
+ #include "s26_tsum.cuh"
+ 
+ #include <cuda_fp16.h>
+@@ -54,9 +55,10 @@ __device__ __forceinline__ uint32_t unpack_ksigns(const uint8_t v) {
+     return s * 0x01010101;
+ }
+ __device__ __forceinline__ int2 get_int_from_table_16(const int& q4, const int8_t* table) {
+-#if defined(STRATA_HIP_GFX906)
++#if defined(__HIPCC__)
+     // AMD: llama.cpp's HIP lookup (vecdotq.cuh) - v_perm_b32 takes 3-bit byte indices, so the low and high halves
+-    // of the table are looked up and the index MSB picks between them: 4 perms per 8 values.
++    // of the table are looked up and the index MSB picks between them: 6 perms per 8 values, against 6 perms plus
++    // the spreading of 6 data-dependent __byte_perm selectors in the CUDA form.
+     const uint32_t* v32 = reinterpret_cast<const uint32_t*>(table);
+     const uint32_t q_even = (uint32_t) q4, q_odd = (uint32_t) q4 >> 4;
+     const uint32_t el = __builtin_amdgcn_perm(v32[1], v32[0], q_even & 0x07070707u);
+@@ -115,13 +117,10 @@ __device__ __forceinline__ float vec_dot_iq2_xxs_q8_1(const void* __restrict__ v
+ #pragma unroll
+     for (int k0 = 0; k0 < 8; k0 += 2) {
+         const uint2 grid_pos = ((const uint2*) iq2xxs_grid)[aux8[k0 / 2]];
+-        const uint32_t signs = unpack_ksigns(aux32 >> (7 * k0 / 2));
+-        const int signs0 = __vcmpne4(signs & 0x08040201, 0);
+-        const int grid0 = __vsub4(grid_pos.x ^ signs0, signs0);
++        int grid0, grid1;
++        iq_ksigned8(grid_pos.x, grid_pos.y, aux32 >> (7 * k0 / 2), grid0, grid1);
+         const int u0 = get_int_b4(bq8_1[iqs / 2].qs, k0 + 0);
+         sumi = ggml_cuda_dp4a(grid0, u0, sumi);
+-        const int signs1 = __vcmpne4(signs & 0x80402010, 0);
+-        const int grid1 = __vsub4(grid_pos.y ^ signs1, signs1);
+         const int u1 = get_int_b4(bq8_1[iqs / 2].qs, k0 + 1);
+         sumi = ggml_cuda_dp4a(grid1, u1, sumi);
+     }
+@@ -142,12 +141,9 @@ __device__ __forceinline__ float vec_dot_iq2_xs_q8_1(const void* __restrict__ vb
+ #pragma unroll
+     for (int l0 = 0; l0 < 8; l0 += 2) {
+         const uint2 grid_pos = ((const uint2*) iq2xs_grid)[q2[l0 / 2] & 0x1FF];
+-        const uint32_t signs = unpack_ksigns(q2[l0 / 2] >> 9);
+-        const int signs0 = __vcmpne4(signs & 0x08040201, 0);
+-        const int grid_l = __vsub4(grid_pos.x ^ signs0, signs0);
++        int grid_l, grid_h;
++        iq_ksigned8(grid_pos.x, grid_pos.y, q2[l0 / 2] >> 9, grid_l, grid_h);
+         const int u0 = get_int_b4(bq8_1[iqs / 2].qs, l0 + 0);
+-        const int signs1 = __vcmpne4(signs & 0x80402010, 0);
+-        const int grid_h = __vsub4(grid_pos.y ^ signs1, signs1);
+         const int u1 = get_int_b4(bq8_1[iqs / 2].qs, l0 + 1);
+         if (l0 < 4) {
+             sumi0 = ggml_cuda_dp4a(grid_l, u0, sumi0);
+@@ -176,10 +172,8 @@ __device__ __forceinline__ float vec_dot_iq2_s_q8_1(const void* __restrict__ vbq
+ #pragma unroll
+     for (int l0 = 0; l0 < 8; l0 += 2) {
+         const int* grid_pos = (const int*) (iq2s_grid + (qs[l0 / 2] | ((qh << (8 - l0)) & 0x300)));
+-        const int signs0 = __vcmpne4(((signs_packed_8[l0 / 2] & 0x03) << 7) | ((signs_packed_8[l0 / 2] & 0x0C) << 21), 0x00000000);
+-        const int signs1 = __vcmpne4(((signs_packed_8[l0 / 2] & 0x30) << 3) | ((signs_packed_8[l0 / 2] & 0xC0) << 17), 0x00000000);
+-        const int grid_l = __vsub4(grid_pos[0] ^ signs0, signs0);
+-        const int grid_h = __vsub4(grid_pos[1] ^ signs1, signs1);
++        int grid_l, grid_h;
++        iq_signed8(grid_pos[0], grid_pos[1], signs_packed_8[l0 / 2], grid_l, grid_h);
+         const int u0 = get_int_b4(bq8_1[iqs / 2].qs, l0 + 0);
+         const int u1 = get_int_b4(bq8_1[iqs / 2].qs, l0 + 1);
+         if (l0 < 4) {
+@@ -205,12 +199,9 @@ __device__ __forceinline__ float vec_dot_iq3_xxs_q8_1(const void* __restrict__ v
+ #pragma unroll
+     for (int l0 = 0; l0 < 8; l0 += 2) {
+         const int2 grid_pos = make_int2(iq3xxs_grid[q3[l0 + 0]], iq3xxs_grid[q3[l0 + 1]]);
+-        const uint32_t signs = unpack_ksigns(aux32 >> (7 * l0 / 2));
+-        const int signs0 = __vcmpne4(signs & 0x08040201, 0);
+-        const int grid_l = __vsub4(grid_pos.x ^ signs0, signs0);
++        int grid_l, grid_h;
++        iq_ksigned8(grid_pos.x, grid_pos.y, aux32 >> (7 * l0 / 2), grid_l, grid_h);
+         const int u0 = get_int_b4(bq8_1[iqs / 2].qs, l0 + 0);
+-        const int signs1 = __vcmpne4(signs & 0x80402010, 0);
+-        const int grid_h = __vsub4(grid_pos.y ^ signs1, signs1);
+         const int u1 = get_int_b4(bq8_1[iqs / 2].qs, l0 + 1);
+         sumi = ggml_cuda_dp4a(grid_l, u0, sumi);
+         sumi = ggml_cuda_dp4a(grid_h, u1, sumi);
+@@ -234,10 +225,8 @@ __device__ __forceinline__ float vec_dot_iq3_s_q8_1(const void* __restrict__ vbq
+     for (int l0 = 0; l0 < 8; l0 += 2) {
+         const int2 grid_pos = make_int2(iq3s_grid[qs[l0 + 0] | ((qh << (8 - l0)) & 0x100)],
+                                         iq3s_grid[qs[l0 + 1] | ((qh << (7 - l0)) & 0x100)]);
+-        const int signs0 = __vcmpne4(((signs_packed_8[l0 / 2] & 0x03) << 7) | ((signs_packed_8[l0 / 2] & 0x0C) << 21), 0x00000000);
+-        const int signs1 = __vcmpne4(((signs_packed_8[l0 / 2] & 0x30) << 3) | ((signs_packed_8[l0 / 2] & 0xC0) << 17), 0x00000000);
+-        const int grid_l = __vsub4(grid_pos.x ^ signs0, signs0);
+-        const int grid_h = __vsub4(grid_pos.y ^ signs1, signs1);
++        int grid_l, grid_h;
++        iq_signed8(grid_pos.x, grid_pos.y, signs_packed_8[l0 / 2], grid_l, grid_h);
+         const int u0 = get_int_b4(bq8_1[iqs / 2].qs, l0 + 0);
+         const int u1 = get_int_b4(bq8_1[iqs / 2].qs, l0 + 1);
+         sumi = ggml_cuda_dp4a(grid_l, u0, sumi);
+@@ -926,11 +915,7 @@ template<> struct Split<16> {   // IQ2_XXS
+ #pragma unroll
+         for (int k0 = 0; k0 < 8; k0 += 2) {
+             const uint2 grid_pos = grid_lut[aux8[k0 / 2]];
+-            const uint32_t signs = unpack_ksigns(aux32 >> (7 * k0 / 2));
+-            const int signs0 = __vcmpne4(signs & 0x08040201, 0);
+-            r.g[k0 + 0] = __vsub4(grid_pos.x ^ signs0, signs0);
+-            const int signs1 = __vcmpne4(signs & 0x80402010, 0);
+-            r.g[k0 + 1] = __vsub4(grid_pos.y ^ signs1, signs1);
++            iq_ksigned8(grid_pos.x, grid_pos.y, aux32 >> (7 * k0 / 2), r.g[k0 + 0], r.g[k0 + 1]);
+         }
+         r.ls = aux32 >> 27 | 1;
+         r.dw = __half2float(bq2->d);
+@@ -995,11 +980,7 @@ template<> struct Split<17> : SplitLs2 {   // IQ2_XS
+ #pragma unroll
+         for (int l0 = 0; l0 < 8; l0 += 2) {
+             const uint2 grid_pos = grid_lut[q2[l0 / 2] & 0x1FF];
+-            const uint32_t signs = unpack_ksigns(q2[l0 / 2] >> 9);
+-            const int signs0 = __vcmpne4(signs & 0x08040201, 0);
+-            r.g[l0 + 0] = __vsub4(grid_pos.x ^ signs0, signs0);
+-            const int signs1 = __vcmpne4(signs & 0x80402010, 0);
+-            r.g[l0 + 1] = __vsub4(grid_pos.y ^ signs1, signs1);
++            iq_ksigned8(grid_pos.x, grid_pos.y, q2[l0 / 2] >> 9, r.g[l0 + 0], r.g[l0 + 1]);
+         }
+         r.dw = __half2float(bq2->d);
+         return r;
+@@ -1024,10 +1005,7 @@ template<> struct Split<22> : SplitLs2 {   // IQ2_S
+ #pragma unroll
+         for (int l0 = 0; l0 < 8; l0 += 2) {
+             const int* grid_pos = (const int*) (grid_lut + (qs[l0 / 2] | ((qh << (8 - l0)) & 0x300)));
+-            const int signs0 = __vcmpne4(((signs_packed_8[l0 / 2] & 0x03) << 7) | ((signs_packed_8[l0 / 2] & 0x0C) << 21), 0x00000000);
+-            const int signs1 = __vcmpne4(((signs_packed_8[l0 / 2] & 0x30) << 3) | ((signs_packed_8[l0 / 2] & 0xC0) << 17), 0x00000000);
+-            r.g[l0 + 0] = __vsub4(grid_pos[0] ^ signs0, signs0);
+-            r.g[l0 + 1] = __vsub4(grid_pos[1] ^ signs1, signs1);
++            iq_signed8(grid_pos[0], grid_pos[1], signs_packed_8[l0 / 2], r.g[l0 + 0], r.g[l0 + 1]);
+         }
+         r.dw = __half2float(bq2->d);
+         return r;
+@@ -1055,11 +1033,7 @@ template<> struct Split<18> {   // IQ3_XXS
+                 r.g[l0 + 0] = (int) ((grid_pos.x ^ ml) + (ml & 0x01010101u));
+                 r.g[l0 + 1] = (int) ((grid_pos.y ^ mh) + (mh & 0x01010101u));
+             } else {
+-                const uint32_t signs = unpack_ksigns(aux32 >> (7 * l0 / 2));
+-                const int signs0 = __vcmpne4(signs & 0x08040201, 0);
+-                r.g[l0 + 0] = __vsub4(grid_pos.x ^ signs0, signs0);
+-                const int signs1 = __vcmpne4(signs & 0x80402010, 0);
+-                r.g[l0 + 1] = __vsub4(grid_pos.y ^ signs1, signs1);
++                iq_ksigned8(grid_pos.x, grid_pos.y, aux32 >> (7 * l0 / 2), r.g[l0 + 0], r.g[l0 + 1]);
+             }
+         }
+         r.ls = aux32 >> 28;
+@@ -1107,10 +1081,7 @@ template<> struct Split<21> {   // IQ3_S
+                 r.g[l0 + 0] = (int) (((uint32_t) grid_pos.x ^ ml) + (ml & 0x01010101u));
+                 r.g[l0 + 1] = (int) (((uint32_t) grid_pos.y ^ mh) + (mh & 0x01010101u));
+             } else {
+-                const int signs0 = __vcmpne4(((signs_packed_8[l0 / 2] & 0x03) << 7) | ((signs_packed_8[l0 / 2] & 0x0C) << 21), 0x00000000);
+-                const int signs1 = __vcmpne4(((signs_packed_8[l0 / 2] & 0x30) << 3) | ((signs_packed_8[l0 / 2] & 0xC0) << 17), 0x00000000);
+-                r.g[l0 + 0] = __vsub4(grid_pos.x ^ signs0, signs0);
+-                r.g[l0 + 1] = __vsub4(grid_pos.y ^ signs1, signs1);
++                iq_signed8(grid_pos.x, grid_pos.y, signs_packed_8[l0 / 2], r.g[l0 + 0], r.g[l0 + 1]);
+             }
+         }
+         r.ls = 1 + 2 * ((bq3->scales[iqs / 4] >> ((iqs << 1) & 0x04)) & 0x0F);
+@@ -3550,10 +3521,7 @@ template<bool NT> struct S26Split<21, NT> {   // IQ3_S: Split<21>::load with the
+         for (int l0 = 0; l0 < 8; l0 += 2) {
+             const int2 grid_pos = make_int2(iq3s_grid[qs[l0 + 0] | ((qh << (8 - l0)) & 0x100)],
+                                             iq3s_grid[qs[l0 + 1] | ((qh << (7 - l0)) & 0x100)]);
+-            const int signs0 = __vcmpne4(((signs_packed_8[l0 / 2] & 0x03) << 7) | ((signs_packed_8[l0 / 2] & 0x0C) << 21), 0x00000000);
+-            const int signs1 = __vcmpne4(((signs_packed_8[l0 / 2] & 0x30) << 3) | ((signs_packed_8[l0 / 2] & 0xC0) << 17), 0x00000000);
+-            r.g[l0 + 0] = __vsub4(grid_pos.x ^ signs0, signs0);
+-            r.g[l0 + 1] = __vsub4(grid_pos.y ^ signs1, signs1);
++            iq_signed8(grid_pos.x, grid_pos.y, signs_packed_8[l0 / 2], r.g[l0 + 0], r.g[l0 + 1]);
+         }
+         r.ls = 1 + 2 * ((ld8i<NT>(bq3->scales + iqs / 4) >> ((iqs << 1) & 0x04)) & 0x0F);
+         r.dw = ldhalf<NT>(&bq3->d);
+@@ -3591,10 +3559,7 @@ struct S26IQ3S {   // Split<21>::load with the grid from `grid` (LT) or iq3s_gri
+         for (int l0 = 0; l0 < 8; l0 += 2) {
+             const int i0 = qs[l0 + 0] | ((qh << (8 - l0)) & 0x100), i1 = qs[l0 + 1] | ((qh << (7 - l0)) & 0x100);
+             const int2 grid_pos = LT ? make_int2(grid[i0], grid[i1]) : make_int2(iq3s_grid[i0], iq3s_grid[i1]);
+-            const int signs0 = __vcmpne4(((signs_packed_8[l0 / 2] & 0x03) << 7) | ((signs_packed_8[l0 / 2] & 0x0C) << 21), 0x00000000);
+-            const int signs1 = __vcmpne4(((signs_packed_8[l0 / 2] & 0x30) << 3) | ((signs_packed_8[l0 / 2] & 0xC0) << 17), 0x00000000);
+-            r.g[l0 + 0] = __vsub4(grid_pos.x ^ signs0, signs0);
+-            r.g[l0 + 1] = __vsub4(grid_pos.y ^ signs1, signs1);
++            iq_signed8(grid_pos.x, grid_pos.y, signs_packed_8[l0 / 2], r.g[l0 + 0], r.g[l0 + 1]);
+         }
+         r.ls = 1 + 2 * ((bq3->scales[iqs / 4] >> ((iqs << 1) & 0x04)) & 0x0F);
+         r.dw = __half2float(bq3->d);
+diff --git a/src/kernels/cuda/iq_signs.cuh b/src/kernels/cuda/iq_signs.cuh
+new file mode 100644
+index 000000000..92063eae7
+--- /dev/null
++++ b/src/kernels/cuda/iq_signs.cuh
+@@ -0,0 +1,58 @@
++// src/kernels/cuda/iq_signs.cuh - the sign step of the i-quant dot products (IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS,
++// IQ3_S): codebook bytes negated where their sign bit is set.
++//
++// llama.cpp writes it __vsub4(g ^ m, m) with m = __vcmpne4 of the sign bits, and CUDA keeps that form.  HIP has no
++// byte-SIMD compare or subtract, and hip_compat's emulation of the pair is ~15 VALU operations and a quarter-rate
++// multiply a word on gfx1100, most of the decode expert kernels' VALU time.  On HIP a 24-bit multiply spreads the
++// signs to one selector bit a byte, and v_perm_b32 picks each byte of g or of -g.  -g is computed for all four bytes
++// at once: no codebook byte is 0 (all are 1..62), so 256 - g never borrows from the next byte.  Every word is bit
++// for bit the __vsub4 one (tests/hip/iq_signs.cu checks all codebook words against all sign inputs).
++#pragma once
++
++#include <cstdint>
++
++namespace strata::kernels {
++
++#if defined(__HIPCC__)
++// g with byte k negated where bit k of n is set; n < 128, its bits 4-6 ignored.  The multiply puts copies of n at bit
++// offsets 2, 9, 16 and 23, which do not overlap, and the mask keeps bit k of copy k as bit 2 of selector byte k:
++// selector k picks byte k of g, k + 4 byte k of -g.
++__device__ __forceinline__ int iq_sign4(uint32_t g, uint32_t n) {
++    const uint32_t sel = (__umul24(n, 0x810204u) & 0x04040404u) | 0x03020100u;
++    return (int) __builtin_amdgcn_perm(0x01010100u - g, g, sel);
++}
++#endif
++
++// gx and gy with the signs of the byte s applied, bits 0-3 to gx and 4-7 to gy (IQ2_S, IQ3_S)
++__device__ __forceinline__ void iq_signed8(uint32_t gx, uint32_t gy, uint32_t s, int& qx, int& qy) {
++#if defined(__HIPCC__)
++    qx = iq_sign4(gx, s & 0x0fu);
++    qy = iq_sign4(gy, (s >> 4) & 0x0fu);
++#else
++    const int signs0 = __vcmpne4(((s & 0x03) << 7) | ((s & 0x0C) << 21), 0x00000000);
++    const int signs1 = __vcmpne4(((s & 0x30) << 3) | ((s & 0xC0) << 17), 0x00000000);
++    qx = __vsub4(gx ^ signs0, signs0);
++    qy = __vsub4(gy ^ signs1, signs1);
++#endif
++}
++
++// The same for the 7-bit sign groups of IQ2_XXS, IQ2_XS and IQ3_XXS (bits 0-6 of v, the bits above ignored), the
++// eighth sign the parity of the seven
++__device__ __forceinline__ void iq_ksigned8(uint32_t gx, uint32_t gy, uint32_t v, int& qx, int& qy) {
++#if defined(__HIPCC__)
++    // bit 3 of the high nibble is popc's bit 0: v >> 4 has 3 bits, so the sum does not carry into it
++    v &= 0x7fu;
++    qx = iq_sign4(gx, v);
++    qy = iq_sign4(gy, (v >> 4) + (__popc(v) << 3));
++#else
++    // llama.cpp's unpack_ksigns: bit 7 of the byte replaced by the parity, the byte broadcast
++    const uint8_t v8 = (uint8_t) v;
++    const uint32_t signs = (v8 ^ (__popc(v8) & 1) << 7) * 0x01010101;
++    const int signs0 = __vcmpne4(signs & 0x08040201, 0);
++    const int signs1 = __vcmpne4(signs & 0x80402010, 0);
++    qx = __vsub4(gx ^ signs0, signs0);
++    qy = __vsub4(gy ^ signs1, signs1);
++#endif
++}
++
++}  // namespace strata::kernels
+diff --git a/src/kernels/cuda/native_mmvq.cu b/src/kernels/cuda/native_mmvq.cu
+index 0f2bdf7dc..aced927a3 100644
+--- a/src/kernels/cuda/native_mmvq.cu
++++ b/src/kernels/cuda/native_mmvq.cu
+@@ -453,7 +453,7 @@ __device__ __align__(4) int8_t iq4nl_values[16] = {
+ };
+ 
+ __device__ __forceinline__ int2 iq4_table_lookup(int q4) {
+-#if defined(STRATA_HIP_GFX906)
++#if defined(__HIPCC__)
+     // AMD: llama.cpp's HIP lookup (see iq_kernels.cu get_int_from_table_16): 4 v_perm_b32 per 8 values
+     const uint32_t* v32 = reinterpret_cast<const uint32_t*>(iq4nl_values);
+     const uint32_t q_even = (uint32_t) q4, q_odd = (uint32_t) q4 >> 4;
+diff --git a/tests/hip/iq_signs.cu b/tests/hip/iq_signs.cu
+new file mode 100644
+index 000000000..5deb3e648
+--- /dev/null
++++ b/tests/hip/iq_signs.cu
+@@ -0,0 +1,77 @@
++// The i-quant sign step of the decode kernels (src/kernels/cuda/iq_signs.cuh) against llama.cpp's __vcmpne4 /
++// __vsub4 form, which iq_kernels.cu used before, bit for bit: every 32-bit word of the five codebooks (IQ2_XXS, IQ2_XS,
++// IQ2_S, IQ3_XXS, IQ3_S) with every sign byte, and for the 7-bit sign groups with every 10-bit input (the callers
++// pass the group with the next one's bits above it).  GPU, no model.
++#include "../../src/kernels/cuda/iq_signs.cuh"
++
++#define GGML_COMMON_DECL_CUDA
++#define GGML_COMMON_IMPL_CUDA
++#include "ggml-common.h"
++
++#include <cstdint>
++#include <cstdio>
++
++namespace {
++
++constexpr int kWords = 2 * 256 + 2 * 512 + 2 * 1024 + 256 + 512;
++
++__device__ uint32_t codebook_word(int i) {
++    if (i < 512) return ((const uint32_t*) iq2xxs_grid)[i];
++    if ((i -= 512) < 1024) return ((const uint32_t*) iq2xs_grid)[i];
++    if ((i -= 1024) < 2048) return ((const uint32_t*) iq2s_grid)[i];
++    if ((i -= 2048) < 256) return iq3xxs_grid[i];
++    return iq3s_grid[i - 256];
++}
++
++// iq_kernels.cu before iq_signs.cuh: the 7-bit groups (unpack_ksigns, its argument a uint8_t) and the sign bytes
++__device__ void ref_ksigned8(uint32_t gx, uint32_t gy, uint32_t v, int& qx, int& qy) {
++    const uint8_t v8 = (uint8_t) v;
++    const uint32_t signs = (v8 ^ (__popc(v8) & 1) << 7) * 0x01010101u;
++    const int m0 = __vcmpne4(signs & 0x08040201, 0), m1 = __vcmpne4(signs & 0x80402010, 0);
++    qx = __vsub4(gx ^ m0, m0);
++    qy = __vsub4(gy ^ m1, m1);
++}
++__device__ void ref_signed8(uint32_t gx, uint32_t gy, uint32_t s, int& qx, int& qy) {
++    const int m0 = __vcmpne4(((s & 0x03) << 7) | ((s & 0x0C) << 21), 0x00000000);
++    const int m1 = __vcmpne4(((s & 0x30) << 3) | ((s & 0xC0) << 17), 0x00000000);
++    qx = __vsub4(gx ^ m0, m0);
++    qy = __vsub4(gy ^ m1, m1);
++}
++
++// thread i: word i % kWords as both gx and gy, sign input i / kWords
++__global__ void check_signs(bool ksigns, int n_inputs, unsigned long long* bad) {
++    const int i = blockIdx.x * blockDim.x + threadIdx.x;
++    if (i >= kWords * n_inputs) return;
++    const uint32_t g = codebook_word(i % kWords), v = (uint32_t) (i / kWords);
++    int ax, ay, bx, by;
++    if (ksigns) {
++        strata::kernels::iq_ksigned8(g, g, v, ax, ay);
++        ref_ksigned8(g, g, v, bx, by);
++    } else {
++        strata::kernels::iq_signed8(g, g, v, ax, ay);
++        ref_signed8(g, g, v, bx, by);
++    }
++    if (ax != bx || ay != by) atomicAdd(bad, 1ull);
++}
++
++}  // namespace
++
++int main() {
++    unsigned long long* bad = nullptr;
++    if (hipMalloc(&bad, 2 * sizeof(*bad)) != hipSuccess || hipMemset(bad, 0, 2 * sizeof(*bad)) != hipSuccess) {
++        std::fprintf(stderr, "iq_signs: no GPU memory\n");
++        return 2;
++    }
++    const int n_inputs[2] = {256, 1024};   // sign bytes; 7-bit groups with 3 more bits above
++    for (int k = 0; k < 2; ++k)
++        check_signs<<<(kWords * n_inputs[k] + 255) / 256, 256>>>(k == 1, n_inputs[k], bad + k);
++    unsigned long long h[2] = {};
++    if (hipMemcpy(h, bad, sizeof(h), hipMemcpyDeviceToHost) != hipSuccess) {
++        std::fprintf(stderr, "iq_signs: kernel failed\n");
++        return 2;
++    }
++    (void) hipFree(bad);
++    std::printf("iq_signs: sign bytes %llu of %d differ, 7-bit groups %llu of %d differ\n", h[0], kWords * n_inputs[0],
++                h[1], kWords * n_inputs[1]);
++    return h[0] || h[1] ? 1 : 0;
++}

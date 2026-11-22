@@ -1,0 +1,772 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: blackhat-7 <44942105+blackhat-7@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 04:06:26 +0530
+Subject: [PATCH 01/33] HC read on gfx1100: pipelined staged down
+ (STRATA_GR_PIPE) and the read in one kernel (STRATA_GR_ONE)
+
+Port of opt7/integrate 432ff3be 4078a4f3 8f3ced2a 50c6c675 210ebbdd onto v0.2.9.
+- gr_down_pipe_kernel: the staged down projection with LDS-only barriers and pipelined loads, on by default on
+  gfx1100 (STRATA_GR_PIPE=0/1 forces it); same sums in the same order as gr_down_staged_kernel.
+- gr_one_kernel: norm, pipelined down and q32 up of a 1-6 token read in one launch (roles by block, counters),
+  default on where the pipe runs (STRATA_GR_ONE=0: three kernels). fused_gr_check runs it bit for bit against the
+  plain read at start and turns it off if it differs or a wait times out; generate/serve stop if a wait times out.
+- Not with v0.2.9's int8 HC weights (STRATA_HC_REQ8: s_down set) or sm_75 token groups (HIP has none).
+- Dropped STRATA_GR_DOWN_WARPS (9f78384c): measured no faster.
+Measured on 0.1.43: pipe code +6.5%, edit +8.9%; one kernel read 1.16-1.40x at 1-6 tokens, decode +1.5-2.5%.
+---
+ include/strata/kernels/fused_gr.hpp |   4 +
+ src/kernels/cuda/fused_gr.cu        | 583 +++++++++++++++++++++++++++-
+ src/kernels/fused_gr_bench.cpp      |  17 +-
+ src/program/generate.cpp            |  11 +
+ 4 files changed, 610 insertions(+), 5 deletions(-)
+
+diff --git a/include/strata/kernels/fused_gr.hpp b/include/strata/kernels/fused_gr.hpp
+index cc264fad7..c8cd6d12b 100644
+--- a/include/strata/kernels/fused_gr.hpp
++++ b/include/strata/kernels/fused_gr.hpp
+@@ -89,6 +89,10 @@ void fused_gr_set_fast(int on);
+ /// plain read unless STRATA_HC_SPLIT=1 or 2 names a variant.
+ void fused_gr_check();
+ int fused_gr_variant();
++/// The waits of the one-kernel read (gfx1100, STRATA_GR_ONE) that gave up on the current card since the startup check.
++/// A wait gives up only when its blocks starve for ~1M polls; its counters can then stay out of step, so a later read
++/// could race or stall without any error: callers stop instead of continuing.
++unsigned fused_gr_one_timeouts();
+ 
+ /// Opt-in STRATA_HC_PERSIST=1 (HIP): the multi read as one persistent kernel (80 resident blocks, the down projection
+ /// split by column slices, two grid barriers).  Another summation order (not bitwise).
+diff --git a/src/kernels/cuda/fused_gr.cu b/src/kernels/cuda/fused_gr.cu
+index 9e504694f..3e99e76cb 100644
+--- a/src/kernels/cuda/fused_gr.cu
++++ b/src/kernels/cuda/fused_gr.cu
+@@ -21,6 +21,7 @@
+ #include <cstdio>
+ #include <cstdlib>
+ #include <cstring>
++#include <mutex>
+ #include <random>
+ #include <string>
+ #include <vector>
+@@ -1169,6 +1170,426 @@ __global__ void __launch_bounds__(THREADS) gr_down_staged_kernel(GrMulti m) {
+     }
+ }
+ 
++#if defined(__HIPCC__) && !defined(STRATA_HIP_GFX906)
++// ======================== gfx1100: the staged down projection, pipelined (STRATA_GR_PIPE) ========================
++// The staged down kernel's rows, tiles, lanes and sums in the same order (the same bits), with the memory latency
++// hidden.  On gfx11 __syncthreads() waits for every outstanding global load before its barrier (the workgroup release
++// fence is s_waitcnt vmcnt(0) in WGP mode), so the staged kernel's weight prefetch landed at the next barrier: each of
++// its 8 tiles exposed a DRAM round trip, and its staging copy waited for one load at a time.  Here the barriers fence
++// shared memory only, a tile's activations are loaded into registers a tile ahead and its weights two tiles ahead.
++// The final sums use DPP instead of ds_bpermute (the same xor pairs, so the same bits).
++__device__ __forceinline__ void lds_sync() {
++    __builtin_amdgcn_fence(__ATOMIC_RELEASE, "workgroup", "local");
++    __builtin_amdgcn_s_barrier();
++    __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "workgroup", "local");
++}
++
++// warp_sum's butterfly: xor 16 (permlanex16), then 8, 4, 2, 1 (DPP row_xmask)
++__device__ __forceinline__ float warp_sum_dpp(float v) {
++    v += __int_as_float((int) __builtin_amdgcn_permlanex16((unsigned) __float_as_int(v), (unsigned) __float_as_int(v),
++                                                           0x76543210u, 0xfedcba98u, false, false));
++    v += __int_as_float(__builtin_amdgcn_update_dpp(0, __float_as_int(v), 0x168, 0xf, 0xf, false));
++    v += __int_as_float(__builtin_amdgcn_update_dpp(0, __float_as_int(v), 0x164, 0xf, 0xf, false));
++    v += __int_as_float(__builtin_amdgcn_update_dpp(0, __float_as_int(v), 0x162, 0xf, 0xf, false));
++    v += __int_as_float(__builtin_amdgcn_update_dpp(0, __float_as_int(v), 0x161, 0xf, 0xf, false));
++    return v;
++}
++
++// gr_down_staged_kernel<T, true> pipelined.  A wait for a load is a wait for every load issued before it, so the loads
++// go out in the order they are needed: tile h + 1's activations, then tile h + 2's weights.
++template <int T>
++__global__ void __launch_bounds__(THREADS) gr_down_pipe_kernel(GrMulti m) {
++    extern __shared__ __align__(16) float4 hbuf[];      // 2 buffers x (the staged kernel's [T][2 planes][160] + pad)
++    constexpr int TF4 = T * (H_TILE / 4);                // float4 of a tile, every token
++    constexpr int SPT = (TF4 + THREADS - 1) / THREADS;   // of them a thread stages
++    constexpr int BUF = SPT * THREADS;                   // a buffer: the tile, then the pad the spare slots fill
++    constexpr int PD = 2;                                // tiles of weights in flight
++    const int t = threadIdx.x, lane = t & 31, warp = t >> 5;
++    const bool inject_block = (int) blockIdx.x >= DOWN_BLOCKS;
++    const int row = inject_block ? warp : (int) blockIdx.x * WARPS + warp;
++    const bool active = !(inject_block && (m.a[0].w_inject == nullptr || row >= HC));
++    // an idle warp (the inject block's spare rows) still loads row 0 of w_down, unused: a load under a branch makes
++    // every later wait count it as possibly missing, so the waits drain the prefetch
++    const uint4* w4 = reinterpret_cast<const uint4*>(active ? (inject_block ? m.a[0].w_inject : m.a[0].w_down) +
++                                                                  (size_t) row * D
++                                                            : m.a[0].w_down) + lane;
++    // slot s: float4 i = t + s THREADS of the tile, token k's float4 s4; a slot past the tile copies its last float4
++    // into the pad (no branch, so the slots stay in registers)
++    int src[SPT], dst[SPT];
++#pragma unroll
++    for (int s = 0; s < SPT; ++s) {
++        const int i = t + s * THREADS, ic = i < TF4 ? i : TF4 - 1, k = ic / (H_TILE / 4), s4 = ic - k * (H_TILE / 4);
++        src[s] = k * (D / 4) + s4;
++        dst[s] = i < TF4 ? k * (H_TILE / 4) + (s4 & 1) * (H_TILE / 8) + (s4 >> 1) : i;
++    }
++    using f4v = float __attribute__((ext_vector_type(4)));   // not float4: a struct copy goes through the stack
++    f4v* hb = reinterpret_cast<f4v*>(hbuf);
++    const f4v* xs = reinterpret_cast<const f4v*>(m.xn);
++    f4v sreg[SPT];
++    uint4 wv[PD + 1][HQ];
++    float acc[T];
++#pragma unroll
++    for (int k = 0; k < T; ++k) acc[k] = 0.0f;
++#pragma unroll
++    for (int s = 0; s < SPT; ++s) sreg[s] = xs[src[s]];
++#pragma unroll
++    for (int h = 0; h < PD; ++h)
++#pragma unroll
++        for (int q = 0; q < HQ; ++q) wv[h][q] = __ldg(w4 + h * (H_TILE / 8) + 32 * q);
++#pragma unroll
++    for (int s = 0; s < SPT; ++s) hb[dst[s]] = sreg[s];
++#pragma unroll
++    for (int s = 0; s < SPT; ++s) sreg[s] = xs[H_TILE / 4 + src[s]];
++    lds_sync();
++#pragma unroll
++    for (int h = 0; h < N_HTILES; ++h) {
++        if (h + 1 < N_HTILES) {                          // tile h + 1 into the buffer every warp left at the barrier
++#pragma unroll
++            for (int s = 0; s < SPT; ++s) hb[((h + 1) & 1) * BUF + dst[s]] = sreg[s];
++        }
++        if (h + 2 < N_HTILES) {
++#pragma unroll
++            for (int s = 0; s < SPT; ++s) sreg[s] = xs[(h + 2) * (H_TILE / 4) + src[s]];
++        }
++        if (h + PD < N_HTILES) {
++#pragma unroll
++            for (int q = 0; q < HQ; ++q)
++                wv[(h + PD) % (PD + 1)][q] = __ldg(w4 + (h + PD) * (H_TILE / 8) + 32 * q);
++        }
++        if (active) {
++            const float4* cur = hbuf + (h & 1) * BUF;
++#pragma unroll
++            for (int q = 0; q < HQ; ++q) {
++                const int j = lane + 32 * q;
++                const Bf16x8 wq = unpack8(wv[h % (PD + 1)][q]);
++#pragma unroll
++                for (int k = 0; k < T; ++k) {
++                    const float4* pk = cur + k * (H_TILE / 4);
++                    acc[k] += dot8u(wq, pk[j], pk[H_TILE / 8 + j]);
++                }
++            }
++        }
++        lds_sync();
++    }
++    if (!active) return;
++#pragma unroll
++    for (int k = 0; k < T; ++k) {
++        const float s = warp_sum_dpp(acc[k]);
++        if (lane != k) continue;
++        if (inject_block) {
++            m.a[k].inject_out[row] = s;
++        } else {
++            const float x = s / (float) HC;
++            m.a[k].lo[row] = x / (1.0f + __expf(-x));
++        }
++    }
++}
++
++// gr_down_pipe_kernel<T>'s two padded buffers
++constexpr size_t down_pipe_smem(int T) { return (size_t) 2 * ((T * (H_TILE / 4) + THREADS - 1) / THREADS) * THREADS * sizeof(float4); }
++
++// ======================== gfx1100: the staged read in one kernel (STRATA_GR_ONE) ========================
++// gr_norm_split_fast_kernel, gr_down_pipe_kernel<T> and gr_up_q32_kernel<T> as roles of one launch, by block: [0, T*HC)
++// the norm of one (token, stream) each, the next DOWN_BLOCKS + 1 the down projection, the last ONE_UP_BLOCKS the up
++// projection of 32 columns x 4 streams.  Each value is computed with those kernels' operations in their order (the
++// same bits; fused_gr_check compares it with the plain read).  The down blocks load their first weight tiles and the
++// up blocks all of theirs (6.5 MB, in registers) before they wait for the role before them, so the weights stream
++// while the norm and the down projection run, and two of the read's three launches are gone.  A role waits on a
++// counter of the role before it; roles are in block order, so a block only waits for blocks dispatched before it.
++// cnt: [0] norm blocks done, [1] down blocks done, [2] up blocks past their wait; zero between launches (norm block 0
++// resets them once the last up block passed its wait).  A wait gives up after ~1M polls and counts in *err.
++constexpr int ONE_COLS = 32, ONE_UP_BLOCKS = N / ONE_COLS;   // 80
++
++__device__ __forceinline__ void one_wait(const unsigned* p, unsigned v, unsigned* err) {
++    if (threadIdx.x == 0) {
++        unsigned it = 0;
++        while (__hip_atomic_load(p, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT) < v) {
++            __builtin_amdgcn_s_sleep(1);
++            if (++it == (1u << 20)) { atomicAdd(err, 1u); break; }
++        }
++    }
++    lds_sync();
++    asm volatile("buffer_gl0_inv\n\tbuffer_gl1_inv" ::: "memory");   // the producers' data, not this CU's stale copy
++}
++__device__ __forceinline__ void one_signal(unsigned* p) {
++    __threadfence();
++    __syncthreads();
++    if (threadIdx.x == 0) {
++        __threadfence();
++        atomicAdd(p, 1u);
++    }
++}
++// warp_sum's stages 4, 2, 1 inside each 8 lanes
++__device__ __forceinline__ float xor8_dpp(float v) {
++    v += __int_as_float(__builtin_amdgcn_update_dpp(0, __float_as_int(v), 0x164, 0xf, 0xf, false));
++    v += __int_as_float(__builtin_amdgcn_update_dpp(0, __float_as_int(v), 0x162, 0xf, 0xf, false));
++    v += __int_as_float(__builtin_amdgcn_update_dpp(0, __float_as_int(v), 0x161, 0xf, 0xf, false));
++    return v;
++}
++
++// gr_norm_split_fast_kernel for (token, stream) b
++template <int T>
++__device__ __forceinline__ void one_norm(const GrMulti& m, int b, unsigned* cnt, unsigned* err, float* sm) {
++    float* part = sm;
++    float* s_rs = sm + WARPS;
++    const int kt = b / HC, c = b - kt * HC;
++    const FusedGrArgs& a = m.a[kt];
++    float* xn = m.xn + (size_t) kt * D;
++    const int t = threadIdx.x, lane = t & 31, warp = t >> 5;
++    const float gw = a.apply ? 2.0f * sigmoidf_(a.inj_prev[c] / (float) HC) : 0.0f;
++    constexpr int KS = 3;
++    int k0 = (c * N - 4 * t + THREADS * 4 - 1) / (THREADS * 4);
++    if (k0 < 0) k0 = 0;
++    float4 r[KS], g[KS];
++    bool ok[KS];
++#pragma unroll
++    for (int j = 0; j < KS; ++j) {
++        const int i = t * 4 + (k0 + j) * THREADS * 4;
++        ok[j] = i < (c + 1) * N;
++        if (ok[j]) {
++            r[j] = *reinterpret_cast<const float4*>(a.R + i);
++            g[j] = *reinterpret_cast<const float4*>(a.w_norm + i);
++            if (a.apply) {
++                const float4 bb = *reinterpret_cast<const float4*>(a.bo_prev + (i - c * N));
++                r[j].x = fmaf(bb.x, gw, r[j].x); r[j].y = fmaf(bb.y, gw, r[j].y);
++                r[j].z = fmaf(bb.z, gw, r[j].z); r[j].w = fmaf(bb.w, gw, r[j].w);
++            }
++        }
++    }
++    float ss = 0.0f;
++#pragma unroll
++    for (int j = 0; j < KS; ++j) {
++        if (ok[j]) {
++            // the contraction the other norm kernels compile to, spelled out: inlined here the compiler picks another
++            const float sq = fmaf(r[j].w, r[j].w, fmaf(r[j].z, r[j].z, fmaf(r[j].x, r[j].x, r[j].y * r[j].y)));
++            ss += sq;
++            r[j] = make_float4(r[j].x * g[j].x, r[j].y * g[j].y, r[j].z * g[j].z, r[j].w * g[j].w);
++        }
++    }
++    const float v = warp_sum(ss);
++    if (lane == 0) part[warp] = v;
++    __syncthreads();
++    if (t == 0) {
++        float s = 0.0f;
++        for (int w = 0; w < WARPS; ++w) s += part[w];
++        s_rs[0] = rsqrtf(s / (float) N + a.eps);
++        a.rs[c] = s_rs[0];
++    }
++    __syncthreads();
++    const float rs = s_rs[0];
++#pragma unroll
++    for (int j = 0; j < KS; ++j)
++        if (ok[j])
++            *reinterpret_cast<float4*>(xn + t * 4 + (k0 + j) * THREADS * 4) =
++                make_float4(r[j].x * rs, r[j].y * rs, r[j].z * rs, r[j].w * rs);
++    one_signal(cnt);
++    if (b == 0 && t == 0) {   // idle from here: reset the counters once no block reads them any more
++        unsigned it = 0;
++        while (__hip_atomic_load(cnt + 2, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT) < (unsigned) ONE_UP_BLOCKS) {
++            __builtin_amdgcn_s_sleep(2);
++            if (++it == (1u << 20)) { atomicAdd(err, 1u); break; }
++        }
++        atomicExch(cnt + 0, 0u);
++        atomicExch(cnt + 1, 0u);
++        atomicExch(cnt + 2, 0u);
++    }
++}
++
++// gr_down_pipe_kernel<T> for down block bd, its first PD weight tiles loaded before the wait for the norm
++template <int T>
++__device__ __forceinline__ void one_down(const GrMulti& m, int bd, unsigned* cnt, unsigned* err, float4* hbuf) {
++    constexpr int TF4 = T * (H_TILE / 4);
++    constexpr int SPT = (TF4 + THREADS - 1) / THREADS;
++    constexpr int BUF = SPT * THREADS;
++    constexpr int PD = 2;
++    const int t = threadIdx.x, lane = t & 31, warp = t >> 5;
++    const bool inject_block = bd >= DOWN_BLOCKS;
++    const int row = inject_block ? warp : bd * WARPS + warp;
++    const bool active = !(inject_block && (m.a[0].w_inject == nullptr || row >= HC));
++    const uint4* w4 = reinterpret_cast<const uint4*>(active ? (inject_block ? m.a[0].w_inject : m.a[0].w_down) +
++                                                                  (size_t) row * D
++                                                            : m.a[0].w_down) + lane;
++    int src[SPT], dst[SPT];
++#pragma unroll
++    for (int s = 0; s < SPT; ++s) {
++        const int i = t + s * THREADS, ic = i < TF4 ? i : TF4 - 1, k = ic / (H_TILE / 4), s4 = ic - k * (H_TILE / 4);
++        src[s] = k * (D / 4) + s4;
++        dst[s] = i < TF4 ? k * (H_TILE / 4) + (s4 & 1) * (H_TILE / 8) + (s4 >> 1) : i;
++    }
++    using f4v = float __attribute__((ext_vector_type(4)));
++    f4v* hb = reinterpret_cast<f4v*>(hbuf);
++    const f4v* xs = reinterpret_cast<const f4v*>(m.xn);
++    f4v sreg[SPT];
++    uint4 wv[PD + 1][HQ];
++    float acc[T];
++#pragma unroll
++    for (int k = 0; k < T; ++k) acc[k] = 0.0f;
++#pragma unroll
++    for (int h = 0; h < PD; ++h)
++#pragma unroll
++        for (int q = 0; q < HQ; ++q) wv[h][q] = __ldg(w4 + h * (H_TILE / 8) + 32 * q);
++    one_wait(cnt, T * HC, err);
++#pragma unroll
++    for (int s = 0; s < SPT; ++s) sreg[s] = xs[src[s]];
++#pragma unroll
++    for (int s = 0; s < SPT; ++s) hb[dst[s]] = sreg[s];
++#pragma unroll
++    for (int s = 0; s < SPT; ++s) sreg[s] = xs[H_TILE / 4 + src[s]];
++    lds_sync();
++#pragma unroll
++    for (int h = 0; h < N_HTILES; ++h) {
++        if (h + 1 < N_HTILES) {
++#pragma unroll
++            for (int s = 0; s < SPT; ++s) hb[((h + 1) & 1) * BUF + dst[s]] = sreg[s];
++        }
++        if (h + 2 < N_HTILES) {
++#pragma unroll
++            for (int s = 0; s < SPT; ++s) sreg[s] = xs[(h + 2) * (H_TILE / 4) + src[s]];
++        }
++        if (h + PD < N_HTILES) {
++#pragma unroll
++            for (int q = 0; q < HQ; ++q)
++                wv[(h + PD) % (PD + 1)][q] = __ldg(w4 + (h + PD) * (H_TILE / 8) + 32 * q);
++        }
++        if (active) {
++            const float4* cur = hbuf + (h & 1) * BUF;
++#pragma unroll
++            for (int q = 0; q < HQ; ++q) {
++                const int j = lane + 32 * q;
++                const Bf16x8 wq = unpack8(wv[h % (PD + 1)][q]);
++#pragma unroll
++                for (int k = 0; k < T; ++k) {
++                    const float4* pk = cur + k * (H_TILE / 4);
++                    acc[k] += dot8u(wq, pk[j], pk[H_TILE / 8 + j]);
++                }
++            }
++        }
++        lds_sync();
++    }
++    if (active) {
++#pragma unroll
++        for (int k = 0; k < T; ++k) {
++            const float s = warp_sum_dpp(acc[k]);
++            if (lane != k) continue;
++            if (inject_block) {
++                m.a[k].inject_out[row] = s;
++            } else {
++                const float x = s / (float) HC;
++                m.a[k].lo[row] = x / (1.0f + __expf(-x));
++            }
++        }
++    }
++    one_signal(cnt + 1);
++}
++
++// gr_up_q32_kernel<T> for columns [32 bu, 32 bu + 32): a column's stream row is 8 lanes, lane j holding the q32 kernel's
++// lanes j, j + 8, j + 16, j + 24 and chunk 32 + j, so its butterfly's stages 16 and 8 are the in-lane sums below
++template <int T>
++__device__ __forceinline__ void one_up(const GrMulti& m, int bu, unsigned* cnt, unsigned* err, float* sm) {
++    float (*lo)[LR] = reinterpret_cast<float (*)[LR]>(sm);
++    float (*rsS)[HC] = reinterpret_cast<float (*)[HC]>(sm + T * LR);
++    float (*g)[HC][ONE_COLS] = reinterpret_cast<float (*)[HC][ONE_COLS]>(sm + T * LR + T * HC);
++    float (*ms)[ONE_COLS] = reinterpret_cast<float (*)[ONE_COLS]>(sm + T * LR + T * HC + T * HC * ONE_COLS);
++    const int t = threadIdx.x, j = t & 7, grp = t >> 3, lane = t & 31, warp = t >> 5;
++    const int d0 = bu * ONE_COLS;
++    uint4 w[HC][5];
++#pragma unroll
++    for (int c = 0; c < HC; ++c) {
++        const uint4* w4 = reinterpret_cast<const uint4*>(m.a[0].w_up + (size_t) (c * N + d0 + grp) * LR);
++#pragma unroll
++        for (int q = 0; q < 4; ++q) w[c][q] = __ldg(w4 + j + 8 * q);
++        w[c][4] = __ldg(w4 + 32 + j);
++    }
++    float rv[HC] = {}, wn[HC] = {}, bo[HC] = {}, ip[HC] = {};
++    bool apply = false;
++    if (j < T) {
++        const FusedGrArgs& a = m.a[j];
++        apply = a.apply;
++#pragma unroll
++        for (int c = 0; c < HC; ++c) {
++            const int i = c * N + d0 + grp;
++            rv[c] = a.R[i];
++            wn[c] = a.w_norm[i];
++            if (apply) { bo[c] = a.bo_prev[d0 + grp]; ip[c] = a.inj_prev[c]; }
++        }
++    }
++    one_wait(cnt + 1, DOWN_BLOCKS + 1, err);
++    if (t == 0) atomicAdd(cnt + 2, 1u);
++    for (int i = t; i < T * LR; i += THREADS) lo[i / LR][i % LR] = m.a[i / LR].lo[i % LR];
++    if (t < T * HC) rsS[t / HC][t % HC] = m.a[t / HC].rs[t % HC];
++    __syncthreads();
++    float mine[HC] = {};
++#pragma unroll
++    for (int k = 0; k < T; ++k) {
++        const float4* l4 = reinterpret_cast<const float4*>(lo[k]);
++        const float4 a0 = l4[2 * j], a1 = l4[2 * j + 1], b0 = l4[2 * (j + 8)], b1 = l4[2 * (j + 8) + 1];
++        const float4 c0 = l4[2 * (j + 16)], c1 = l4[2 * (j + 16) + 1], e0 = l4[2 * (j + 24)], e1 = l4[2 * (j + 24) + 1];
++        const float4 f0 = l4[2 * (32 + j)], f1 = l4[2 * (32 + j) + 1];
++#pragma unroll
++        for (int c = 0; c < HC; ++c) {
++            const float p0 = dot8u(unpack8(w[c][0]), a0, a1) + dot8u(unpack8(w[c][4]), f0, f1);   // q32 lane j
++            const float p1 = dot8u(unpack8(w[c][1]), b0, b1);                                    // lane j + 8
++            const float p2 = dot8u(unpack8(w[c][2]), c0, c1);                                    // lane j + 16
++            const float p3 = dot8u(unpack8(w[c][3]), e0, e1);                                    // lane j + 24
++            const float s = xor8_dpp((p0 + p2) + (p1 + p3));
++            if (j == k) mine[c] = s;
++        }
++    }
++    if (j < T) {
++#pragma unroll
++        for (int c = 0; c < HC; ++c) {
++            float x0 = rv[c];
++            if (apply) {
++                x0 = fmaf(bo[c], 2.0f * sigmoidf_(ip[c] / (float) HC), x0);
++                m.a[j].R_out[c * N + d0 + grp] = x0;
++            }
++            const float x = x0 * wn[c] * rsS[j][c];
++            g[j][c][grp] = x * sigmoidf_(mine[c]);
++        }
++    }
++    __syncthreads();
++    for (int i = t; i < T * ONE_COLS; i += THREADS) {
++        const int k = i / ONE_COLS, col = i - k * ONE_COLS;
++        float s = 0.0f;
++#pragma unroll
++        for (int c = 0; c < HC; ++c) s += g[k][c][col];
++        const float v = s / (float) HC;
++        m.a[k].mixed[d0 + col] = v;
++        ms[k][col] = v;
++    }
++    if (m.a[0].q8_mixed != nullptr) {
++        __syncthreads();
++        if (warp < T) {
++            const float xi = ms[warp][lane];
++            float amax = fabsf(xi), sum = xi;
++#pragma unroll
++            for (int o = 16; o > 0; o >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));
++#pragma unroll
++            for (int o = 16; o > 0; o >>= 1) sum += __shfl_xor_sync(0xffffffffu, sum, o);
++            const float d = q8_1_finite(amax / 127.0f);
++            const int8_t q = q8_1_quant(xi, d, amax);
++            GrQ81* y = reinterpret_cast<GrQ81*>(m.a[warp].q8_mixed) + d0 / 32;
++            y->qs[lane] = q;
++            if (lane == 0) y->ds = q8_1_ds(d, sum);
++        }
++    }
++}
++
++template <int T>
++__global__ void __launch_bounds__(THREADS) gr_one_kernel(GrMulti m, unsigned* cnt, unsigned* err) {
++    extern __shared__ __align__(16) float4 one_smem4[];
++    constexpr int NN = T * HC, ND = DOWN_BLOCKS + 1;
++    const int b = blockIdx.x;
++    if (b < NN) one_norm<T>(m, b, cnt, err, reinterpret_cast<float*>(one_smem4));
++    else if (b < NN + ND) one_down<T>(m, b - NN, cnt, err, one_smem4);
++    else one_up<T>(m, b - NN - ND, cnt, err, reinterpret_cast<float*>(one_smem4));
++}
++constexpr size_t one_smem(int T) {
++    const size_t up = (size_t) (T * LR + T * HC + T * HC * ONE_COLS + T * ONE_COLS) * sizeof(float);
++    return down_pipe_smem(T) > up ? down_pipe_smem(T) : up;
++}
++#endif
++
+ // the current device is Volta (sm_70): the fast norm/up is its default
+ bool cur_dev_volta() {
+ #if defined(__HIPCC__)
+@@ -1251,6 +1672,10 @@ int down_chunk(bool staged, int* tile_out) {
+         set_staged_attr(gr_down_staged_kernel<6, true>, 6);
+         set_staged_attr(gr_down_staged_kernel<4, false>, 4);
+         set_staged_attr(gr_down_staged_kernel<kFusedGrMaxT, false>, kFusedGrMaxT);
++#if defined(__HIPCC__) && !defined(STRATA_HIP_GFX906)
++        cudaFuncSetAttribute(gr_down_pipe_kernel<5>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) down_pipe_smem(5));
++        cudaFuncSetAttribute(gr_down_pipe_kernel<6>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) down_pipe_smem(6));
++#endif
+         cudaGetLastError();      // drop any error the attempt left behind
+         // The opt-in is a promise a pre-Volta card does not keep: an sm_60 answers 65536 and accepts the
+         // cudaFuncSetAttribute for 61440 B, then fails the LAUNCH with "invalid argument".  What such a card
+@@ -1380,8 +1805,116 @@ static int gr_r2() {
+     static const int v = [] { const char* e = std::getenv("STRATA_GR_R2"); return e != nullptr ? std::atoi(e) : 2; }();
+     return v == 1 || v == 2 || v == 4 ? v : 0;
+ }
++#if defined(__HIPCC__) && !defined(STRATA_HIP_GFX906)
++// the pipelined staged down kernel (gr_down_pipe_kernel): gfx1100 only until another arch is measured;
++// STRATA_GR_PIPE=0 / 1 forces it off / on
++bool gr_pipe_on() {
++    static const int env = [] { const char* e = std::getenv("STRATA_GR_PIPE"); return e != nullptr ? (std::atoi(e) != 0 ? 1 : 0) : -1; }();
++    if (env >= 0) return env != 0;
++    static int per_dev[64];   // 0 unknown, 1 no, 2 yes
++    int dev = 0;
++    if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) return false;
++    if (!per_dev[dev]) {
++        cudaDeviceProp p;
++        per_dev[dev] = cudaGetDeviceProperties(&p, dev) == cudaSuccess && strata::kernels::gfx_arch_is(p.gcnArchName, "gfx1100") ? 2 : 1;
++    }
++    return per_dev[dev] == 2;
++}
++// gr_one_kernel's counters: per device, a slot per activations scratch (two reads in flight at once never share one),
++// slot 0 the timeouts.  Allocated by fused_gr_check before any graph is captured; no slot = the three kernels.
++constexpr int kOneSlots = 64, kOneSlotU = 16;   // 64 B a slot
++struct OnePool {
++    unsigned* base = nullptr;
++    std::vector<const float*> xn;
++    bool off = false;   // the check rejected it on this card
++};
++OnePool g_one[64];
++std::mutex g_one_mu;
++
++void one_setup() {
++    int dev = 0;
++    if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) return;
++    std::lock_guard<std::mutex> lk(g_one_mu);
++    OnePool& p = g_one[dev];
++    if (p.base) return;
++    const size_t bytes = sizeof(unsigned) * kOneSlots * kOneSlotU;
++    if (cudaFuncSetAttribute(gr_one_kernel<5>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) one_smem(5)) != cudaSuccess ||
++        cudaFuncSetAttribute(gr_one_kernel<6>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) one_smem(6)) != cudaSuccess ||
++        cudaMalloc((void**) &p.base, bytes) != cudaSuccess || cudaMemset(p.base, 0, bytes) != cudaSuccess) {
++        (void) cudaGetLastError();
++        if (p.base) (void) cudaFree(p.base);
++        p.base = nullptr;   // no gr_one_kernel on this card
++    }
++}
++
++// STRATA_GR_ONE=0: the staged read as three kernels again (default: one, where the pipelined down runs)
++bool gr_one_on() {
++    static const bool env_off = [] { const char* e = std::getenv("STRATA_GR_ONE"); return e != nullptr && std::atoi(e) == 0; }();
++    return !env_off && gr_pipe_on();
++}
++
++unsigned* one_err(int dev) { return g_one[dev].base; }
++
++// the staged read of n_tok <= 6 tokens as gr_one_kernel; false = not here (the caller launches the three kernels)
++bool launch_one(const GrMulti& m, cudaStream_t st) {
++    static const bool no_multi_gr = [] {
++        const char* no = std::getenv("STRATA_NO_MULTI_GR");
++        return no != nullptr && no[0] != '\0' && no[0] != '0';
++    }();
++    if (m.T > 6 || no_multi_gr || !gr_one_on() || m.a[0].s_down != nullptr ||
++        (m.a[0].q8_mixed != nullptr && !qfuse_hc_local()))
++        return false;
++    int dev = 0;
++    if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) return false;
++    unsigned* cnt = nullptr;
++    {
++        std::lock_guard<std::mutex> lk(g_one_mu);
++        OnePool& p = g_one[dev];
++        if (!p.base || p.off) return false;
++        size_t i = 0;
++        while (i < p.xn.size() && p.xn[i] != m.xn) ++i;
++        if (i == p.xn.size()) {
++            if ((int) i + 1 >= kOneSlots) return false;
++            p.xn.push_back(m.xn);
++        }
++        cnt = p.base + kOneSlotU * (i + 1);
++    }
++    unsigned* err = one_err(dev);
++    const unsigned blocks = (unsigned) (m.T * HC + DOWN_BLOCKS + 1 + ONE_UP_BLOCKS);
++    switch (m.T) {
++        case 1: gr_one_kernel<1><<<blocks, THREADS, one_smem(1), st>>>(m, cnt, err); break;
++        case 2: gr_one_kernel<2><<<blocks, THREADS, one_smem(2), st>>>(m, cnt, err); break;
++        case 3: gr_one_kernel<3><<<blocks, THREADS, one_smem(3), st>>>(m, cnt, err); break;
++        case 4: gr_one_kernel<4><<<blocks, THREADS, one_smem(4), st>>>(m, cnt, err); break;
++        case 5: gr_one_kernel<5><<<blocks, THREADS, one_smem(5), st>>>(m, cnt, err); break;
++        default: gr_one_kernel<6><<<blocks, THREADS, one_smem(6), st>>>(m, cnt, err); break;
++    }
++    return true;
++}
++
++void launch_down_pipe(const GrMulti& c, int ct, cudaStream_t st) {
++    const size_t smem = down_pipe_smem(ct);
++    switch (ct) {
++        case 1: gr_down_pipe_kernel<1><<<DOWN_BLOCKS + 1, THREADS, smem, st>>>(c); break;
++        case 2: gr_down_pipe_kernel<2><<<DOWN_BLOCKS + 1, THREADS, smem, st>>>(c); break;
++        case 3: gr_down_pipe_kernel<3><<<DOWN_BLOCKS + 1, THREADS, smem, st>>>(c); break;
++        case 4: gr_down_pipe_kernel<4><<<DOWN_BLOCKS + 1, THREADS, smem, st>>>(c); break;
++        case 5: gr_down_pipe_kernel<5><<<DOWN_BLOCKS + 1, THREADS, smem, st>>>(c); break;
++        default: gr_down_pipe_kernel<6><<<DOWN_BLOCKS + 1, THREADS, smem, st>>>(c); break;
++    }
++}
++#endif
+ void launch_multi(const GrMulti& m, int variant, cudaStream_t st, unsigned long long* stamp_buf, int stamp_i0) {
+     const int n_tok = m.T;
++#if defined(__HIPCC__) && !defined(STRATA_HIP_GFX906)
++    if (variant >= kHcStaged && launch_one(m, st)) {   // the whole read in one kernel: both stamps after it
++        if (stamp_buf) {
++            gpu_stamp(stamp_buf, stamp_i0, (void*) st);
++            gpu_stamp(stamp_buf, stamp_i0 + 1, (void*) st);
++        }
++        return;
++    }
++#endif
+     const bool q8w = m.a[0].s_down != nullptr;   // STRATA_HC_REQ8: w_down / w_up hold int8 codes
+ #if STRATA_GR_FAST_BUILD
+     // gfx906: the latency-hidden norm/up (STRATA_GR_FAST=0: off) - the same sums in the same order as the kernels
+@@ -1435,6 +1968,10 @@ void launch_multi(const GrMulti& m, int variant, cudaStream_t st, unsigned long
+                 else if (tg == 2) gr_down_staged_kernel<2, true><<<grid, THREADS, sm_g, st>>>(c);
+                 else gr_down_staged_kernel<3, true><<<grid, THREADS, sm_g, st>>>(c);
+             } else
++#if defined(__HIPCC__) && !defined(STRATA_HIP_GFX906)
++            if (exact_t && ct <= 6 && gr_pipe_on()) launch_down_pipe(c, ct, st);
++            else
++#endif
+             if (exact_t && ct == 1) gr_down_staged_kernel<1, true><<<DOWN_BLOCKS + 1, THREADS, smem, st>>>(c);
+             else if (exact_t && ct == 2) gr_down_staged_kernel<2, true><<<DOWN_BLOCKS + 1, THREADS, smem, st>>>(c);
+             else if (exact_t && ct == 3) gr_down_staged_kernel<3, true><<<DOWN_BLOCKS + 1, THREADS, smem, st>>>(c);
+@@ -2789,7 +3326,29 @@ void fused_gr_check() {
+     }
+     bool okv[4];
+     std::string why[4];
+-    const bool ran = fused_gr_selftest(okv, why);
++#if defined(__HIPCC__) && !defined(STRATA_HIP_GFX906)
++    one_setup();
++#endif
++    bool ran = fused_gr_selftest(okv, why);
++#if defined(__HIPCC__) && !defined(STRATA_HIP_GFX906)
++    bool one = ran && gr_one_on() && g_one[dev].base != nullptr;
++    if (one) {   // the staged check ran gr_one_kernel for 1-6 tokens: if it failed, check the three kernels instead
++        unsigned timeouts = 0;
++        if (cudaMemcpy(&timeouts, one_err(dev), sizeof timeouts, cudaMemcpyDeviceToHost) != cudaSuccess) timeouts = ~0u;
++        if (!okv[kHcStaged] || timeouts != 0) {
++            const std::string what = timeouts != 0 ? std::string("timed out waiting")
++                                                   : "differs from the plain read: " + why[kHcStaged];
++            std::fprintf(stderr, "strata hc: CUDA%d: the read in one kernel (STRATA_GR_ONE) %s - not used\n", dev,
++                         what.c_str());
++            {
++                std::lock_guard<std::mutex> lk(g_one_mu);
++                g_one[dev].off = true;
++            }
++            one = false;
++            ran = fused_gr_selftest(okv, why);
++        }
++    }
++#endif
+     int use = kHcPlain;
+     if (want >= kHcStaged && okv[kHcStaged]) use = kHcStaged;
+     else if (okv[kHcSplit]) use = kHcSplit;
+@@ -2805,11 +3364,29 @@ void fused_gr_check() {
+         "", "the plain read (the norm per token, the down projection on 41 blocks)",
+         "split (the norm per token and stream, then the plain read's down projection)",
+         "staged (the norm per token and stream, the down projection's activations staged ahead by cp.async)"};
+-    std::fprintf(stderr, "strata hc: CUDA%d: the hyper-connection read runs as %s%s\n", dev, what[use],
++    std::fprintf(stderr, "strata hc: CUDA%d: the hyper-connection read runs as %s%s%s\n", dev, what[use],
+                  use >= kHcSplit ? "; checked bit for bit against the plain read on this card (STRATA_HC_SPLIT=1 or 0 "
+-                                   "for the earlier ones)" : "");
++                                   "for the earlier ones)" : "",
++#if defined(__HIPCC__) && !defined(STRATA_HIP_GFX906)
++                 use == kHcStaged && one ? "; 1-6 tokens in one kernel (STRATA_GR_ONE=0: three)" : "");
++#else
++                 "");
++#endif
+ }
+ 
++unsigned fused_gr_one_timeouts() {
++#if defined(__HIPCC__) && !defined(STRATA_HIP_GFX906)
++    int dev = 0;
++    if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) return 0;
++    std::lock_guard<std::mutex> lk(g_one_mu);
++    if (!g_one[dev].base || g_one[dev].off) return 0;   // off: the startup check's own timeouts, it is not used
++    unsigned n = 0;
++    if (cudaMemcpy(&n, g_one[dev].base, sizeof n, cudaMemcpyDeviceToHost) != cudaSuccess) return ~0u;
++    return n;
++#else
++    return 0;
++#endif
++}
+ 
+ namespace {
+ __global__ void hc_q8_bf16_kernel(const int8_t* __restrict__ q, const float* __restrict__ sc, uint16_t* __restrict__ out,
+diff --git a/src/kernels/fused_gr_bench.cpp b/src/kernels/fused_gr_bench.cpp
+index 677696cf1..6daf91cc5 100644
+--- a/src/kernels/fused_gr_bench.cpp
++++ b/src/kernels/fused_gr_bench.cpp
+@@ -90,6 +90,15 @@ int main(int argc, char** argv) {
+     cudaMalloc((void**) &dwd, wd.size() * 2);
+     cudaMalloc((void**) &dwu, wu.size() * 2);
+     cudaMalloc((void**) &dwi, wi.size() * 2);
++    // STRATA_BENCH_Q8=1: every token also gets its q8_1 image of `mixed` (the engine's STRATA_QFUSE / QFUSE_HC read)
++    const bool q8 = std::getenv("STRATA_BENCH_Q8") != nullptr && std::atoi(std::getenv("STRATA_BENCH_Q8")) != 0;
++    const size_t q8_tok = (size_t) (N / 32) * 36;
++    uint8_t* dq8 = nullptr;
++    unsigned* dcnt = nullptr;
++    cudaMalloc((void**) &dq8, (size_t) TM * q8_tok);
++    cudaMalloc((void**) &dcnt, (size_t) (N / 32) * sizeof(unsigned));
++    cudaMemset(dq8, 0, (size_t) TM * q8_tok);
++    cudaMemset(dcnt, 0, (size_t) (N / 32) * sizeof(unsigned));
+     cudaMemcpy(dbo, bo.data(), bo.size() * 4, cudaMemcpyHostToDevice);
+     cudaMemcpy(dinj, inj.data(), inj.size() * 4, cudaMemcpyHostToDevice);
+     cudaMemcpy(dwn, wn.data(), wn.size() * 4, cudaMemcpyHostToDevice);
+@@ -112,6 +121,7 @@ int main(int argc, char** argv) {
+                     a[t].w_norm = dwn; a[t].w_down = dwd; a[t].w_up = dwu; a[t].w_inject = inject ? dwi : nullptr;
+                     a[t].lo = dlo + (size_t) t * LR; a[t].rs = drs + (size_t) t * HC;
+                     a[t].inject_out = dio + (size_t) t * HC; a[t].mixed = dmix + (size_t) t * N;
++                    if (q8) { a[t].q8_mixed = dq8 + (size_t) t * q8_tok; a[t].q8_cnt = dcnt; }
+                 }
+                 std::vector<float> out[2];
+                 for (int f = 0; f < 2; ++f) {
+@@ -120,17 +130,19 @@ int main(int argc, char** argv) {
+                     cudaMemset(drs, 0xff, (size_t) TM * HC * 4);
+                     cudaMemset(dio, 0xff, (size_t) TM * HC * 4);
+                     cudaMemset(dmix, 0xff, (size_t) TM * N * 4);
++                    cudaMemset(dq8, 0xff, (size_t) TM * q8_tok);
+                     K::fused_gr_set_fast(f);
+                     K::fused_gr_read_multi(a, T, dxn, s);
+                     cudaStreamSynchronize(s);
+                     auto& o = out[f];
+-                    o.resize((size_t) TM * (D + LR + HC + HC + N));
++                    o.resize((size_t) TM * (D + LR + HC + HC + N) + (TM * q8_tok + 3) / 4);
+                     float* p = o.data();
+                     cudaMemcpy(p, dR, (size_t) TM * D * 4, cudaMemcpyDeviceToHost); p += (size_t) TM * D;
+                     cudaMemcpy(p, dlo, (size_t) TM * LR * 4, cudaMemcpyDeviceToHost); p += (size_t) TM * LR;
+                     cudaMemcpy(p, drs, (size_t) TM * HC * 4, cudaMemcpyDeviceToHost); p += (size_t) TM * HC;
+                     cudaMemcpy(p, dio, (size_t) TM * HC * 4, cudaMemcpyDeviceToHost); p += (size_t) TM * HC;
+-                    cudaMemcpy(p, dmix, (size_t) TM * N * 4, cudaMemcpyDeviceToHost);
++                    cudaMemcpy(p, dmix, (size_t) TM * N * 4, cudaMemcpyDeviceToHost); p += (size_t) TM * N;
++                    cudaMemcpy(p, dq8, (size_t) TM * q8_tok, cudaMemcpyDeviceToHost);
+                 }
+                 const bool same = std::memcmp(out[0].data(), out[1].data(), out[0].size() * 4) == 0;
+                 double us[2] = {1e30, 1e30};
+@@ -246,6 +258,7 @@ int main(int argc, char** argv) {
+                     if (f == 2) { a.q8_down = cqd[c]; a.q8_up = cqu[c]; }
+                     a.lo = dlo + (size_t) t * LR; a.rs = drs + (size_t) t * HC;
+                     a.inject_out = dio + (size_t) t * HC; a.mixed = dmix + (size_t) t * N;
++                    if (q8) { a.q8_mixed = dq8 + (size_t) t * q8_tok; a.q8_cnt = dcnt; }
+                 }
+             for (int rep = 0; rep < 2; ++rep) {
+                 for (int i = 0; i < iters; ++i) {
+diff --git a/src/program/generate.cpp b/src/program/generate.cpp
+index ce44646d8..cdfec7dae 100644
+--- a/src/program/generate.cpp
++++ b/src/program/generate.cpp
+@@ -58,6 +58,7 @@
+ #include "strata/kernels/sampler.hpp"
+ #include "strata/kernels/verify_kernels.hpp"
+ #include "strata/kernels/elementwise.hpp"
++#include "strata/kernels/fused_gr.hpp"
+ #include "strata/kernels/shared_expert.hpp"
+ #include "strata/kernels/native_moe.hpp"
+ #include "strata/kernels/native_gdn.hpp"
+@@ -17134,6 +17135,11 @@ int main(int argc, char** argv) {
+                 std::printf("ERR %s\n", err.c_str());
+                 return 1;
+             }
++            if (const unsigned n = strata::kernels::fused_gr_one_timeouts(); n != 0) {
++                std::printf("ERR the hyper-connection read in one kernel timed out %u times: restart the engine "
++                            "(STRATA_GR_ONE=0 avoids it)\n", n);
++                return 1;
++            }
+             if (dec_timing && dec_windows > 0) {
+                 const DecSnap d1 = dec_snap();
+                 const double w = (double) dec_windows, L = (double) g.n_layers;
+@@ -18745,6 +18751,11 @@ int main(int argc, char** argv) {
+             std::fprintf(stderr, "strata generate: %s\n", err.c_str());
+             return 1;
+         }
++        if (const unsigned n = strata::kernels::fused_gr_one_timeouts(); n != 0) {
++            std::fprintf(stderr, "strata generate: the hyper-connection read in one kernel timed out %u times "
++                                 "(STRATA_GR_ONE=0 avoids it)\n", n);
++            return 1;
++        }
+         if (hashes != nullptr) std::fclose(hashes);
+         if (spec_trace != nullptr) std::fclose(spec_trace);
+         std::printf("%-24s %lld rounds of %d, drafts accepted %lld of %lld (%.3f), %.2f tokens per round\n",

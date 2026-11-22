@@ -1,0 +1,1909 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: blackhat-7 <44942105+blackhat-7@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 23:39:06 +0530
+Subject: [PATCH 15/33] Conversation cache: a disk tier under the RAM cache
+ (--conversation-cache-disk-mib, --conversation-cache-disk-dir)
+
+Ported from opt10/disk-tier (0.1.43) onto 0.2.9 and simplified: a content-addressed blob store
+plus one manifest per conversation; evicted conversations, and those still held at exit, are
+written in the background and read back when a prompt starts with them, also after a restart.
+
+Changes from the first build:
+- the writer works only while the engine is idle (no request and no heartbeat for 1 s, read
+  from progress.hpp) and stops between two 1 MiB writes when a request comes in: the PLE table
+  is read from the same QLC drive every decode window and writes beside it stall decode
+  (r11-plus). This replaces the 256 MiB/s pacing and STRATA_DISK_WRITE_MIB_S.
+- one pass per blob (gather, hash, write if missing) instead of hashing everything first.
+- one file container for blobs and manifests; one field list for encode and decode.
+- the exit flush is bounded (12 s after QUIT, server.py waits 20 s) and runs after the expert
+  profile is saved; the most recently used conversation is written first.
+- stored conversations are bound to the binary and its STRATA_* environment.
+- v0.2.9: a disk match goes the take-whole way (the disk keeps its copy, so siblings lose
+  nothing); async park tokens land before an image is queued; the checkpoint clock moves past
+  a restored chain's.
+- the reader threads of a restore leave the host's CPU.
+---
+ CMakeLists.txt                             |    8 +-
+ include/strata/core/conversation_cache.hpp |   18 +-
+ include/strata/core/conversation_disk.hpp  |   83 ++
+ src/core/conversation_cache_test.cpp       |   21 +
+ src/core/conversation_disk.cpp             | 1014 ++++++++++++++++++++
+ src/core/conversation_disk_test.cpp        |  422 ++++++++
+ src/program/generate.cpp                   |  129 ++-
+ 7 files changed, 1687 insertions(+), 8 deletions(-)
+ create mode 100644 include/strata/core/conversation_disk.hpp
+ create mode 100644 src/core/conversation_disk.cpp
+ create mode 100644 src/core/conversation_disk_test.cpp
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 6fdabbd4b..ea6c7dc7a 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -182,6 +182,11 @@ if(STRATA_BUILD_CONVERSATION_TESTS)
+   add_executable(conversation_file_test src/core/conversation_file_test.cpp src/core/conversation_file.cpp)
+   target_include_directories(conversation_file_test PRIVATE include)
+   add_test(NAME conversation_file_test COMMAND conversation_file_test)
++  add_executable(conversation_disk_test src/core/conversation_disk_test.cpp src/core/conversation_disk.cpp src/core/conversation_file.cpp)
++  target_include_directories(conversation_disk_test PRIVATE include)
++  find_package(Threads REQUIRED)
++  target_link_libraries(conversation_disk_test PRIVATE Threads::Threads)
++  add_test(NAME conversation_disk_test COMMAND conversation_disk_test)
+   add_executable(session_save_reclaim_test src/core/session_save_reclaim_test.cpp src/core/conversation_file.cpp)
+   target_include_directories(session_save_reclaim_test PRIVATE include)
+   add_test(NAME session_save_reclaim_test COMMAND session_save_reclaim_test)
+@@ -685,7 +690,8 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
+     src/core/remote_expert_opt.cu
+     src/core/expert_cache.cpp src/core/native_head.cpp src/core/native_dense.cpp src/core/verify.cpp src/core/mtp.cpp src/core/dflash2.cpp
+     src/core/conversation_snapshot.cpp src/core/conversation_state.cpp src/core/conversation_memory.cpp src/core/peer_experts.cpp
+-    src/core/arch_defaults.cpp src/core/nv_defaults.cpp src/core/vmm.cpp src/core/conversation_file.cpp)
++    src/core/arch_defaults.cpp src/core/nv_defaults.cpp src/core/vmm.cpp src/core/conversation_file.cpp
++    src/core/conversation_disk.cpp)
+   target_include_directories(strata_engine PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+   target_link_libraries(strata_engine PUBLIC strata_core strata_kernels strata_kernels_cpu ${_strata_gpu_runtime_target})
+   if(STRATA_BUILD_TESTS AND STRATA_ENABLE_CUDA AND NOT STRATA_HIP_GFX906)
+diff --git a/include/strata/core/conversation_cache.hpp b/include/strata/core/conversation_cache.hpp
+index 78ff9f189..3e90d5ef5 100644
+--- a/include/strata/core/conversation_cache.hpp
++++ b/include/strata/core/conversation_cache.hpp
+@@ -9,6 +9,8 @@
+ #include <cstddef>
+ #include <cstdint>
+ #include <deque>
++#include <functional>
++#include <iterator>
+ #include <memory>
+ #include <utility>
+ #include <vector>
+@@ -395,7 +397,7 @@ public:
+         while (!entries_.empty() && (entries_.size() >= slots_ || bytes_ > budget_ - held - incoming)) {
+             // the oldest entry that does not hold a pinned shared prefix leaves; with only pinned ones left the new
+             // image does not fit (the caller skips parking it - the pinned prefix is what the queries come back to)
+-            if (!evict_oldest()) return false;
++            if (!evict_oldest(true)) return false;
+         }
+         return true;
+     }
+@@ -406,17 +408,28 @@ public:
+     // own allocation, far above glibc's mmap threshold, so dropping an entry returns the whole footprint
+     // to the kernel at once - the next admission check reads it back from /proc/meminfo.
+     // False when none can go (empty, or only entries that hold a pinned shared prefix are left).
+-    bool evict_oldest() {
++    // `spill`: the entry goes to the disk tier (set_spill) instead of being dropped.  Only an eviction for want of the
++    // cache's own room does that: one that frees RAM for the machine must really give the memory back.
++    bool evict_oldest(bool spill = false) {
+         // the oldest entry that holds no pinned shared prefix and is not the guarded (borrowed) donor
+         for (size_t i = 0; i < entries_.size(); ++i) {
+             if (entries_[i].pinned() || (guarded_ != 0 && serials_[i] == guarded_)) continue;
+             bytes_ -= entries_[i].bytes();
++            if (spill && spill_) spill_(std::move(entries_[i]));
+             erase(i);
+             ++evictions_;
+             return true;
+         }
+         return false;
+     }
++    // Receives each entry that make_room() evicts; the receiver may keep it (move from it) or leave it to be destroyed.
++    void set_spill(std::function<void(SavedConversation&&)> spill) { spill_ = std::move(spill); }
++    // Every parked conversation, most recently active first, and the cache is empty (the process is ending).
++    std::vector<SavedConversation> drain() {
++        std::vector<SavedConversation> out(std::make_move_iterator(entries_.rbegin()), std::make_move_iterator(entries_.rend()));
++        clear();
++        return out;
++    }
+ 
+     // #879: every parked conversation (pinned ones too) and the retained K/V go - after non-finite logits any of them
+     // may carry the poison.  Returns how many were parked.
+@@ -537,6 +550,7 @@ private:
+     uint64_t next_serial_ = 1, guarded_ = 0;
+     bool guard_blocked_ = false;
+     ConversationKvReuse reuse_;
++    std::function<void(SavedConversation&&)> spill_;
+ };
+ 
+ } // namespace strata::core
+diff --git a/include/strata/core/conversation_disk.hpp b/include/strata/core/conversation_disk.hpp
+new file mode 100644
+index 000000000..9cfc83200
+--- /dev/null
++++ b/include/strata/core/conversation_disk.hpp
+@@ -0,0 +1,83 @@
++// The disk tier under the RAM conversation cache (--conversation-cache-disk-mib / --conversation-cache-disk-dir).
++//
++// A conversation that the RAM cache evicts, or that the engine still holds when it ends, is written to a folder and read
++// back when a later prompt starts with it, also after a restart.  Pure host code: no CUDA.
++//
++// On disk a conversation is one small manifest (tokens, the layout, and the hash of every part) plus immutable blob
++// files named by the hash of their bytes: one blob per 2048-token block of K/V (every layer and part together) and one
++// per saved running state.  A conversation written again a few turns on, or another that starts the same way, writes
++// only the blobs that are new: the K/V of a longer conversation starts with the bytes of the shorter one.  A file
++// appears under its final name only once complete and flushed, so a crash leaves nothing a restore can read wrongly;
++// every part is hash-checked on the way back and a conversation with a part that fails is deleted.  The folder keeps
++// to a byte budget, least recently used conversation first; a blob goes with the last conversation that uses it.
++//
++// The writer works only while the engine is idle (no request for a second, progress.hpp): the model's PLE table is
++// read from the same drive in every decode window, and writes beside those reads stall them.
++#pragma once
++
++#include "strata/core/conversation_cache.hpp"
++#include "strata/core/conversation_file.hpp"
++
++#include <chrono>
++#include <cstdint>
++#include <functional>
++#include <memory>
++#include <string>
++#include <vector>
++
++namespace strata::core {
++
++class ConversationDisk {
++public:
++    /// A conversation shorter than this is read again faster than it is worth writing.
++    static constexpr size_t min_tokens = 8192;
++    struct Match {
++        uint64_t id = 0;       // names the stored conversation for load()
++        int64_t tokens = 0;    // how much of the prompt it covers; 0 = none
++        uint64_t bytes = 0;    // the RAM load() allocates, for the caller's admission check
++    };
++    struct Stats {
++        size_t conversations = 0, written = 0, restored = 0, dropped = 0;
++        uint64_t disk_bytes = 0, written_bytes = 0, read_bytes = 0;
++    };
++
++    ConversationDisk();
++    ~ConversationDisk();   // ends the writer at its next step; what is still queued is dropped
++    ConversationDisk(const ConversationDisk&) = delete;
++    ConversationDisk& operator=(const ConversationDisk&) = delete;
++
++    /// Creates `dir`, takes its lock (one engine per folder), removes what a crash left and indexes the conversations
++    /// written under any identity.  Only those of `id` and of this build (the binary and its STRATA_* environment) can
++    /// be restored.  A write leaves `min_free_bytes` of the volume free.  `log` receives one line per finished write
++    /// (called from the writer thread).
++    bool open(const std::string& dir, const SessionFileIdentity& id, uint64_t budget_bytes, uint64_t min_free_bytes,
++              std::function<void(const std::string&)> log, std::string& error);
++    bool enabled() const { return impl_ != nullptr; }
++
++    /// The longest stored prefix of `prompt` (live tokens or a checkpoint, with the same pictures and control-vector
++    /// state), at most prompt.size() - 1 tokens.  Also matches a conversation still waiting to be written.
++    Match best(const std::vector<int32_t>& prompt, const std::vector<ConversationImageKey>& images, bool cvec) const;
++
++    /// Reads the whole conversation of `m` back.  `limits` bounds every count and size before it is allocated and
++    /// `limits.admit` is asked for the RAM first.  One whose write has not finished comes back from RAM (a copy; one not
++    /// yet started is taken back for good).  A part that fails its hash deletes the conversation; false with `error` then.
++    bool load(const Match& m, SavedConversation& out, const SessionReadLimits& limits, std::string& error);
++
++    /// Queues `image` for the writer thread, which owns it from here: nothing is copied.  Keeps the root checkpoint and
++    /// the deepest few, drops the stored copies it supersedes once it is complete.  False (image not consumed) when it is
++    /// too short to be worth a write, cannot be stored, or the queued images would pass `queue_cap` bytes.  The most
++    /// recently queued is written first.
++    bool put(SavedConversation&& image, uint64_t queue_cap);
++
++    /// The engine is ending: writes what is queued without waiting for it to be idle, until `deadline`; what is not
++    /// written by then is dropped (a write cut short leaves nothing a restore would read).  How many were written.
++    size_t finish(std::chrono::steady_clock::time_point deadline);
++
++    Stats stats() const;
++
++private:
++    struct Impl;
++    std::unique_ptr<Impl> impl_;
++};
++
++} // namespace strata::core
+diff --git a/src/core/conversation_cache_test.cpp b/src/core/conversation_cache_test.cpp
+index 7c4dba46d..f2013c7bc 100644
+--- a/src/core/conversation_cache_test.cpp
++++ b/src/core/conversation_cache_test.cpp
+@@ -745,5 +745,26 @@ int main() {
+         check(cache.drop_superseded(slot_ids, {}, slot_chain, true) == 1 && cache.size() == 0,
+               "the slot's chain supersedes the richer copy");
+     }
++    {   // the disk tier: make_room hands over what it evicts; freeing RAM for the machine does not; drain empties the cache
++        const size_t one = image({1,2,3}).bytes();
++        ConversationCache cache(one * 2 + 64, 2);
++        std::vector<std::vector<int32_t>> spilled;
++        cache.set_spill([&](SavedConversation&& s) { spilled.push_back(s.live.ids); });
++        cache.put(image({1,1,1}));
++        cache.put(image({2,2,2}));
++        check(spilled.empty(), "nothing is spilled while the cache has room");
++        cache.put(image({3,3,3}));
++        check(spilled.size() == 1 && spilled[0] == std::vector<int32_t>({1,1,1}) && cache.evictions() == 1,
++              "the evicted oldest conversation is handed to the disk tier");
++        check(cache.evict_oldest() && spilled.size() == 1 && cache.size() == 1, "evict_oldest() alone spills nothing");
++        cache.put(image({4,4,4}));
++        auto all = cache.drain();
++        check(all.size() == 2 && all[0].live.ids == std::vector<int32_t>({4,4,4}) && all[1].live.ids == std::vector<int32_t>({3,3,3}),
++              "drain gives the most recent first");
++        check(cache.size() == 0 && cache.bytes() == 0 && cache.best(std::vector<int32_t>{4,4,4,5}, {}, true).tokens == 0, "and leaves the cache empty");
++        cache.put(image({5,5,5}));
++        check(cache.size() == 1 && cache.find(cache.best(std::vector<int32_t>{5,5,5,6}, {}, true).serial) != nullptr,
++              "the cache works on after a drain");
++    }
+     std::printf("conversation_cache_test: %d checks passed\n", checks);
+ }
+diff --git a/src/core/conversation_disk.cpp b/src/core/conversation_disk.cpp
+new file mode 100644
+index 000000000..528b20792
+--- /dev/null
++++ b/src/core/conversation_disk.cpp
+@@ -0,0 +1,1014 @@
++#include "strata/core/conversation_disk.hpp"
++
++#include "strata/core/progress.hpp"
++#include "strata/platform/aux_cpus.hpp"
++
++#include <algorithm>
++#include <array>
++#include <bit>
++#include <condition_variable>
++#include <cstddef>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <filesystem>
++#include <fstream>
++#include <future>
++#include <map>
++#include <mutex>
++#include <random>
++#include <set>
++#include <thread>
++
++#if !defined(_WIN32)
++#include <dirent.h>
++#include <fcntl.h>
++#include <sched.h>
++#include <sys/file.h>
++#include <sys/resource.h>
++#include <sys/stat.h>
++#include <sys/statvfs.h>
++#include <sys/syscall.h>
++#include <unistd.h>
++#endif
++
++namespace strata::core {
++
++#if defined(_WIN32)
++// POSIX direct I/O and flock only; the Windows build has no disk tier.
++struct ConversationDisk::Impl {};
++ConversationDisk::ConversationDisk() = default;
++ConversationDisk::~ConversationDisk() = default;
++bool ConversationDisk::open(const std::string&, const SessionFileIdentity&, uint64_t, uint64_t,
++                            std::function<void(const std::string&)>, std::string& error) {
++    error = "the conversation disk tier is not supported on Windows";
++    return false;
++}
++ConversationDisk::Match ConversationDisk::best(const std::vector<int32_t>&, const std::vector<ConversationImageKey>&,
++                                               bool) const { return {}; }
++bool ConversationDisk::load(const Match&, SavedConversation&, const SessionReadLimits&, std::string&) { return false; }
++bool ConversationDisk::put(SavedConversation&&, uint64_t) { return false; }
++size_t ConversationDisk::finish(std::chrono::steady_clock::time_point) { return 0; }
++ConversationDisk::Stats ConversationDisk::stats() const { return {}; }
++#else
++
++namespace {
++
++static_assert(std::endian::native == std::endian::little, "the disk tier format is little-endian");
++using Clock = std::chrono::steady_clock;
++
++constexpr char kMagic[8] = {'S', 'T', 'R', 'D', 'S', 'K', '\0', '\2'};
++// A K/V block covers this many tokens of every layer.  A multiple of the K/V page and of the indexer's block (4 cells
++// each), so the bytes of a full block never change when the conversation grows; only the last, partial one does.
++constexpr int64_t kBlockTokens = 2048;
++constexpr int64_t kIndexBlock = 4;   // cells per pooled indexer row (qsa_real_shapes().idx_block)
++// Besides the root (the end of the system prompt) the deepest checkpoints a conversation keeps on disk: the next turn
++// resumes from one of them.
++constexpr size_t kKeepCheckpoints = 3;
++constexpr size_t kPage = 4096;       // O_DIRECT alignment, and every file's header
++constexpr size_t kChunk = 1u << 20;  // one write request: a request that comes in waits for at most one
++constexpr uint64_t kMaxManifest = 64ull << 20;
++constexpr uint64_t kSeed = 0x5354524453ull;
++// The writer goes on only once the engine has been idle this long, and looks this often while it waits.
++constexpr auto kIdle = std::chrono::seconds(1);
++constexpr auto kPoll = std::chrono::milliseconds(20);
++
++size_t round_up(size_t n) { return (n + kPage - 1) / kPage * kPage; }
++
++// ---- the layout: how a conversation's K/V maps onto blocks
++struct Layer {
++    int64_t format = 0, cells = 0, heads = 0, head_dim = 0, page_size = 0, pooled_rows = 0, idx_dim = 0;
++    std::array<uint64_t, 5> sizes{};   // k, v, k_scale, v_scale, pooled
++};
++
++// The bytes of part `p` that fall in one block; 0 for an empty part.  Parts 0-3 hold the same number of bytes for
++// every cell, the pooled part one row per kIndexBlock cells.  False when the part does not divide evenly.
++bool chunk_bytes(const Layer& l, size_t p, uint64_t& out) {
++    out = 0;
++    if (!l.sizes[p]) return true;
++    const int64_t units = p == 4 ? l.pooled_rows : l.cells;
++    if (units <= 0 || l.sizes[p] % (uint64_t) units) return false;
++    out = l.sizes[p] / (uint64_t) units * (uint64_t) (p == 4 ? kBlockTokens / kIndexBlock : kBlockTokens);
++    return true;
++}
++
++struct Slice {
++    size_t layer, part;
++    uint64_t at, n, to;   // bytes [at, at + n) of the part go to offset `to` of the block
++};
++
++// The slices of block `j`, in layer then part order; the block's size.
++uint64_t block_slices(const std::vector<Layer>& layers, uint64_t j, std::vector<Slice>& out) {
++    out.clear();
++    uint64_t to = 0;
++    for (size_t li = 0; li < layers.size(); ++li)
++        for (size_t p = 0; p < 5; ++p) {
++            uint64_t c = 0;
++            chunk_bytes(layers[li], p, c);
++            if (!c || j * c >= layers[li].sizes[p]) continue;
++            const uint64_t n = std::min(c, layers[li].sizes[p] - j * c);
++            out.push_back({li, p, j * c, n, to});
++            to += n;
++        }
++    return to;
++}
++
++uint64_t block_count(const std::vector<Layer>& layers) {
++    uint64_t n = 0;
++    for (const auto& l : layers)
++        for (size_t p = 0; p < 5; ++p) {
++            uint64_t c = 0;
++            chunk_bytes(l, p, c);
++            if (c) n = std::max(n, (l.sizes[p] + c - 1) / c);
++        }
++    return n;
++}
++
++template<class Kv> auto parts_of(Kv& k) { return std::array{&k.k, &k.v, &k.k_scale, &k.v_scale, &k.pooled}; }
++template<class C> auto state_of(C& c) { return std::array{&c.gdn, &c.ple, &c.tails, &c.dead, &c.block_pos}; }
++
++// ---- the manifest
++struct StateRef {
++    uint64_t hash = 0;
++    std::array<uint64_t, 5> sizes{};   // gdn, ple, tails, dead, block_pos
++    uint64_t bytes() const { return sizes[0] + sizes[1] + sizes[2] + sizes[3] + sizes[4]; }
++};
++struct Point {   // the live state, or a checkpoint: a prefix of the live tokens
++    uint64_t len = 0, used = 0;
++    StateRef state;
++};
++struct Manifest {
++    SessionFileIdentity id;
++    bool cvec = true;
++    decltype(SavedConversation::geometry) geometry{};
++    int64_t layer_lo = 0, layer_hi = 0;
++    std::vector<int32_t> ids;
++    std::vector<ConversationImageKey> imgs;
++    Point live;
++    std::vector<Point> checks;
++    std::vector<Layer> layers;
++    struct Block { uint64_t hash = 0, bytes = 0; };
++    std::vector<Block> blocks;
++};
++
++// One field list for both directions: Out appends every field, In reads them back (a count is checked against the
++// bytes left before its array is allocated).
++struct Out {
++    std::vector<uint8_t> b;
++    bool ok = true;
++    void raw(const void* p, size_t n) { b.insert(b.end(), static_cast<const uint8_t*>(p), static_cast<const uint8_t*>(p) + n); }
++    template<class T> void count(std::vector<T>& v, size_t) { const uint64_t n = v.size(); raw(&n, 8); }
++};
++struct In {
++    const uint8_t* p;
++    size_t left;
++    bool ok = true;
++    void raw(void* dst, size_t n) {
++        if (!ok || n > left) { ok = false; return; }
++        std::memcpy(dst, p, n);
++        p += n;
++        left -= n;
++    }
++    template<class T> void count(std::vector<T>& v, size_t each) {   // `each`: the fewest bytes one element takes
++        uint64_t n = 0;
++        raw(&n, 8);
++        if (!ok || n > left / each) { ok = false; return; }
++        v.resize((size_t) n);
++    }
++};
++
++template<class A> void fields(A& a, Manifest& m) {
++    uint64_t cvec = m.cvec ? 1 : 0;
++    a.raw(&m.id.model, 8); a.raw(&m.id.config, 8); a.raw(&cvec, 8);
++    a.raw(m.geometry.data(), sizeof m.geometry); a.raw(&m.layer_lo, 8); a.raw(&m.layer_hi, 8);
++    a.count(m.ids, 4);
++    if (a.ok) a.raw(m.ids.data(), m.ids.size() * 4);
++    a.count(m.imgs, 16);
++    for (auto& k : m.imgs) { a.raw(&k.start, 8); a.raw(&k.hash, 8); }
++    auto point = [&](Point& pt) { a.raw(&pt.len, 8); a.raw(&pt.used, 8); a.raw(&pt.state.hash, 8); a.raw(pt.state.sizes.data(), 40); };
++    point(m.live);
++    a.count(m.checks, 64);
++    for (auto& c : m.checks) point(c);
++    a.count(m.layers, 96);
++    for (auto& l : m.layers) {
++        for (int64_t* v : {&l.format, &l.cells, &l.heads, &l.head_dim, &l.page_size, &l.pooled_rows, &l.idx_dim}) a.raw(v, 8);
++        a.raw(l.sizes.data(), 40);
++    }
++    a.count(m.blocks, 16);
++    for (auto& b : m.blocks) { a.raw(&b.hash, 8); a.raw(&b.bytes, 8); }
++    if (cvec > 1) a.ok = false;
++    m.cvec = cvec == 1;
++}
++
++// The payload, and the structure the rest of the code relies on.
++bool decode(const uint8_t* p, size_t n, Manifest& m) {
++    In r{p, n};
++    fields(r, m);
++    if (!r.ok || r.left != 0 || m.live.len != m.ids.size()) return false;
++    for (const auto& c : m.checks)
++        if (c.len == 0 || c.len > m.ids.size()) return false;
++    for (const auto& l : m.layers)
++        for (size_t q = 0; q < 5; ++q) {
++            uint64_t c = 0;
++            if (!chunk_bytes(l, q, c)) return false;
++        }
++    if (m.blocks.size() != block_count(m.layers)) return false;
++    std::vector<Slice> slices;
++    for (uint64_t j = 0; j < m.blocks.size(); ++j)
++        if (block_slices(m.layers, j, slices) != m.blocks[j].bytes) return false;
++    return true;
++}
++
++std::string blob_name(char kind, uint64_t hash, uint64_t bytes) {
++    char b[48];
++    std::snprintf(b, sizeof b, "%c-%016llx-%llx", kind, (unsigned long long) hash, (unsigned long long) bytes);
++    return b;
++}
++
++// Every blob the manifest names, without repeats.
++std::vector<std::string> blobs_of(const Manifest& m) {
++    std::set<std::string> names;
++    names.insert(blob_name('s', m.live.state.hash, m.live.state.bytes()));
++    for (const auto& c : m.checks) names.insert(blob_name('s', c.state.hash, c.state.bytes()));
++    for (const auto& b : m.blocks) names.insert(blob_name('k', b.hash, b.bytes));
++    return {names.begin(), names.end()};
++}
++
++std::vector<ConversationImageKey> imgs_below(const std::vector<ConversationImageKey>& all, uint64_t tokens) {
++    std::vector<ConversationImageKey> out;
++    for (const auto& k : all)
++        if ((uint64_t) k.start < tokens) out.push_back(k);
++    return out;
++}
++
++// Whether a prompt's pictures that start before token `n` are exactly the stored ones that do.
++bool images_agree(const std::vector<ConversationImageKey>& stored, const std::vector<ConversationImageKey>& req,
++                  uint64_t n) {
++    size_t j = 0;
++    for (const auto& k : req) {
++        if ((uint64_t) k.start >= n) continue;
++        if (j == stored.size() || !(stored[j++] == k)) return false;
++    }
++    return j == stored.size() || (uint64_t) stored[j].start >= n;
++}
++
++// The checkpoints a conversation can keep on disk: a chain of prefixes of the live tokens, no stage parts.
++bool checkpoints_storable(const SavedConversation& s) {
++    for (const auto& c : s.checkpoints)
++        if (!c.stage_parts.empty() || c.ids.empty() || c.ids.size() > s.live.ids.size() ||
++            !std::equal(c.ids.begin(), c.ids.end(), s.live.ids.begin()) || c.imgs != imgs_below(s.live.imgs, c.ids.size()))
++            return false;
++    return true;
++}
++
++// `neu` holds everything `old` does apart from the tail that the client rewrote: the same conversation a turn back
++// (conversation_cache.hpp, drop_superseded).
++bool superseded(const Manifest& old, const Manifest& neu) {
++    if (old.id.model != neu.id.model || old.id.config != neu.id.config || old.cvec != neu.cvec) return false;
++    if (old.ids == neu.ids && old.imgs == neu.imgs) return true;
++    uint64_t deepest = 0;
++    for (const auto& c : old.checks) deepest = std::max(deepest, c.len);
++    if (!deepest || deepest > neu.ids.size() || !std::equal(old.ids.begin(), old.ids.begin() + (std::ptrdiff_t) deepest, neu.ids.begin()))
++        return false;
++    bool held = deepest == neu.ids.size();
++    for (const auto& c : neu.checks) held = held || c.len == deepest;
++    return held && imgs_below(old.imgs, deepest) == imgs_below(neu.imgs, deepest);
++}
++
++// ---- files
++class AlignedBuf {
++public:
++    AlignedBuf() = default;
++    AlignedBuf(const AlignedBuf&) = delete;
++    AlignedBuf& operator=(const AlignedBuf&) = delete;
++    ~AlignedBuf() { std::free(p_); }
++    // at least n bytes, rounded up to kPage, kPage-aligned, contents unspecified
++    uint8_t* get(size_t n) {
++        n = round_up(n);
++        if (n > cap_) {
++            std::free(p_);
++            cap_ = 0;
++            p_ = static_cast<uint8_t*>(std::aligned_alloc(kPage, n));
++            if (!p_) throw std::bad_alloc();
++            cap_ = n;
++        }
++        return p_;
++    }
++private:
++    uint8_t* p_ = nullptr;
++    size_t cap_ = 0;
++};
++
++struct Header {   // the first kPage bytes of every file
++    char magic[8];
++    uint64_t hash, bytes, check;   // the payload's hash and size; the hash of the fields before `check`
++};
++
++// O_DIRECT keeps the model files' pages in the page cache and avoids a write-back burst later; a filesystem that
++// refuses it (tmpfs) gets buffered I/O.
++int open_direct(const std::string& path, int flags, bool& direct) {
++    int fd = ::open(path.c_str(), flags | O_DIRECT | O_CLOEXEC, 0600);
++    direct = fd >= 0;
++    if (fd < 0 && errno == EINVAL) fd = ::open(path.c_str(), flags | O_CLOEXEC, 0600);
++    return fd;
++}
++
++void sync_dir(const std::string& dir) {
++    const int fd = ::open(dir.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
++    if (fd >= 0) { ::fsync(fd); ::close(fd); }
++}
++
++uint64_t random64() {
++    static std::mt19937_64 g{std::random_device{}()};
++    static std::mutex m;
++    std::lock_guard<std::mutex> lk(m);
++    return g();
++}
++
++// Writes the payload at buf + kPage (`bytes` of it, of hash `hash`; buf holds round_up(kPage + bytes)) as dir/name:
++// under a temporary name first, flushed, then renamed, so the name never refers to a partial file.  `go` is asked
++// before each write request; false gives up.
++bool write_file(const std::string& dir, const std::string& name, uint8_t* buf, uint64_t hash, uint64_t bytes,
++                const std::function<bool()>& go, std::string& err) {
++    Header h{};
++    std::memcpy(h.magic, kMagic, 8);
++    h.hash = hash;
++    h.bytes = bytes;
++    h.check = session_hash64(&h, offsetof(Header, check), kSeed);
++    const size_t total = kPage + (size_t) bytes, padded = round_up(total);
++    std::memset(buf, 0, kPage);
++    std::memcpy(buf, &h, sizeof h);
++    std::memset(buf + total, 0, padded - total);
++    char tmp[32];
++    std::snprintf(tmp, sizeof tmp, "/tmp-%016llx", (unsigned long long) random64());
++    const std::string tmp_path = dir + tmp;
++    bool direct = false;
++    const int fd = open_direct(tmp_path, O_WRONLY | O_CREAT | O_EXCL, direct);
++    if (fd < 0) { err = "create " + tmp_path + ": " + std::strerror(errno); return false; }
++    std::string why;
++    for (size_t at = 0; at < padded && why.empty();) {
++        const ssize_t w = go() ? ::pwrite(fd, buf + at, std::min(kChunk, padded - at), (off_t) at) : 0;
++        if (w < 0 && errno == EINTR) continue;
++        if (w <= 0) why = w == 0 ? "stopped" : std::strerror(errno);
++        else at += (size_t) w;
++    }
++    if (why.empty() && ::ftruncate(fd, (off_t) total) != 0) why = std::strerror(errno);
++    if (why.empty() && ::fdatasync(fd) != 0) why = std::strerror(errno);
++    if (!direct) ::posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED);
++    ::close(fd);
++    if (why.empty() && ::rename(tmp_path.c_str(), (dir + "/" + name).c_str()) != 0) why = std::strerror(errno);
++    if (!why.empty()) {
++        err = "write " + name + ": " + why;
++        ::unlink(tmp_path.c_str());
++    }
++    return why.empty();
++}
++
++// Reads a file of at most `max_bytes` into buf and checks its header, size and payload hash.  The payload is at
++// buf + kPage, h.bytes long.
++bool read_file(const std::string& path, uint64_t max_bytes, AlignedBuf& buf, Header& h, std::string& err) {
++    bool direct = false;
++    const int fd = open_direct(path, O_RDONLY, direct);
++    if (fd < 0) { err = "open " + path + ": " + std::strerror(errno); return false; }
++    struct stat st;
++    bool ok = ::fstat(fd, &st) == 0 && S_ISREG(st.st_mode) && (uint64_t) st.st_size >= kPage &&
++              (uint64_t) st.st_size <= max_bytes;
++    const size_t size = ok ? (size_t) st.st_size : 0;
++    uint8_t* p = ok ? buf.get(size) : nullptr;
++    for (size_t at = 0; ok && at < size;) {
++        const ssize_t r = ::pread(fd, p + at, std::min<size_t>(8u << 20, round_up(size - at)), (off_t) at);
++        if (r < 0 && errno == EINTR) continue;
++        ok = r > 0;
++        if (ok) at += (size_t) r;
++    }
++    if (!direct) ::posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED);
++    ::close(fd);
++    if (ok) std::memcpy(&h, p, sizeof h);
++    if (!ok || std::memcmp(h.magic, kMagic, 8) || h.check != session_hash64(&h, offsetof(Header, check), kSeed) ||
++        kPage + h.bytes != size || session_hash64(p + kPage, (size_t) h.bytes, kSeed) != h.hash) {
++        err = path + ": unreadable or damaged";
++        return false;
++    }
++    return true;
++}
++
++// A stored conversation is bound to this build too, the binary and its STRATA_* settings: another may compute other
++// bits from the same tokens, or lay them out otherwise, and then "restored" would no longer mean "never left".
++uint64_t build_hash() {
++    SessionHasher h(kSeed);
++    std::ifstream f("/proc/self/exe", std::ios::binary);
++    std::vector<char> b(1 << 20);
++    while (f.read(b.data(), (std::streamsize) b.size()) || f.gcount() > 0) h.update(b.data(), (size_t) f.gcount());
++    std::vector<std::string> env;
++    for (char** e = environ; *e; ++e)
++        if (std::strncmp(*e, "STRATA_", 7) == 0) env.emplace_back(*e);
++    std::sort(env.begin(), env.end());
++    for (const auto& s : env) h.update(s.c_str(), s.size() + 1);
++    return h.digest();
++}
++
++// A thread the engine's host thread starts inherits its one CPU (strata/platform/aux_cpus.hpp), where it would take
++// turns with the host: spread out first.
++void leave_host_cpu() {
++    cpu_set_t all;
++    CPU_ZERO(&all);
++    for (int c = 0; c < CPU_SETSIZE; ++c) CPU_SET(c, &all);
++    (void) sched_setaffinity(0, sizeof all, &all);
++    strata::aux_cpus::pin_current_thread();
++}
++
++} // namespace
++
++// ---- the store
++struct ConversationDisk::Impl {
++    struct Part { uint64_t bytes = 0; int refs = 0; };
++    struct Entry {
++        enum State { queued, writing, ready } state = ready;
++        uint64_t used = 0, file_bytes = 0, ram = 0;   // file_bytes: the manifest's; ram: the queued image's
++        std::string name;
++        Manifest m;
++        std::shared_ptr<SavedConversation> image;   // until it is written; the writer and a load only read it
++    };
++    struct Done {
++        std::string name;
++        uint64_t file_bytes = 0, new_bytes = 0;
++        size_t new_blobs = 0, shared_blobs = 0;
++        double waited = 0;   // seconds the job stood still for the engine
++    };
++
++    std::string dir;
++    SessionFileIdentity id;
++    uint64_t budget = 0, min_free = 0;
++    std::function<void(const std::string&)> log;
++    int lock_fd = -1;
++    mutable std::mutex mu;
++    std::condition_variable cv;
++    std::map<uint64_t, Entry> entries;
++    std::map<std::string, Part> parts;
++    std::vector<uint64_t> queue;   // the last one first
++    uint64_t next_id = 1, clock = 0, used_bytes = 0, queued_bytes = 0;
++    bool stop = false, working = false, urgent = false;
++    Stats stats;
++    // the writer's own: its buffer, and the engine's heartbeat count it saw last and since when
++    AlignedBuf wbuf;
++    uint64_t beats = 0;
++    Clock::time_point quiet{};
++    std::thread writer;
++
++    ~Impl() {
++        {
++            std::lock_guard<std::mutex> lk(mu);
++            stop = true;
++        }
++        cv.notify_all();
++        if (writer.joinable()) writer.join();
++        if (lock_fd >= 0) ::close(lock_fd);
++    }
++    std::string path(const std::string& name) const { return dir + "/" + name; }
++
++    // ---- bookkeeping, mu held
++    void release_locked(const std::vector<std::string>& names) {
++        for (const auto& n : names) {
++            auto it = parts.find(n);
++            if (it == parts.end() || --it->second.refs > 0) continue;
++            ::unlink(path(n).c_str());
++            used_bytes -= it->second.bytes;
++            parts.erase(it);
++        }
++    }
++    void drop_locked(uint64_t eid) {
++        auto it = entries.find(eid);
++        ::unlink(path(it->second.name).c_str());
++        used_bytes -= it->second.file_bytes;
++        release_locked(blobs_of(it->second.m));
++        entries.erase(it);
++        ++stats.dropped;
++    }
++    // A blob that failed its check: gone, and so is every conversation that needs it.
++    void drop_blob_locked(const std::string& name) {
++        std::vector<uint64_t> users;
++        for (auto& [eid, e] : entries) {
++            const auto names = blobs_of(e.m);
++            if (e.state == Entry::ready && std::find(names.begin(), names.end(), name) != names.end()) users.push_back(eid);
++        }
++        for (uint64_t eid : users) drop_locked(eid);
++        if (auto it = parts.find(name); it != parts.end()) {   // a job still holds it: the file goes all the same
++            ::unlink(path(name).c_str());
++            used_bytes -= it->second.bytes;
++            parts.erase(it);
++        }
++    }
++    bool evict_lru_locked() {
++        uint64_t victim = 0, oldest = UINT64_MAX;
++        for (auto& [eid, e] : entries)
++            if (e.state == Entry::ready && e.used < oldest) { oldest = e.used; victim = eid; }
++        if (!victim) return false;
++        drop_locked(victim);
++        return true;
++    }
++
++    // ---- open
++    bool scan(std::string& error) {
++        DIR* d = ::opendir(dir.c_str());
++        if (!d) { error = "cannot list " + dir + ": " + std::strerror(errno); return false; }
++        std::vector<std::string> manifests;
++        while (const dirent* e = ::readdir(d)) {
++            const std::string n = e->d_name;
++            if (n.rfind("tmp-", 0) == 0) {
++                ::unlink(path(n).c_str());   // a write that did not finish
++            } else if (n.size() > 2 && (n[0] == 'k' || n[0] == 's') && n[1] == '-') {
++                // the name carries the payload size: a file of another size is partial or foreign
++                const size_t dash = n.find('-', 2);
++                const uint64_t want = dash == std::string::npos ? 0 : kPage + std::strtoull(n.c_str() + dash + 1, nullptr, 16);
++                struct stat st;
++                if (::stat(path(n).c_str(), &st) == 0 && (uint64_t) st.st_size == want) parts[n].bytes = want;
++                else ::unlink(path(n).c_str());
++            } else if (n.rfind("c-", 0) == 0) {
++                manifests.push_back(n);
++            }
++        }
++        ::closedir(d);
++        struct Found { std::string name; int64_t mtime = 0; uint64_t size = 0; Manifest m; };
++        std::vector<Found> found;
++        AlignedBuf buf;
++        for (const auto& n : manifests) {
++            Found f;
++            f.name = n;
++            Header h;
++            std::string err;
++            struct stat st;
++            bool whole = ::stat(path(n).c_str(), &st) == 0 && read_file(path(n), kMaxManifest, buf, h, err) &&
++                         decode(buf.get(0) + kPage, (size_t) h.bytes, f.m);
++            for (const auto& b : whole ? blobs_of(f.m) : std::vector<std::string>{}) whole = whole && parts.count(b);
++            if (!whole) { ::unlink(path(n).c_str()); continue; }   // unreadable, or a blob it needs is gone
++            f.size = (uint64_t) st.st_size;
++            f.mtime = (int64_t) st.st_mtim.tv_sec * 1000000000 + st.st_mtim.tv_nsec;
++            found.push_back(std::move(f));
++        }
++        std::sort(found.begin(), found.end(), [](const Found& a, const Found& b) { return a.mtime < b.mtime; });
++        for (auto& f : found) {
++            Entry e;
++            e.used = ++clock;
++            e.name = f.name;
++            e.file_bytes = f.size;
++            e.m = std::move(f.m);
++            for (const auto& b : blobs_of(e.m)) ++parts[b].refs;
++            used_bytes += f.size;
++            entries.emplace(next_id++, std::move(e));
++        }
++        for (auto it = parts.begin(); it != parts.end();) {   // what no conversation names: a crash between its writes
++            if (it->second.refs == 0) { ::unlink(path(it->first).c_str()); it = parts.erase(it); }
++            else { used_bytes += it->second.bytes; ++it; }
++        }
++        while (used_bytes > budget && evict_lru_locked()) {}
++        return true;
++    }
++
++    // ---- the writer
++    // Whether the engine has been idle for kIdle: no request in flight and no heartbeat (a token, a prompt chunk, a
++    // batch window) since.  Writer thread, mu held.
++    bool engine_idle() {
++        Progress& p = progress();
++        const uint64_t b = p.beats.load(std::memory_order_relaxed);
++        const auto now = Clock::now();
++        if (p.busy.load(std::memory_order_relaxed) || b != beats) {
++            beats = b;
++            quiet = now;
++            return false;
++        }
++        return now - quiet >= kIdle;
++    }
++    // Waits until the writer may go on: the engine idle, or ending.  False when the store closes.
++    bool wait_turn(std::unique_lock<std::mutex>& lk, double* waited = nullptr) {
++        const auto t0 = Clock::now();
++        while (!stop && !urgent && !engine_idle()) cv.wait_for(lk, kPoll);
++        if (waited) *waited += std::chrono::duration<double>(Clock::now() - t0).count();
++        return !stop;
++    }
++
++    void run() {
++        leave_host_cpu();
++        ::setpriority(PRIO_PROCESS, (id_t) ::syscall(SYS_gettid), 19);   // hashing must not take a decode thread's core
++        std::unique_lock<std::mutex> lk(mu);
++        for (;;) {
++            cv.wait(lk, [&] { return stop || !queue.empty(); });
++            if (!wait_turn(lk)) return;
++            if (queue.empty()) continue;   // a load took it back meanwhile
++            const uint64_t eid = queue.back();
++            queue.pop_back();
++            Entry& e = entries.at(eid);
++            e.state = Entry::writing;
++            working = true;
++            std::shared_ptr<SavedConversation> image = e.image;
++            Manifest m = e.m;   // the tokens; job() adds the layout and the hashes
++            lk.unlock();
++            const auto t0 = Clock::now();
++            std::vector<std::string> held;
++            Done done;
++            std::string err;
++            bool ok = false;
++            try {
++                ok = job(*image, m, held, done, err);
++            } catch (const std::exception& x) {
++                err = x.what();
++            }
++            const size_t tokens = image->live.ids.size();
++            image.reset();
++            lk.lock();
++            queued_bytes -= e.ram;   // the image counts against the queue cap until it is gone from RAM
++            std::string line;
++            if (!ok) {
++                release_locked(held);
++                entries.erase(eid);
++                line = "disk tier: not written (" + std::to_string(tokens) + " tokens): " + err;
++            } else {
++                e.m = std::move(m);
++                e.name = done.name;
++                e.file_bytes = done.file_bytes;
++                e.used = ++clock;
++                e.state = Entry::ready;
++                e.image.reset();
++                used_bytes += done.file_bytes;
++                std::vector<uint64_t> old;
++                for (const auto& [oid, o] : entries)
++                    if (oid != eid && o.state == Entry::ready && superseded(o.m, e.m)) old.push_back(oid);
++                for (uint64_t oid : old) drop_locked(oid);
++                ++stats.written;
++                stats.written_bytes += done.new_bytes;
++                char b[320];
++                std::snprintf(b, sizeof b, "disk tier: wrote %zu tokens: %zu new and %zu shared blobs, %.0f MiB new, in "
++                              "%.1f s (%.1f s of it waiting for the engine to be idle); %zu stored, %.1f of %.1f GiB",
++                              tokens, done.new_blobs, done.shared_blobs, (double) done.new_bytes / 1048576.0,
++                              std::chrono::duration<double>(Clock::now() - t0).count(), done.waited, entries.size(),
++                              (double) used_bytes / 1073741824.0, (double) budget / 1073741824.0);
++                line = b;
++            }
++            working = false;
++            cv.notify_all();
++            if (log) {
++                lk.unlock();
++                log(line);
++                lk.lock();
++            }
++        }
++    }
++
++    // Writes the blobs of `img` the folder lacks, each as soon as it is hashed, then the manifest.  `held` ends up with
++    // a reference on every blob the manifest names, whether or not it failed half way.
++    bool job(const SavedConversation& img, Manifest& m, std::vector<std::string>& held, Done& done, std::string& err) {
++        m.geometry = img.geometry;
++        m.layer_lo = img.layer_lo;
++        m.layer_hi = img.layer_hi;
++        for (const auto& k : img.kv) {
++            Layer l{k.format, k.cells, k.heads, k.head_dim, k.page_size, k.pooled_rows, k.idx_dim, {}};
++            const auto p = parts_of(k);
++            for (size_t q = 0; q < 5; ++q) {
++                l.sizes[q] = p[q]->size();
++                uint64_t c = 0;
++                if (!chunk_bytes(l, q, c)) { err = "a K/V part does not divide into cells"; return false; }
++            }
++            m.layers.push_back(l);
++        }
++        m.blocks.resize(block_count(m.layers));
++        std::vector<Slice> slices;
++        uint64_t whole = 0;   // what the conversation's blobs take at most, shared ones included (the manifest is small)
++        auto state_sizes = [&](const ConversationCheckpoint& c, Point& pt) {
++            const auto v = state_of(c);
++            for (size_t q = 0; q < 5; ++q) pt.state.sizes[q] = v[q]->size();
++            whole += kPage + pt.state.bytes();
++        };
++        state_sizes(img.live, m.live);
++        for (size_t i = 0; i < img.checkpoints.size(); ++i) state_sizes(img.checkpoints[i], m.checks[i]);
++        for (uint64_t j = 0; j < m.blocks.size(); ++j) whole += kPage + (m.blocks[j].bytes = block_slices(m.layers, j, slices));
++        if (whole > budget) { err = "larger than the disk budget"; return false; }
++
++        const std::function<bool()> go = [&] {
++            std::unique_lock<std::mutex> lk(mu);
++            return wait_turn(lk, &done.waited);
++        };
++        std::set<std::string> seen;
++        // One blob: `gather` fills the payload; written unless the folder has it already.
++        auto blob = [&](char kind, uint64_t bytes, uint64_t& hash, const auto& gather) {
++            if (!go()) { err = "stopped"; return false; }
++            uint8_t* p = wbuf.get(kPage + (size_t) bytes);
++            if (!gather(p + kPage)) { err = "a K/V part is shorter than its layout"; return false; }
++            hash = session_hash64(p + kPage, (size_t) bytes, kSeed);
++            const std::string name = blob_name(kind, hash, bytes);
++            if (!seen.insert(name).second) return true;
++            {
++                std::lock_guard<std::mutex> lk(mu);
++                if (auto it = parts.find(name); it != parts.end()) {
++                    ++it->second.refs;
++                    held.push_back(name);
++                    ++done.shared_blobs;
++                    return true;
++                }
++                while (used_bytes + kPage + bytes > budget)
++                    if (!evict_lru_locked()) { err = "no room in the disk budget"; return false; }
++                struct statvfs sv;
++                if (::statvfs(dir.c_str(), &sv) != 0 || (uint64_t) sv.f_bavail * sv.f_frsize < kPage + bytes + min_free) {
++                    err = "the volume has less than " + std::to_string((kPage + bytes + min_free) >> 20) + " MiB free";
++                    return false;
++                }
++                used_bytes += kPage + bytes;   // taken now, so an eviction for another blob counts it
++            }
++            const bool wrote = write_file(dir, name, p, hash, bytes, go, err);
++            std::lock_guard<std::mutex> lk(mu);
++            if (!wrote) { used_bytes -= kPage + bytes; return false; }
++            parts[name] = {kPage + bytes, 1};
++            held.push_back(name);
++            ++done.new_blobs;
++            done.new_bytes += kPage + bytes;
++            return true;
++        };
++        auto state = [&](const ConversationCheckpoint& c, Point& pt) {
++            return blob('s', pt.state.bytes(), pt.state.hash, [&](uint8_t* dst) {
++                for (const auto* v : state_of(c))
++                    if (!v->empty()) { std::memcpy(dst, v->data(), v->size()); dst += v->size(); }
++                return true;
++            });
++        };
++        if (!state(img.live, m.live)) return false;
++        for (size_t i = 0; i < img.checkpoints.size(); ++i)
++            if (!state(img.checkpoints[i], m.checks[i])) return false;
++        for (uint64_t j = 0; j < m.blocks.size(); ++j) {
++            block_slices(m.layers, j, slices);
++            if (!blob('k', m.blocks[j].bytes, m.blocks[j].hash, [&](uint8_t* dst) {
++                    for (const auto& s : slices)
++                        if (!parts_of(img.kv[s.layer])[s.part]->read(dst + s.to, (size_t) s.at, (size_t) s.n)) return false;
++                    return true;
++                }))
++                return false;
++        }
++        // the manifest last, once every blob it names is in the folder for good
++        Out w;
++        fields(w, m);
++        uint8_t* p = wbuf.get(kPage + w.b.size());
++        std::memcpy(p + kPage, w.b.data(), w.b.size());
++        char name[40];
++        std::snprintf(name, sizeof name, "c-%016llx.chat", (unsigned long long) random64());
++        sync_dir(dir);
++        if (!write_file(dir, name, p, session_hash64(w.b.data(), w.b.size(), kSeed), w.b.size(), go, err)) return false;
++        sync_dir(dir);
++        done.name = name;
++        done.file_bytes = kPage + w.b.size();
++        return true;
++    }
++};
++
++ConversationDisk::ConversationDisk() = default;
++ConversationDisk::~ConversationDisk() = default;
++
++bool ConversationDisk::open(const std::string& dir, const SessionFileIdentity& id, uint64_t budget_bytes,
++                            uint64_t min_free_bytes, std::function<void(const std::string&)> log, std::string& error) {
++    if (impl_) { error = "already open"; return false; }
++    auto d = std::make_unique<Impl>();
++    d->dir = dir;
++    while (d->dir.size() > 1 && d->dir.back() == '/') d->dir.pop_back();
++    d->id = id;
++    const uint64_t build = build_hash();
++    d->id.config = session_hash64(&build, sizeof build, id.config);
++    d->budget = budget_bytes;
++    d->min_free = min_free_bytes;
++    d->log = std::move(log);
++    std::error_code ec;
++    std::filesystem::create_directories(std::filesystem::path(d->dir).parent_path(), ec);
++    if (::mkdir(d->dir.c_str(), 0700) != 0 && errno != EEXIST) {
++        error = "cannot create " + d->dir + ": " + std::strerror(errno);
++        return false;
++    }
++    d->lock_fd = ::open(d->path(".lock").c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0600);
++    if (d->lock_fd < 0 || ::flock(d->lock_fd, LOCK_EX | LOCK_NB) != 0) {
++        error = d->dir + " is in use by another engine, or cannot be locked";
++        return false;
++    }
++    if (!d->scan(error)) return false;
++    Impl* raw = d.get();
++    d->writer = std::thread([raw] { raw->run(); });
++    impl_ = std::move(d);
++    return true;
++}
++
++ConversationDisk::Match ConversationDisk::best(const std::vector<int32_t>& prompt,
++                                               const std::vector<ConversationImageKey>& images, bool cvec) const {
++    Impl& d = *impl_;
++    std::lock_guard<std::mutex> lk(d.mu);
++    Match best;
++    uint64_t best_used = 0;
++    for (const auto& [eid, e] : d.entries) {
++        const Manifest& m = e.m;
++        if (m.id.model != d.id.model || m.id.config != d.id.config || m.cvec != cvec) continue;
++        const uint64_t common = (uint64_t) (std::mismatch(m.ids.begin(), m.ids.end(), prompt.begin(), prompt.end()).first -
++                                            m.ids.begin());
++        auto consider = [&](uint64_t n) {
++            // the last prompt token always starts the next verify window
++            if (!n || n > common || n >= prompt.size() || !images_agree(m.imgs, images, n)) return;
++            if ((int64_t) n > best.tokens || ((int64_t) n == best.tokens && e.used > best_used)) {
++                best.id = eid;
++                best.tokens = (int64_t) n;
++                best_used = e.used;
++            }
++        };
++        consider(m.ids.size());
++        for (const auto& c : m.checks) consider(c.len);
++    }
++    if (best.tokens) {   // the RAM load() allocates: the image (and two blocks being read, for one on disk)
++        const Impl::Entry& e = d.entries.at(best.id);
++        if (e.state != Impl::Entry::ready) {
++            best.bytes = e.ram;
++        } else {
++            uint64_t n = e.m.ids.size() * 4 + e.m.live.state.bytes(), block = 0;
++            for (const auto& b : e.m.blocks) block = std::max(block, b.bytes);
++            for (const auto& l : e.m.layers) for (uint64_t s : l.sizes) n += s;
++            for (const auto& c : e.m.checks) n += c.state.bytes();
++            best.bytes = n + 2 * (block + kPage) + (64u << 20);
++        }
++    }
++    return best;
++}
++
++bool ConversationDisk::load(const Match& match, SavedConversation& out, const SessionReadLimits& limits,
++                            std::string& error) {
++    Impl& d = *impl_;
++    std::unique_lock<std::mutex> lk(d.mu);
++    auto it = d.entries.find(match.id);
++    if (it == d.entries.end()) { error = "the stored conversation is gone"; return false; }
++    Impl::Entry& e = it->second;
++    auto fail = [&](const std::string& why) { error = "disk tier: " + why; return false; };
++    if (e.state == Impl::Entry::queued) {   // the write has not started: the image comes back, no reason to wait
++        out = std::move(*e.image);
++        d.queue.erase(std::find(d.queue.begin(), d.queue.end(), it->first));
++        d.queued_bytes -= e.ram;
++        d.entries.erase(it);
++        return true;
++    }
++    std::string why;
++    if (limits.admit && !limits.admit(match.bytes, why)) return fail(why);
++    if (e.state == Impl::Entry::writing) {   // a copy: the writer is reading it
++        out = *e.image;
++        return true;
++    }
++    const Manifest& m = e.m;
++
++    // what this engine can restore, before anything is allocated
++    if (limits.geometry && *limits.geometry != m.geometry) return fail("saved with another model geometry");
++    if (limits.layer_range && (limits.layer_range->first != m.layer_lo || limits.layer_range->second != m.layer_hi))
++        return fail("saved with another layer range");
++    if (m.ids.size() > limits.max_tokens || m.checks.size() > limits.max_checkpoints ||
++        m.layers.size() > limits.max_kv_layers)
++        return fail("over this engine's limits");
++    auto state_fits = [&](const StateRef& r) {
++        for (size_t q = 0; q < 5; ++q)
++            if (r.sizes[q] > limits.max_state_bytes[q]) return false;
++        return true;
++    };
++    bool fits = state_fits(m.live.state);
++    for (const auto& c : m.checks) fits = fits && state_fits(c.state);
++    for (size_t li = 0; li < m.layers.size() && li < limits.max_kv_bytes.size(); ++li)
++        for (size_t q = 0; q < 5; ++q) fits = fits && m.layers[li].sizes[q] <= limits.max_kv_bytes[li][q];
++    if (!fits) return fail("a part is larger than this engine's");
++
++    SavedConversation r;
++    r.geometry = m.geometry;
++    r.layer_lo = m.layer_lo;
++    r.layer_hi = m.layer_hi;
++    r.cvec = m.cvec;
++    r.live.ids = m.ids;
++    r.live.imgs = m.imgs;
++    r.live.used = m.live.used;
++    for (const auto& c : m.checks) {
++        ConversationCheckpoint k;
++        k.ids.assign(m.ids.begin(), m.ids.begin() + (std::ptrdiff_t) c.len);
++        k.imgs = imgs_below(m.imgs, c.len);
++        k.used = c.used;
++        r.checkpoints.push_back(std::move(k));
++    }
++    for (const auto& l : m.layers) {
++        ConversationKv k;
++        k.format = (int) l.format; k.cells = l.cells; k.heads = l.heads; k.head_dim = l.head_dim;
++        k.page_size = l.page_size; k.pooled_rows = l.pooled_rows; k.idx_dim = l.idx_dim;
++        const auto p = parts_of(k);
++        for (size_t q = 0; q < 5; ++q) p[q]->resize((size_t) l.sizes[q]);
++        r.kv.push_back(std::move(k));
++    }
++
++    // Reads blob `name` into buf, checked against what the manifest says it is.
++    AlignedBuf bufs[2];
++    auto read_blob = [&](const std::string& name, uint64_t hash, uint64_t bytes, AlignedBuf& buf, std::string& err) {
++        Header h;
++        if (!read_file(d.path(name), kPage + bytes, buf, h, err)) return false;
++        if (h.hash == hash && h.bytes == bytes) return true;
++        err = name + ": not the blob its name says";
++        return false;
++    };
++    uint64_t read = 0;
++    std::string err;
++    auto bad = [&](const std::string& name) {
++        error = "disk tier: " + err;
++        d.drop_blob_locked(name);   // `m` and `e` are gone from here on
++        return false;
++    };
++    for (size_t i = 0; i <= m.checks.size(); ++i) {   // the running states: live, then each checkpoint
++        const StateRef& s = i == 0 ? m.live.state : m.checks[i - 1].state;
++        const std::string name = blob_name('s', s.hash, s.bytes());
++        if (!read_blob(name, s.hash, s.bytes(), bufs[0], err)) return bad(name);
++        read += kPage + s.bytes();
++        const uint8_t* p = bufs[0].get(0) + kPage;
++        const auto v = state_of(i == 0 ? r.live : r.checkpoints[i - 1]);
++        for (size_t q = 0; q < 5; ++q) {
++            v[q]->assign(p, p + s.sizes[q]);
++            p += s.sizes[q];
++        }
++    }
++    // the K/V: the next block is read and hashed on another thread while this one is copied out
++    std::vector<Slice> slices;
++    std::string errs[2];
++    auto fetch = [&](uint64_t j) {
++        return std::async(std::launch::async, [&, j] {
++            leave_host_cpu();
++            return read_blob(blob_name('k', m.blocks[j].hash, m.blocks[j].bytes), m.blocks[j].hash, m.blocks[j].bytes,
++                             bufs[j & 1], errs[j & 1]);
++        });
++    };
++    std::future<bool> next;
++    if (!m.blocks.empty()) next = fetch(0);
++    for (uint64_t j = 0; j < m.blocks.size(); ++j) {
++        if (!next.get()) {
++            err = errs[j & 1];
++            return bad(blob_name('k', m.blocks[j].hash, m.blocks[j].bytes));
++        }
++        if (j + 1 < m.blocks.size()) next = fetch(j + 1);
++        block_slices(m.layers, j, slices);
++        const uint8_t* src = bufs[j & 1].get(0) + kPage;
++        for (const auto& s : slices)
++            parts_of(r.kv[s.layer])[s.part]->visit((size_t) s.at, (size_t) s.n, [&](uint8_t* p, size_t n, size_t at) {
++                std::memcpy(p, src + s.to + (at - (size_t) s.at), n);
++                return true;
++            });
++        read += kPage + m.blocks[j].bytes;
++    }
++    e.used = ++d.clock;
++    ::utimensat(AT_FDCWD, d.path(e.name).c_str(), nullptr, 0);   // recency survives a restart
++    ++d.stats.restored;
++    d.stats.read_bytes += read;
++    out = std::move(r);
++    return true;
++}
++
++bool ConversationDisk::put(SavedConversation&& image, uint64_t queue_cap) {
++    Impl& d = *impl_;
++    if (image.live.ids.size() < min_tokens || !image.stage_images.empty() || !image.live.stage_parts.empty() ||
++        !checkpoints_storable(image))
++        return false;
++    const uint64_t ram = image.bytes();
++    std::lock_guard<std::mutex> lk(d.mu);
++    if (d.queued_bytes + ram > queue_cap) return false;
++    // a background copy may still be filling it (STRATA_PARK_ASYNC, STRATA_PARK_VRAM_MIB): it lands here, as it would
++    // if the image were dropped
++    image.pending.reset();
++    image.live_pending.reset();
++    for (auto& k : image.kv) k.pending.reset();
++    auto& cs = image.checkpoints;   // the root and the deepest few
++    std::stable_sort(cs.begin(), cs.end(), [](const auto& a, const auto& b) { return a.ids.size() < b.ids.size(); });
++    if (cs.size() > 1 + kKeepCheckpoints) cs.erase(cs.begin() + 1, cs.end() - (std::ptrdiff_t) kKeepCheckpoints);
++    Impl::Entry e;
++    e.state = Impl::Entry::queued;
++    e.ram = ram;
++    e.m.id = d.id;
++    e.m.cvec = image.cvec;
++    e.m.ids = image.live.ids;
++    e.m.imgs = image.live.imgs;
++    e.m.live = {image.live.ids.size(), image.live.used, {}};
++    for (const auto& c : cs) e.m.checks.push_back({c.ids.size(), c.used, {}});
++    e.image = std::make_shared<SavedConversation>(std::move(image));
++    d.queued_bytes += ram;
++    d.queue.push_back(d.next_id);
++    d.entries.emplace(d.next_id++, std::move(e));
++    d.cv.notify_all();
++    return true;
++}
++
++size_t ConversationDisk::finish(std::chrono::steady_clock::time_point deadline) {
++    Impl& d = *impl_;
++    std::unique_lock<std::mutex> lk(d.mu);
++    const size_t before = d.stats.written;
++    d.urgent = true;
++    d.cv.notify_all();
++    if (!d.cv.wait_until(lk, deadline, [&] { return d.queue.empty() && !d.working; })) {
++        d.stop = true;   // the job in hand gives up at its next write; its blobs go with it
++        d.cv.notify_all();
++    }
++    return d.stats.written - before;
++}
++
++ConversationDisk::Stats ConversationDisk::stats() const {
++    Impl& d = *impl_;
++    std::lock_guard<std::mutex> lk(d.mu);
++    Stats s = d.stats;
++    s.conversations = d.entries.size();
++    s.disk_bytes = d.used_bytes;
++    return s;
++}
++
++} // namespace strata::core
++#endif
+diff --git a/src/core/conversation_disk_test.cpp b/src/core/conversation_disk_test.cpp
+new file mode 100644
+index 000000000..ac86a682a
+--- /dev/null
++++ b/src/core/conversation_disk_test.cpp
+@@ -0,0 +1,422 @@
++#include "strata/core/conversation_disk.hpp"
++#include "strata/core/progress.hpp"
++
++#include <chrono>
++#include <cstdio>
++#include <cstdlib>
++#include <filesystem>
++#include <fstream>
++#include <string>
++#include <thread>
++#include <vector>
++
++#include <unistd.h>
++
++using namespace strata::core;
++namespace fs = std::filesystem;
++
++namespace {
++int checks = 0;
++void check(bool value, const char* description) {
++    ++checks;
++    if (!value) { std::fprintf(stderr, "FAIL: %s\n", description); std::exit(1); }
++}
++
++// A byte of layer `l`, part `p` at `offset`: the same for every conversation, so a longer one starts with the bytes of a
++// shorter one - except the indexer's last (spare) row, which depends on the length.
++uint8_t byte_at(size_t l, size_t p, uint64_t offset, uint64_t salt) {
++    uint64_t x = (l + 1) * 0x9E3779B97F4A7C15ull ^ (p + 7) * 0xC2B2AE3D27D4EB4Full ^ (offset + salt) * 0x165667B19E3779F9ull;
++    x ^= x >> 29; x *= 0xBF58476D1CE4E5B9ull; x ^= x >> 32;
++    return (uint8_t) x;
++}
++
++// n tokens, 3 K/V layers (the last one the "draft"), the checkpoints at `marks`.
++SavedConversation make(size_t n, std::vector<size_t> marks, int32_t token_salt = 0, bool with_image = false) {
++    SavedConversation s;
++    for (size_t i = 0; i < s.geometry.size(); ++i) s.geometry[i] = (int64_t) i + 3;
++    s.layer_lo = 0; s.layer_hi = 36;
++    s.live.ids.resize(n);
++    for (size_t i = 0; i < n; ++i) s.live.ids[i] = (int32_t) ((i * 7 + 3) % 50000) + token_salt;
++    if (with_image) s.live.imgs = {{100, 0xABCDEFull}};
++    auto fill = [](std::vector<uint8_t>& v, size_t bytes, uint64_t salt) {
++        v.resize(bytes);
++        for (size_t i = 0; i < bytes; ++i) v[i] = byte_at(99, 0, i, salt);
++    };
++    auto state = [&](ConversationCheckpoint& c, uint64_t salt) {
++        fill(c.gdn, 300000, salt); fill(c.ple, 5000, salt + 1); fill(c.tails, 70000, salt + 2);
++        fill(c.dead, 33, salt + 3); fill(c.block_pos, 8, salt + 4);
++    };
++    state(s.live, n + (uint64_t) token_salt * 1000003);
++    s.live.used = 1000 + n;
++    for (size_t m : marks) {
++        ConversationCheckpoint c;
++        c.ids.assign(s.live.ids.begin(), s.live.ids.begin() + (std::ptrdiff_t) m);
++        if (with_image && m > 100) c.imgs = s.live.imgs;
++        state(c, m);   // a checkpoint's bytes depend on where it is, not on the conversation
++        c.used = m;
++        s.checkpoints.push_back(std::move(c));
++    }
++    const int64_t cells = (int64_t) ((n + 3) / 4 * 4), rows = (int64_t) (n / 4 + 1);
++    for (size_t l = 0; l < 3; ++l) {
++        ConversationKv k;
++        k.format = 2; k.cells = cells; k.heads = 2; k.head_dim = 64; k.page_size = 4; k.pooled_rows = rows; k.idx_dim = 128;
++        const size_t sizes[5] = {(size_t) cells * 128, (size_t) cells * 128, (size_t) cells * 4, (size_t) cells * 4,
++                                 (size_t) rows * 512};
++        ConversationBuffer* bufs[5] = {&k.k, &k.v, &k.k_scale, &k.v_scale, &k.pooled};
++        for (size_t p = 0; p < 5; ++p) {
++            bufs[p]->resize(sizes[p]);
++            bufs[p]->visit(0, sizes[p], [&](uint8_t* d, size_t c, size_t at) {
++                for (size_t i = 0; i < c; ++i) {
++                    // the last pooled row is the moving spare row
++                    const bool spare = p == 4 && at + i >= sizes[4] - 512;
++                    d[i] = byte_at(l, p, at + i, (uint64_t) token_salt * 1000003 + (spare ? n : 0));
++                }
++                return true;
++            });
++        }
++        s.kv.push_back(std::move(k));
++    }
++    return s;
++}
++
++SavedConversation copy_of(const SavedConversation& s) { return s; }
++
++bool same_checkpoint(const ConversationCheckpoint& a, const ConversationCheckpoint& b) {
++    return a.ids == b.ids && a.imgs == b.imgs && a.gdn == b.gdn && a.ple == b.ple && a.tails == b.tails &&
++           a.dead == b.dead && a.block_pos == b.block_pos && a.used == b.used;
++}
++bool same(const SavedConversation& a, const SavedConversation& b) {
++    if (a.geometry != b.geometry || a.layer_lo != b.layer_lo || a.layer_hi != b.layer_hi || a.cvec != b.cvec ||
++        !same_checkpoint(a.live, b.live) || a.checkpoints.size() != b.checkpoints.size() || a.kv.size() != b.kv.size())
++        return false;
++    for (size_t i = 0; i < a.checkpoints.size(); ++i)
++        if (!same_checkpoint(a.checkpoints[i], b.checkpoints[i])) return false;
++    for (size_t i = 0; i < a.kv.size(); ++i) {
++        const auto &x = a.kv[i], &y = b.kv[i];
++        if (x.format != y.format || x.cells != y.cells || x.heads != y.heads || x.head_dim != y.head_dim ||
++            x.page_size != y.page_size || x.pooled_rows != y.pooled_rows || x.idx_dim != y.idx_dim || !(x.k == y.k) ||
++            !(x.v == y.v) || !(x.k_scale == y.k_scale) || !(x.v_scale == y.v_scale) || !(x.pooled == y.pooled))
++            return false;
++    }
++    return true;
++}
++
++std::vector<int32_t> prompt_of(const SavedConversation& s, size_t extra = 5, int32_t tail = 777777) {
++    auto p = s.live.ids;
++    for (size_t i = 0; i < extra; ++i) p.push_back(tail + (int32_t) i);
++    return p;
++}
++
++std::vector<std::string> files(const std::string& dir, const std::string& prefix) {
++    std::vector<std::string> out;
++    for (const auto& e : fs::directory_iterator(dir))
++        if (e.path().filename().string().rfind(prefix, 0) == 0) out.push_back(e.path().string());
++    return out;
++}
++
++uint64_t folder_bytes(const std::string& dir) {
++    uint64_t n = 0;
++    for (const auto& e : fs::directory_iterator(dir)) if (e.is_regular_file()) n += e.file_size();
++    return n;
++}
++
++std::chrono::steady_clock::time_point far() { return std::chrono::steady_clock::now() + std::chrono::minutes(5); }
++void busy(bool on) { progress().busy.store(on); }
++
++struct Store {
++    ConversationDisk disk;
++    std::vector<std::string> lines;
++    bool open(const std::string& dir, uint64_t id = 1, uint64_t budget = 1ull << 40) {
++        std::string err;
++        const bool ok = disk.open(dir, {id, 2}, budget, 0, [this](const std::string& l) { lines.push_back(l); }, err);
++        if (!ok) std::fprintf(stderr, "open: %s\n", err.c_str());
++        return ok;
++    }
++};
++}
++
++int main(int argc, char** argv) {
++    const std::string base = argc > 1 ? argv[1] : "/tmp";
++    std::string tmpl = base + "/disk_test_XXXXXX";
++    check(::mkdtemp(tmpl.data()) != nullptr, "temporary folder");
++    const std::string root = tmpl;
++    auto clean = [&] { fs::remove_all(root); };
++    SessionReadLimits open_limits;
++
++    {   // a conversation goes to disk and comes back byte for byte
++        const std::string dir = root + "/a";
++        SavedConversation a = make(20000, {1024, 12000, 16000, 19000, 19500}, 0, true);
++        const SavedConversation original = copy_of(a);
++        const auto p = prompt_of(a);
++        SavedConversation expect = copy_of(original);
++        expect.checkpoints.erase(expect.checkpoints.begin() + 1);   // root + the deepest 3 are kept
++        std::string err;
++        {
++        Store st;
++        check(st.open(dir), "open an empty folder");
++        check(st.disk.best(p, a.live.imgs, true).tokens == 0, "nothing stored yet");
++        check(!st.disk.put(make(8000, {}), 1ull << 30), "a conversation under 8192 tokens is not written");
++        check(st.disk.put(std::move(a), 1ull << 30), "put");
++        const auto pending = st.disk.best(p, original.live.imgs, true);
++        check(pending.tokens == 20000, "a queued conversation already matches");
++        st.disk.finish(far());
++        check(!st.lines.empty() && st.lines.back().find("wrote 20000 tokens") != std::string::npos, "the writer logs");
++        auto m = st.disk.best(p, original.live.imgs, true);
++        check(m.tokens == 20000 && m.bytes > 0, "the stored conversation matches its own tokens");
++        check(st.disk.best(p, original.live.imgs, false).tokens == 0, "a conversation of the other control-vector state does not match");
++        check(st.disk.best(p, {}, true).tokens == 0, "pictures decide: a prompt without the stored image does not match");
++        auto diverged = original.live.ids;
++        diverged.resize(17000);
++        diverged.push_back(-5);
++        check(st.disk.best(diverged, original.live.imgs, true).tokens == 16000, "a prompt that diverges later matches the checkpoint before it");
++        check(st.disk.best(original.live.ids, original.live.imgs, true).tokens == 19500, "the whole prompt is never matched: one token starts the window");
++        SavedConversation back;
++        check(st.disk.load(m, back, open_limits, err), "load");
++        check(same(back, expect), "the loaded conversation equals the original (root and deepest 3 checkpoints)");
++        check(back.checkpoints.size() == 4, "four checkpoints");
++        check(st.disk.stats().conversations == 1, "one conversation");
++        }
++        // a stray temporary file and an orphan blob disappear at open; a restart finds the conversation
++        { std::ofstream(dir + "/tmp-0123456789abcdef") << "partial"; }
++        fs::copy_file(files(dir, "k-")[0], dir + "/k-00000000000000ff-" + fs::path(files(dir, "k-")[0]).filename().string().substr(19));
++        Store again;
++        check(again.open(dir), "reopen after a restart");
++        check(files(dir, "tmp-").empty(), "a leftover temporary file is removed");
++        check(files(dir, "k-00000000000000ff").empty(), "a blob no manifest names is removed");
++        auto m2 = again.disk.best(p, original.live.imgs, true);
++        SavedConversation back2;
++        check(m2.tokens == 20000 && again.disk.load(m2, back2, open_limits, err) && same(back2, expect), "restored after a restart, byte for byte");
++    }
++
++    {   // a longer conversation writes only what is new and replaces the shorter one
++        const std::string dir = root + "/b";
++        Store st;
++        check(st.open(dir), "open");
++        SavedConversation a = make(20000, {1024, 19000});
++        SavedConversation b = make(23000, {1024, 19000, 22000});
++        check(std::equal(a.live.ids.begin(), a.live.ids.end(), b.live.ids.begin()), "b extends a");
++        const SavedConversation b_original = copy_of(b);
++        st.disk.put(std::move(a), 1ull << 30);
++        st.disk.finish(far());
++        const auto first = st.disk.stats();
++        st.disk.put(std::move(b), 1ull << 30);
++        st.disk.finish(far());
++        const auto second = st.disk.stats();
++        check(second.conversations == 1, "the shorter copy is superseded");
++        check(second.written_bytes - first.written_bytes < first.written_bytes / 2, "the second write is mostly shared with the first");
++        std::fprintf(stderr, "dedup: first write %llu bytes, second %llu bytes, folder %llu\n",
++                     (unsigned long long) first.written_bytes, (unsigned long long) (second.written_bytes - first.written_bytes),
++                     (unsigned long long) folder_bytes(dir));
++        SavedConversation back;
++        std::string err;
++        auto m = st.disk.best(prompt_of(b_original), {}, true);
++        check(m.tokens == 23000 && st.disk.load(m, back, open_limits, err) && same(back, b_original), "the longer one loads exactly");
++        // writing the same conversation again changes nothing on disk but its manifest
++        SavedConversation again = copy_of(b_original);
++        const auto before = st.disk.stats().written_bytes;
++        st.disk.put(std::move(again), 1ull << 30);
++        st.disk.finish(far());
++        check(st.disk.stats().conversations == 1 && st.disk.stats().written_bytes - before < 100000, "the same conversation again rewrites nothing big");
++    }
++
++    {   // a part that fails its hash drops the conversation; a crash leaves nothing restorable
++        const std::string dir = root + "/c";
++        Store st;
++        check(st.open(dir), "open");
++        SavedConversation a = make(20000, {1024, 19000});
++        const auto p = prompt_of(a);
++        st.disk.put(std::move(a), 1ull << 30);
++        st.disk.finish(far());
++        auto ks = files(dir, "k-");
++        check(ks.size() > 3, "several K/V blocks");
++        {
++            std::fstream f(ks[2], std::ios::in | std::ios::out | std::ios::binary);
++            f.seekp(5000);
++            char c = 0x5a;
++            f.write(&c, 1);
++        }
++        auto m = st.disk.best(p, {}, true);
++        SavedConversation back;
++        std::string err;
++        check(m.tokens == 20000 && !st.disk.load(m, back, open_limits, err), "a flipped byte is detected");
++        check(st.disk.best(p, {}, true).tokens == 0 && st.disk.stats().conversations == 0, "the conversation is gone");
++        check(files(dir, "c-").empty() && !fs::exists(ks[2]), "its manifest and the bad blob are deleted");
++    }
++    {
++        const std::string dir = root + "/d";
++        {
++            Store st;
++            check(st.open(dir), "open");
++            st.disk.put(make(20000, {1024, 19000}), 1ull << 30);
++            st.disk.finish(far());
++        }
++        auto cs = files(dir, "c-");
++        check(cs.size() == 1, "one manifest");
++        fs::resize_file(cs[0], fs::file_size(cs[0]) - 9);   // a torn manifest
++        {
++            Store st;
++            check(st.open(dir), "reopen with a torn manifest");
++            check(st.disk.stats().conversations == 0 && files(dir, "c-").empty() && files(dir, "k-").empty() && files(dir, "s-").empty(),
++                  "a torn manifest is deleted with the blobs only it named");
++            st.disk.put(make(20000, {1024, 19000}), 1ull << 30);
++            st.disk.finish(far());
++        }
++        fs::remove(files(dir, "s-")[0]);
++        Store third;
++        check(third.open(dir) && third.disk.stats().conversations == 0, "a manifest whose blob is missing is deleted at open");
++    }
++
++    {   // the folder keeps to its budget, least recently used first; another engine's conversations are never restored
++        const std::string dir = root + "/e";
++        SavedConversation a = make(16000, {1024}, 0), b = make(16000, {1024}, 11), c = make(16000, {1024}, 23);
++        const auto pa = prompt_of(a), pb = prompt_of(b), pc = prompt_of(c);
++        Store probe;
++        check(probe.open(root + "/probe"), "probe");
++        probe.disk.put(copy_of(a), 1ull << 30);
++        probe.disk.finish(far());
++        const uint64_t one = probe.disk.stats().disk_bytes;
++        {
++        Store st;
++        check(st.open(dir, 1, one * 5 / 2), "open with room for two");
++        st.disk.put(std::move(a), 1ull << 30);
++        st.disk.put(std::move(b), 1ull << 30);
++        st.disk.finish(far());
++        check(st.disk.stats().conversations == 2, "two fit");
++        SavedConversation back;
++        std::string err;
++        check(st.disk.load(st.disk.best(pa, {}, true), back, open_limits, err), "restoring a refreshes it");
++        st.disk.put(std::move(c), 1ull << 30);
++        st.disk.finish(far());
++        check(st.disk.stats().conversations == 2 && st.disk.best(pb, {}, true).tokens == 0, "b, the least recently used, went");
++        check(st.disk.best(pa, {}, true).tokens == 16000 && st.disk.best(pc, {}, true).tokens == 16000, "a and c stay");
++        check(folder_bytes(dir) <= one * 5 / 2 + 4096, "the folder is within the budget");
++        }
++        // the budget is the whole folder: one conversation that cannot fit is not written
++        Store tiny;
++        check(tiny.open(root + "/tiny", 1, one / 4), "tiny budget");
++        tiny.disk.put(make(16000, {1024}), 1ull << 30);
++        tiny.disk.finish(far());
++        check(tiny.disk.stats().conversations == 0 && !tiny.lines.empty() && tiny.lines.back().find("not written") != std::string::npos,
++              "a conversation larger than the budget is refused, logged");
++        // another identity's conversation stays in the folder, counts against the budget and is not matched
++        Store other;
++        check(other.open(dir, 99, one * 5 / 2), "open with another identity");
++        check(other.disk.best(pa, {}, true).tokens == 0 && other.disk.stats().conversations == 2, "the others are kept, not matched");
++    }
++
++    {   // the writer waits for the engine: nothing is written during a request or within a second of one; a
++        // conversation still waiting for its write, or in the middle of it, comes back from RAM; the queue is bounded
++        const std::string dir = root + "/f";
++        Store st;
++        check(st.open(dir), "open");
++        busy(true);   // a request is running
++        SavedConversation a = make(200000, {1024}), b = make(16000, {1024}, 5), c = make(16000, {1024}, 9);
++        const auto original = copy_of(a), original_b = copy_of(b);
++        const uint64_t cap = a.bytes() + b.bytes() + 100;
++        check(st.disk.put(std::move(b), cap), "fits the queue");
++        check(st.disk.put(std::move(a), cap), "a second fits too");
++        check(!st.disk.put(std::move(c), cap), "a third does not fit the queue cap");
++        std::this_thread::sleep_for(std::chrono::milliseconds(1500));
++        check(files(dir, "k-").empty() && files(dir, "s-").empty() && files(dir, "tmp-").empty() &&
++              st.disk.stats().written == 0, "nothing is written while the engine is busy");
++        SavedConversation back_b;
++        std::string err;
++        auto mb = st.disk.best(prompt_of(original_b), {}, true);
++        check(mb.tokens == 16000 && st.disk.load(mb, back_b, open_limits, err) && same(back_b, original_b),
++              "a load of a queued one takes the image back");
++        check(st.disk.best(prompt_of(original_b), {}, true).tokens == 0, "and it is gone from the store");
++        // the request ends: a second later the writer starts; the next request stops it half way
++        const auto idle_at = std::chrono::steady_clock::now();
++        busy(false);
++        while (files(dir, "k-").size() < 2 && std::chrono::steady_clock::now() - idle_at < std::chrono::seconds(30))
++            std::this_thread::sleep_for(std::chrono::milliseconds(1));
++        busy(true);
++        const double started = std::chrono::duration<double>(std::chrono::steady_clock::now() - idle_at).count();
++        std::fprintf(stderr, "idle gate: the writer had 2 K/V blobs out %.3f s after the request ended\n", started);
++        check(started >= 0.9, "the writer waits for a second of idle (from its last look at the engine)");
++        std::this_thread::sleep_for(std::chrono::milliseconds(200));
++        const size_t blobs = files(dir, "k-").size() + files(dir, "s-").size();
++        std::this_thread::sleep_for(std::chrono::milliseconds(500));
++        check(files(dir, "k-").size() + files(dir, "s-").size() == blobs && files(dir, "c-").empty() &&
++              st.disk.stats().written == 0, "a request pauses the write half way");
++        SavedConversation back;
++        auto m = st.disk.best(prompt_of(original), {}, true);
++        check(m.tokens == 200000 && st.disk.load(m, back, open_limits, err) && same(back, original),
++              "a load of the one being written copies it from RAM");
++        busy(false);
++        st.disk.finish(far());
++        check(st.disk.stats().written == 1 && st.disk.best(prompt_of(original), {}, true).tokens == 200000, "it lands on disk");
++    }
++
++    {   // the end: finish writes what is queued at once, busy engine or not; past its deadline the rest is dropped and
++        // nothing half written stays
++        const std::string dir = root + "/i";
++        {
++            Store st;
++            check(st.open(dir), "open");
++            busy(true);
++            st.disk.put(make(16000, {1024}), 1ull << 30);
++            check(st.disk.finish(far()) == 1, "finish writes the queued one at once");
++            st.disk.put(make(200000, {1024}, 3), 1ull << 30);
++            check(st.disk.finish(std::chrono::steady_clock::now()) == 0, "a deadline that has passed writes nothing more");
++        }
++        busy(false);
++        const uint64_t left = folder_bytes(dir);
++        check(files(dir, "tmp-").empty(), "no temporary file is left");
++        Store again;
++        check(again.open(dir) && again.disk.stats().conversations == 1 && again.disk.stats().disk_bytes == left,
++              "after a restart only the finished one is there, and the cut write left no blob behind");
++    }
++
++    {   // limits are applied before anything is allocated
++        const std::string dir = root + "/g";
++        Store st;
++        check(st.open(dir), "open");
++        SavedConversation a = make(16000, {1024});
++        const auto p = prompt_of(a);
++        const auto geometry = a.geometry;
++        st.disk.put(std::move(a), 1ull << 30);
++        st.disk.finish(far());
++        SavedConversation back;
++        std::string err;
++        SessionReadLimits l;
++        l.max_tokens = 15000;
++        check(!st.disk.load(st.disk.best(p, {}, true), back, l, err) && err.find("limits") != std::string::npos, "too many tokens");
++        l = {};
++        auto other = geometry;
++        other[0] += 1;
++        l.geometry = other;
++        check(!st.disk.load(st.disk.best(p, {}, true), back, l, err), "another geometry");
++        l = {};
++        l.max_kv_bytes = {{1, 1, 1, 1, 1}};
++        check(!st.disk.load(st.disk.best(p, {}, true), back, l, err), "a K/V part over the limit");
++        l = {};
++        l.admit = [](uint64_t, std::string& why) { why = "no RAM"; return false; };
++        check(!st.disk.load(st.disk.best(p, {}, true), back, l, err) && err.find("no RAM") != std::string::npos, "the RAM check");
++        check(st.disk.stats().conversations == 1, "a refusal by limits keeps the conversation");
++    }
++
++    {   // speed of the store itself on this folder: write, hash, read
++        const std::string dir = root + "/h";
++        Store st;
++        check(st.open(dir), "open");
++        SavedConversation a = make(200000, {1024, 150000, 199000});   // ~100 MB of K/V at this toy geometry
++        const auto p = prompt_of(a);
++        const uint64_t bytes = a.bytes();
++        const auto t0 = std::chrono::steady_clock::now();
++        st.disk.put(std::move(a), ~0ull);
++        st.disk.finish(far());
++        const double w = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
++        SavedConversation back;
++        std::string err;
++        const auto t1 = std::chrono::steady_clock::now();
++        check(st.disk.load(st.disk.best(p, {}, true), back, open_limits, err), "load the big one");
++        const double r = std::chrono::duration<double>(std::chrono::steady_clock::now() - t1).count();
++        std::fprintf(stderr, "speed: %.0f MiB image: write+hash %.2f s (%.0f MiB/s), read+hash+copy %.2f s (%.0f MiB/s)\n",
++                     (double) bytes / 1048576.0, w, (double) bytes / 1048576.0 / w, r, (double) bytes / 1048576.0 / r);
++    }
++
++    clean();
++    std::printf("conversation_disk_test: %d checks passed\n", checks);
++    return 0;
++}
+diff --git a/src/program/generate.cpp b/src/program/generate.cpp
+index 33989edd2..0b0959e42 100644
+--- a/src/program/generate.cpp
++++ b/src/program/generate.cpp
+@@ -88,6 +88,7 @@
+ #include "strata/program/batch_read.hpp"
+ #include "strata/program/logits_selection.hpp"
+ #include "strata/program/conv_cache.hpp"
++#include "strata/core/conversation_disk.hpp"
+ #include "strata/program/split_rules.hpp"
+ #include "strata/program/stage_reserve.hpp"
+ #include "strata/program/gpu_report.hpp"
+@@ -863,6 +864,9 @@ struct Options {
+     /// (drop_superseded) after writing the same bytes once more, so on a long single conversation every turn pays a
+     /// whole-snapshot copy for nothing.  0 = park every turn, as before.
+     int64_t conversation_cache_park_gain = 0;
++    /// --serve: a second tier under the RAM cache, on disk (conversation_disk.hpp).  Off at 0 MiB.
++    int64_t conversation_cache_disk_mib = 0;
++    std::string conversation_cache_disk_dir;
+     /// --memory-limit-mib N / STRATA_MEMORY_LIMIT_MIB: the total RAM this engine's container or cgroup may use, for a
+     /// container that cannot see its real limit (0 or unset = none; the flag wins over the variable)
+     int64_t memory_limit_mib = -1;
+@@ -1027,6 +1031,11 @@ void usage() {
+                  "  --conversation-cache-park-gain N  --serve: park only after the conversation advanced N tokens past\n"
+                  "                       the copy it would supersede, so a turn that grew by a few hundred tokens does not\n"
+                  "                       write a whole snapshot that the next turn drops (default 0 = park every turn)\n"
++                 "  --conversation-cache-disk-mib N  --serve: a disk tier under the RAM cache, at most N MiB (default 0 =\n"
++                 "                       off): conversations of 8192+ tokens the RAM cache evicts, or still holds when the\n"
++                 "                       engine ends, are written to --conversation-cache-disk-dir while the engine is idle\n"
++                 "                       and read back when a prompt starts with them, also after a restart\n"
++                 "  --conversation-cache-disk-dir DIR  --serve: the folder of the disk tier (only this engine uses it)\n"
+                  "  --session-min-free-mib N  --serve: disk space a SAVE must leave free (default 4096; 0 = no check)\n"
+                  "  --session-save-reclaim  --serve: reclaim unpinned host caches if SAVE needs RAM (opt-in)\n"
+                  "  --vram-elastic       --serve (#533, opt-in, NVIDIA): the expert cache in segments (--vram-segment-mib,\n"
+@@ -3237,9 +3246,10 @@ int main(int argc, char** argv) {
+         else if (a == "--vision") o.vision = true;
+         else if (a == "--session-save-reclaim") o.session_save_reclaim = true;
+         else if (a == "--prompt-cache") o.prompt_cache = std::max(0, std::atoi(next("--prompt-cache")));
++        else if (a == "--conversation-cache-disk-dir") o.conversation_cache_disk_dir = next("--conversation-cache-disk-dir");
+         else if (a == "--conversation-cache-mib" || a == "--conversation-cache-slots" ||
+                  a == "--conversation-cache-min-free-mib" || a == "--conversation-cache-min-tokens" ||
+-                 a == "--conversation-cache-park-gain" ||
++                 a == "--conversation-cache-park-gain" || a == "--conversation-cache-disk-mib" ||
+                  a == "--session-min-free-mib" || a == "--memory-limit-mib") {
+             const std::string value = next(a.c_str());
+             int64_t number = 0;
+@@ -3255,6 +3265,7 @@ int main(int argc, char** argv) {
+             else if (a == "--conversation-cache-min-free-mib") o.conversation_cache_min_free_mib = number;
+             else if (a == "--conversation-cache-min-tokens") o.conversation_cache_min_tokens = number;
+             else if (a == "--conversation-cache-park-gain") o.conversation_cache_park_gain = number;
++            else if (a == "--conversation-cache-disk-mib") o.conversation_cache_disk_mib = number;
+             else if (a == "--session-min-free-mib") o.session_min_free_mib = number;
+             else if (a == "--memory-limit-mib") o.memory_limit_mib = number;
+             else o.conversation_cache_slots = (int) number;
+@@ -3575,6 +3586,13 @@ int main(int argc, char** argv) {
+     if (o.serve && o.conversation_cache_mib > 0 && (o.prompt_cache == 0 || o.conversation_cache_slots == 0))
+         std::fprintf(stderr, "strata serve: warning: conversation caching is disabled by %s\n",
+                      o.prompt_cache == 0 ? "--prompt-cache 0" : "--conversation-cache-slots 0");
++    if (o.serve && o.conversation_cache_disk_mib > 0 &&
++        (o.conversation_cache_disk_dir.empty() || o.conversation_cache_mib == 0 || o.prompt_cache == 0 ||
++         o.conversation_cache_slots == 0)) {
++        std::fprintf(stderr, "strata serve: --conversation-cache-disk-mib needs --conversation-cache-disk-dir and the RAM "
++                             "cache on (--conversation-cache-mib, --conversation-cache-slots, --prompt-cache)\n");
++        return 2;
++    }
+     // STRATA_PRIMARY_DEVICE: which VISIBLE device the engine's own session runs on.  The Windows HIP runtime
+     // enumerates the cards in a fixed order no HIP_VISIBLE_DEVICES list can change (it only filters), so with a
+     // slower card first a run could only put the model on it (RX 6600 before RX 6800).  0 (unset) is upstream's
+@@ -10525,6 +10543,41 @@ int main(int argc, char** argv) {
+             id.config = *config_fp;
+             return true;
+         };
++        // The disk tier under the RAM cache (conversation_disk.hpp).  What the cache evicts for want of room goes
++        // there, and so does what it still holds when the engine ends; a request that starts with a stored
++        // conversation reads it back instead of reading its prompt.  The draft layer's K/V is part of every image
++        // (the read limits below assume it), and a layer split parks one image per stage: neither is stored.
++        strata::core::ConversationDisk disk;
++        const uint64_t disk_queue_cap = (uint64_t) std::max<int64_t>(o.conversation_cache_mib, 0) << 20;
++        if (o.conversation_cache_disk_mib > 0) {
++            strata::core::SessionFileIdentity disk_id;
++            std::string disk_err;
++            if (!conversations.enabled()) disk_err = "the RAM cache is off";
++            else if (!use_mtp || !stages.empty()) disk_err = "it needs --mtp and no --layer-split";
++            else if (session_identity(disk_id, disk_err, {}))
++                disk.open(o.conversation_cache_disk_dir, disk_id, (uint64_t) o.conversation_cache_disk_mib << 20,
++                          (uint64_t) o.session_min_free_mib << 20, [](const std::string& line) {
++                              std::fprintf(stderr, "strata serve: conversation cache: %s\n", line.c_str());
++                          }, disk_err);
++            if (disk.enabled()) {
++                const auto st = disk.stats();
++                std::fprintf(stderr, "strata serve: conversation cache: disk tier %s, up to %lld MiB; %zu conversations "
++                                     "stored (%.1f GiB)\n", o.conversation_cache_disk_dir.c_str(),
++                             (long long) o.conversation_cache_disk_mib, st.conversations,
++                             (double) st.disk_bytes / 1073741824.0);
++                conversations.set_spill([&disk, disk_queue_cap](strata::core::SavedConversation&& image) {
++                    const size_t tokens = image.live.ids.size(), mib = image.bytes() >> 20;
++                    if (disk.put(std::move(image), disk_queue_cap))
++                        std::fprintf(stderr, "strata serve: conversation cache: evicted %zu tokens (%zu MiB) to the disk tier\n",
++                                     tokens, mib);
++                    else if (tokens >= strata::core::ConversationDisk::min_tokens)
++                        std::fprintf(stderr, "strata serve: conversation cache: evicted %zu tokens (%zu MiB), not kept on "
++                                             "disk (the write queue is full, or it cannot be stored)\n", tokens, mib);
++                });
++            } else {
++                std::fprintf(stderr, "strata serve: conversation cache: the disk tier is off: %s\n", disk_err.c_str());
++            }
++        }
+         // What a park captures: the main session's conversation (park_current) or an idle batch slot's (park_slot:
+         // the reply it decoded, before an admission overwrites it).  One budget / admission / snapshot path for both.
+         struct ParkSource {
+@@ -14299,14 +14352,60 @@ int main(int argc, char** argv) {
+             }
+             const auto parked = conversations.best(ids, req_imgs, want_cvec);
+             std::optional<strata::core::SavedConversation> incoming;
++            int64_t incoming_tokens = parked.tokens;
++            bool incoming_live = parked.live;
++            // The disk tier: a stored conversation that shares more of this prompt than the session, a slot or any
++            // parked one is read back (the request waits for the drive, seconds) and goes on as a parked one taken
++            // whole does.  The disk keeps its copy, so a sibling that starts with one of its checkpoints takes nothing
++            // from the conversation it came from.
++            if (disk.enabled()) {
++                const auto stored = disk.best(std::vector<int32_t>(ids.begin(), ids.end()), req_imgs, want_cvec);
++                if (stored.tokens > std::max({resume, slot_tokens, parked.tokens})) {
++                    const auto t0 = Clock::now();
++                    strata::core::SessionReadLimits limits;
++                    const uint64_t floor = (uint64_t) o.conversation_cache_min_free_mib << 20;
++                    limits.admit = [floor, &o](uint64_t need, std::string& why) {
++                        const auto mem = strata::core::sample_host_memory();
++                        if (strata::core::conversation_memory_admit(
++                                mem ? std::optional<uint64_t>(mem->available) : std::nullopt, need, floor)) return true;
++                        why = "not enough RAM to read it (" + std::to_string(need >> 20) + " MiB plus a floor of " +
++                              std::to_string((long long) o.conversation_cache_min_free_mib) + " MiB needed, " +
++                              ram_note(mem) + ")";
++                        return false;
++                    };
++                    strata::core::SavedConversation image;
++                    std::string disk_err;
++                    try {
++                        if (strata::core::conversation_session_read_limits(
++                                limits, ss, g, mtp.kv_state(), (uint64_t) o.max_context,
++                                (uint64_t) std::max(o.prompt_cache, 1), disk_err))
++                            disk.load(stored, image, limits, disk_err);
++                    } catch (const std::bad_alloc&) {
++                        disk_err = "not enough RAM to read it";
++                    }
++                    if (!image.live.ids.empty()) {
++                        incoming.emplace(std::move(image));
++                        incoming_tokens = stored.tokens;
++                        incoming_live = stored.tokens == (int64_t) incoming->live.ids.size();
++                        std::fprintf(stderr, "strata serve: conversation cache: read %lld of this prompt's tokens back "
++                                             "from the disk tier (%zu MiB) in %.1f ms\n", (long long) stored.tokens,
++                                     incoming->bytes() >> 20,
++                                     std::chrono::duration<double, std::milli>(Clock::now() - t0).count());
++                    } else {
++                        std::fprintf(stderr, "strata serve: conversation cache: the disk tier could not give back %lld "
++                                             "tokens (%s); reading the prompt\n", (long long) stored.tokens,
++                                     disk_err.c_str());
++                    }
++                }
++            }
+             // A checkpoint inside ANOTHER parked conversation (a sibling subagent's system prompt and tools, say) is
+             // borrowed: its K/V up to there and the checkpoint come over, and that conversation stays parked for its
+             // own next turn (ConversationCache::borrows).  Everything else is taken whole, as before.
+             // (a layer split restores whole stage images only, so it never borrows; a batch slot that holds a longer
+             // start of this prompt wins as before)
+-            bool borrow = stages.empty() && parked.tokens > std::max(resume, slot_tokens) &&
++            bool borrow = !incoming && stages.empty() && parked.tokens > std::max(resume, slot_tokens) &&
+                           conversations.borrows(parked);
+-            if (parked.tokens > std::max(resume, slot_tokens) && !borrow)
++            if (!incoming && parked.tokens > std::max(resume, slot_tokens) && !borrow)
+                 incoming.emplace(conversations.take(parked.index));
+             if (incoming || borrow) slot_source = -1;
+             // Reject the entire image before parking/overwriting the outgoing
+@@ -14608,6 +14707,8 @@ int main(int argc, char** argv) {
+                 live_imgs = std::move(incoming->live.imgs);
+                 if (stages.empty()) {
+                     checks = std::move(incoming->checkpoints);
++                    // (one from the disk tier was saved by an earlier run, whose checkpoint clock may be ahead)
++                    for (const ConvCheckpoint& c : checks) check_clock = std::max(check_clock, c.used);
+                 } else {   // give each checkpoint back its stage parts (moved, not copied); none if they do not line up
+                     strata::core::ConversationCheckpointSplit cs;
+                     cs.stage0 = std::move(incoming->checkpoints);
+@@ -14615,8 +14716,8 @@ int main(int argc, char** argv) {
+                     if (!strata::core::conversation_checkpoints_merge(std::move(cs), checks)) checks.clear();
+                 }
+                 cvec_cached = incoming->cvec;
+-                resume = parked.tokens;
+-                from_live = parked.live;
++                resume = incoming_tokens;
++                from_live = incoming_live;
+                 if (std::getenv("STRATA_SNAPSHOT_FULL_CAPTURE") == nullptr) {
+                     std::vector<std::vector<strata::core::ConversationKv>> stage_kv;   // every stage's, for its next park
+                     for (auto& si : incoming->stage_images) stage_kv.push_back(std::move(si.kv));
+@@ -17685,6 +17786,24 @@ int main(int argc, char** argv) {
+             }
+         }
+         save_profile("exit");   // #477: QUIT, or the server closed stdin
++        // The conversations the engine still holds go to the disk tier, the most recent written first: the session's
++        // own is parked as on a switch, then the RAM cache is handed over.  serve/server.py ends the engine 20 s after
++        // QUIT and freeing the memory takes a few of them: what is not written by kExitWrite is dropped.
++        if (disk.enabled()) {
++            constexpr auto kExitWrite = std::chrono::seconds(12);
++            const auto t0 = Clock::now();
++            park_current(0);
++            auto parked_all = conversations.drain();
++            size_t queued = 0;
++            for (auto it = parked_all.rbegin(); it != parked_all.rend(); ++it) queued += disk.put(std::move(*it), ~0ull) ? 1 : 0;
++            parked_all.clear();
++            const size_t written = disk.finish(t0 + kExitWrite);
++            const auto st = disk.stats();
++            std::fprintf(stderr, "strata serve: conversation cache: wrote %zu conversations to the disk tier at exit (%zu "
++                                 "were still parked) in %.1f s; %zu stored (%.1f GiB)\n", written, queued,
++                         std::chrono::duration<double>(Clock::now() - t0).count(), st.conversations,
++                         (double) st.disk_bytes / 1073741824.0);
++        }
+ #if defined(STRATA_GPU_METAL)
+         // the stdin reader (detached above) may still take in_mu when the server closes the pipe after QUIT; on macOS
+         // locking that mutex once this scope has destroyed it throws (the engine ended with an abort): end here

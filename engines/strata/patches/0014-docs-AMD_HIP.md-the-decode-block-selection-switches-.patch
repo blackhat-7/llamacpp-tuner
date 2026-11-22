@@ -1,0 +1,31 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: blackhat-7 <44942105+blackhat-7@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 07:19:04 +0530
+Subject: [PATCH 14/33] docs/AMD_HIP.md: the decode block selection switches
+ (STRATA_TOPK_ROWS, STRATA_SCORES_DPP) in the gfx1100 list
+
+---
+ docs/AMD_HIP.md | 10 ++++++----
+ 1 file changed, 6 insertions(+), 4 deletions(-)
+
+diff --git a/docs/AMD_HIP.md b/docs/AMD_HIP.md
+index aad18e077..927c2ce33 100644
+--- a/docs/AMD_HIP.md
++++ b/docs/AMD_HIP.md
+@@ -371,10 +371,12 @@ follow texts with `--suffix-draft 0` and a fixed `--expert-cache`). On by defaul
+ On by default on gfx1100 in the code, each with its `=0`: the pipelined HC down read and the read in one kernel
+ (`STRATA_GR_PIPE`, `STRATA_GR_ONE`), the dense GEMVs (`STRATA_MMVQ_G11`, `STRATA_MMVQ_R4`), the draft kernel diet
+ (`STRATA_MTP_FUSE`), PR #540's decode attention with the bounded merge (`STRATA_ATTN_PRE75`, `STRATA_ATTN_MERGE_V2`),
+-the v2 prompt attention (`STRATA_PA_V2`, with `STRATA_HIP_WMMA=1`). Opt-in (the run config sets them): the launch cuts
+-`STRATA_SH_GATE_TAIL`, `STRATA_COMBINE_MAPPED`, `STRATA_QSA_GATE_Q8`, `STRATA_MAPPED_FAST`, `STRATA_T1_FUSE`,
+-`STRATA_QSA_FOLD`, `STRATA_ROUTER_TAIL_ROWS=4`; the draft side `STRATA_MTP_NO_RCOPY`, `STRATA_MTP_MIX_FUSED` (moves
+-draft probabilities in their last bits), `STRATA_SPEC_CUM` / `STRATA_SPEC_CUM_ACC` (draft stop), `STRATA_MTP_CTX_ROWS`.
++the v2 prompt attention (`STRATA_PA_V2`, with `STRATA_HIP_WMMA=1`), the decode block selection (the register top-k
++`STRATA_TOPK_ROWS` and the DPP16 scorer `STRATA_SCORES_DPP`; other gfx11 parts: `=1`). Opt-in (the run config sets
++them): the launch cuts `STRATA_SH_GATE_TAIL`, `STRATA_COMBINE_MAPPED`, `STRATA_QSA_GATE_Q8`, `STRATA_MAPPED_FAST`,
++`STRATA_T1_FUSE`, `STRATA_QSA_FOLD`, `STRATA_ROUTER_TAIL_ROWS=4`; the draft side `STRATA_MTP_NO_RCOPY`,
++`STRATA_MTP_MIX_FUSED` (moves draft probabilities in their last bits), `STRATA_SPEC_CUM` / `STRATA_SPEC_CUM_ACC`
++(draft stop), `STRATA_MTP_CTX_ROWS`.
+ 
+ ## Linux: verify timeouts while the kernel reclaims host memory
+ 

@@ -1,0 +1,75 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: blackhat-7 <44942105+blackhat-7@users.noreply.github.com>
+Date: Mon, 16 Nov 2026 03:19:25 +0530
+Subject: [PATCH 26/33] Tail skip beside helper GPUs; per-layer CPU expert
+ counts in the stats
+
+STRATA_ROUTE_TAIL_SKIP now also runs with helper caches, skipping only experts no GPU holds (a helper's are cheap).
+mixD + 4070, generate mode: rank 7 cut the CPU's cold experts 2.4 -> 1.5 a layer, code +3.3%, prose +2.8%; Strata's
+quality set: perplexity 4.153 -> 4.096, KL to the 4-bit reference +0.002 (noise).
+---
+ include/strata/core/expert_source.hpp | 1 +
+ src/core/expert_source.cpp            | 6 +++++-
+ src/program/generate.cpp              | 6 ++++++
+ 3 files changed, 12 insertions(+), 1 deletion(-)
+
+diff --git a/include/strata/core/expert_source.hpp b/include/strata/core/expert_source.hpp
+index 45ac7f742..30002fa34 100644
+--- a/include/strata/core/expert_source.hpp
++++ b/include/strata/core/expert_source.hpp
+@@ -652,6 +652,7 @@ struct ExpertDispatch {
+     const int32_t* dres_check = nullptr;
+     int64_t stale_x = 0;
+     int64_t multi_misses = 0;      ///< distinct (layer, expert) pairs the CPU computed in verify windows
++    std::vector<int64_t> layer_misses;   ///< the same per layer (sized on first use)
+     int64_t multi_entries = 0;     ///< routed (token, expert) entries the CPU served in verify windows
+     /// Multi-GPU: the second GPU's tier.  Its experts are computed there instead of on the CPU (kind 2).
+     PeerExperts* peer = nullptr;
+diff --git a/src/core/expert_source.cpp b/src/core/expert_source.cpp
+index e1f466489..cb2e8ddae 100644
+--- a/src/core/expert_source.cpp
++++ b/src/core/expert_source.cpp
+@@ -4935,7 +4935,8 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
+         const int tail_rank = tail_skip_rank();
+         bool skip_d[kMaxWindowEntries];
+         for (int q = 0; q < nd; ++q) skip_d[q] = false;
+-        if (tail_rank > 0 && d.peer == nullptr && d.remote_count == 0) {
++        // with helper GPUs: never an expert a helper holds (its rows are cheap there), only the CPU's / PCIe misses
++        if (tail_rank > 0 && d.peer == nullptr) {
+             int minr[kMaxWindowEntries];
+             for (int q = 0; q < nd; ++q) minr[q] = 99;
+             for (int64_t i = 0; i < n; ++i) {
+@@ -4947,6 +4948,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
+                 const int32_t e = ids[distinct[q]];
+                 if (e < 0 || e >= d.n_expert || minr[q] < tail_rank) continue;
+                 if (d.host_res[(size_t) d.layers * (size_t) d.n_expert + (size_t) e] >= 0) continue;   // resident
++                if (helper_holds(e)) continue;
+                 skip_d[q] = true;
+                 --nmiss;
+                 ++d.tail_experts;
+@@ -5322,6 +5324,8 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
+         if (e >= 0 && e < d.n_expert) d.job_of[(size_t) e] = -1;
+     }
+     d.multi_misses += njobs;
++    if (d.layer_misses.size() <= (size_t) d.layers) d.layer_misses.resize((size_t) d.layers + 1, 0);
++    d.layer_misses[(size_t) d.layers] += njobs;
+     ++d.layers;
+     d.experts += n_tok * k;
+ }
+diff --git a/src/program/generate.cpp b/src/program/generate.cpp
+index 3c9a8c478..2560d9d67 100644
+--- a/src/program/generate.cpp
++++ b/src/program/generate.cpp
+@@ -18982,6 +18982,12 @@ int main(int argc, char** argv) {
+             std::printf("%-24s %lld of %lld emitted tokens differ from the argmax\n", "follow",
+                         (long long) follow_differ, (long long) follow_emitted);
+         if (o.spec_min_p > 0.0) {
++            if (!drive.d.layer_misses.empty()) {   // the CPU's distinct experts per layer, summed over the windows
++                std::printf("%-24s", "CPU experts by layer");
++                for (size_t l = 0; l < drive.d.layer_misses.size(); ++l)
++                    std::printf(" %zu:%lld", l, (long long) drive.d.layer_misses[l]);
++                std::printf("\n");
++            }
+             std::printf("%-24s", "window sizes");
+             for (size_t i = 1; i < window_hist.size(); ++i) std::printf(" T%zu:%lld", i, (long long) window_hist[i]);
+             std::printf("  (min draft probability %.2f)\n", o.spec_min_p);

@@ -1,0 +1,38 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: blackhat-7 <44942105+blackhat-7@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 07:49:09 +0530
+Subject: [PATCH 18/33] arch_defaults_test: the gfx1100 checks follow this
+ branch's gfx1100 table
+
+v0.2.9's test used gfx1100 as the discrete card without a table (lines 262 and 421); with the seven ported
+gfx1100 switches both checks failed (the tests are not built by the engine build, so the port never ran it).
+They now use gfx1030 for that role, and the STRATA_DEFAULTS=026 block checks that the gfx1100 table does not
+change under 026. arch_defaults_test: OK.
+---
+ src/core/arch_defaults_test.cpp | 6 ++++--
+ 1 file changed, 4 insertions(+), 2 deletions(-)
+
+diff --git a/src/core/arch_defaults_test.cpp b/src/core/arch_defaults_test.cpp
+index 39b07f51a..15813fecd 100644
+--- a/src/core/arch_defaults_test.cpp
++++ b/src/core/arch_defaults_test.cpp
+@@ -259,7 +259,7 @@ int main() {
+     // apply: a discrete card sets nothing, an iGPU sets the five, a switch the user set (even to 0) is kept
+     const char* five[] = {"STRATA_HIP_WMMA", "STRATA_PF_GEMM", "STRATA_PA_FAST", "STRATA_SELECT_WMMA", "STRATA_HC_UPMIX"};
+     for (const char* k : five) unset(k);
+-    CHECK(apply_arch_defaults("gfx1100", false).empty());
++    CHECK(apply_arch_defaults("gfx1030", false).empty());   // (gfx1100 has its own table now: the seven, checked above)
+     // gfx12: a discrete RDNA4 card gets its own nine switches (five prompt, four decode); a second call has nothing to do
+     const char* g12[] = {"STRATA_GDN_HEAD", "STRATA_GDN_PP",  "STRATA_GDN_CONVL2",    "STRATA_GDN_NOY", "STRATA_CVEC_FUSE",
+                          "STRATA_ATTN_LANECELL", "STRATA_ATTN_MERGE_V2", "STRATA_TSUM", "STRATA_EXPDEC"};
+@@ -418,7 +418,9 @@ int main() {
+             CHECK(has(t27, "STRATA_ATTN_LANECELL") && has(t27, "STRATA_ATTN_MERGE_V2") && has(t27, "STRATA_TSUM") && has(t27, "STRATA_EXPDEC"));
+             CHECK(strata::core::arch_default_env("gfx1200", true).size() == 5);
+             CHECK(strata::core::arch_default_env("gfx1151", true) == strata::core::arch_default_env("gfx1151", false));
+-            CHECK(strata::core::arch_default_env("gfx1100", true).empty() && strata::core::arch_default_env("gfx1100", false).empty());
++            CHECK(strata::core::arch_default_env("gfx1030", true).empty() && strata::core::arch_default_env("gfx1030", false).empty());
++            // gfx1100's table is this branch's, not a v0.2.x one: STRATA_DEFAULTS=026 leaves it as it is
++            CHECK(strata::core::arch_default_env("gfx1100", true) == strata::core::arch_default_env("gfx1100", false));
+         }
+         // the decode miss split start value: 0.15 on gfx12 native packs, 0.55 under 026 or STRATA_PCIE_FRAC_DEFAULT=old; the others do not move
+         CHECK(pcie_start_frac(false, true, true, false, false) == 0.15);

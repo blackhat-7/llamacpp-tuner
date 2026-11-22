@@ -1,0 +1,298 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: blackhat-7 <44942105+blackhat-7@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 08:34:51 +0530
+Subject: [PATCH 21/33] STRATA_QSA_KV_ROLE (round 9, ported): a QSA layer's k
+ and v GEMVs as front blocks of its q GEMV (opt-in, with NR3)
+
+Pair-typed roles (Q6_K / IQ4_XS pairs, 2-4 columns; a q in Q6_K at 4 columns falls back to three launches). Two fewer
+critical-path launches per QSA layer on top of STRATA_QSA_NR3. mmvq_g11_parity: OK, 576 kv role runs bitwise.
+---
+ include/strata/kernels/native_mmvq.hpp |  7 +++
+ src/core/verify.cpp                    | 20 ++++++-
+ src/kernels/cuda/native_mmvq.cu        | 78 +++++++++++++++++++++++++-
+ src/kernels/mmvq_g11_parity.cpp        | 65 ++++++++++++++++++++-
+ 4 files changed, 161 insertions(+), 9 deletions(-)
+
+diff --git a/include/strata/kernels/native_mmvq.hpp b/include/strata/kernels/native_mmvq.hpp
+index cbfe69fe7..5db71a755 100644
+--- a/include/strata/kernels/native_mmvq.hpp
++++ b/include/strata/kernels/native_mmvq.hpp
+@@ -148,6 +148,13 @@ bool native_mmvq_supported(int ggml_type) noexcept;
+ std::size_t native_mmvq_weight_bytes(int ggml_type, int n_in, int n_out);
+ void native_mmvq(int ggml_type, const void* weights, const void* x_q8_1, float* y,
+                  int n_in, int n_out, int ncols, void* stream);
++/// STRATA_QSA_KV_ROLE: native_mmvq of wq (n_q rows), wk and wv (n_kv rows each), all of the same q8_1 input, in ONE launch
++/// on gfx1100: k's and v's g11 blocks in front of q's GEMV blocks, every output bitwise its own call's. Returns false
++/// (nothing launched) where one of the three would not take a gfx1100 g11 / r4 kernel (k and v: 2-4 columns, 2560
++/// inputs, Q6_K or IQ4_XS each: Q4_K / Q5_K bodies would cost the q kernel waves); the caller then makes the three calls.
++bool native_mmvq_kv_role(int q_type, const void* wq, float* yq, int n_q, int k_type, const void* wk, float* yk,
++                         int v_type, const void* wv, float* yv, int n_kv, const void* x_q8_1, int n_in, int ncols,
++                         void* stream);
+ /// gdn_conv_ab_multi's arguments (its STRATA_GDN_AB_ILP kernel), for native_mmvq_conv_ab.
+ struct GdnConvAbArgs {
+     float* hist;
+diff --git a/src/core/verify.cpp b/src/core/verify.cpp
+index cc5e46916..5b9ec9b40 100644
+--- a/src/core/verify.cpp
++++ b/src/core/verify.cpp
+@@ -319,6 +319,8 @@ bool qsa_fold_on() { static const bool on = env_on("STRATA_QSA_FOLD"); return on
+ bool qsa_nr3_on() { static const bool on = env_on("STRATA_QSA_NR3"); return on; }
+ // STRATA_Z_CONVAB (opt-in): a GDN layer's conv/ab launch as front blocks of its z GEMV (native_mmvq_conv_ab)
+ bool z_convab_on() { static const bool on = env_on("STRATA_Z_CONVAB"); return on; }
++// STRATA_QSA_KV_ROLE (opt-in, with STRATA_QSA_NR3): a QSA layer's k and v GEMVs as front blocks of its q GEMV
++bool qsa_kv_role_on() { static const bool on = env_on("STRATA_QSA_KV_ROLE"); return on; }
+ #if defined(STRATA_USE_HIP)
+ const bool g_coherent = env_on("STRATA_VERIFY_COHERENT");
+ const bool g_doorbell_store = env_on("STRATA_DOORBELL_STORE");
+@@ -1934,15 +1936,27 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
+                 }
+                 if (!sidem) idx_key(cs);
+                 stamp(l, 7, grp);
+-                mm(wk, kcur_ + tb * NKV * HD, (int) N, (int) (NKV * HD));
+-                mm(wv, vcur_ + tb * NKV * HD, (int) N, (int) (NKV * HD));
+                 // STRATA_QSA_NR3: q's GEMV moves up here (nothing until its old place touches qfull_/qcur_) so the three
+                 // norm+ropes are one launch; kv_rot would put the rotations between them, the unfolded indexer GEMV too
+                 // (the side mixer / query branch run the q and indexer-query chains on branches: not then)
+                 const bool nr3 = qsa_nr3_on() && qb && fuse_nr && !qbr && !sidem && !side_proj && !st.kv_rot && qidx_ready &&
+                                  native_norm_rope_usable((int) ID, (int) s.n_rot);
++                // STRATA_QSA_KV_ROLE: then k and v ride in q's launch (false: no gfx1100 kernel takes them so)
++                const auto il_takes = [&](const WeightRef* w, int rows) {
++                    return g_mmvq_il() && strata::kernels::native_mmvq_il_supported(w->native_type, n, rows);
++                };
++                const bool kv_role = nr3 && qsa_kv_role_on() && !il_takes(wq, (int) (NH * 2 * HD)) &&
++                    !il_takes(wk, (int) (NKV * HD)) && !il_takes(wv, (int) (NKV * HD)) &&
++                    strata::kernels::native_mmvq_kv_role(wq->native_type, wq->native_data, qfull_ + tb * NH * 2 * HD,
++                                                         (int) (NH * 2 * HD), wk->native_type, wk->native_data,
++                                                         kcur_ + tb * NKV * HD, wv->native_type, wv->native_data,
++                                                         vcur_ + tb * NKV * HD, (int) (NKV * HD), xq_, (int) N, n, cs);
++                if (!kv_role) {
++                    mm(wk, kcur_ + tb * NKV * HD, (int) N, (int) (NKV * HD));
++                    mm(wv, vcur_ + tb * NKV * HD, (int) N, (int) (NKV * HD));
++                }
+                 if (nr3) {
+-                    mm(wq, qfull_ + tb * NH * 2 * HD, (int) N, (int) (NH * 2 * HD));
++                    if (!kv_role) mm(wq, qfull_ + tb * NH * 2 * HD, (int) N, (int) (NH * 2 * HD));
+                     const strata::kernels::NormRopeSeg seg[3] = {
+                         {kcur_ + tb * NKV * HD, (int) HD, (const float*) wkn->data, kcur_ + tb * NKV * HD, (int) (n * NKV),
+                          (int) HD, pos_k + tb * NKV},
+diff --git a/src/kernels/cuda/native_mmvq.cu b/src/kernels/cuda/native_mmvq.cu
+index 241ed49ff..3f401e68b 100644
+--- a/src/kernels/cuda/native_mmvq.cu
++++ b/src/kernels/cuda/native_mmvq.cu
+@@ -2661,6 +2661,33 @@ __global__ void native_mmvq_g11_role_kernel(const typename G::Block* __restrict_
+     g11_rows<G, NC, BPR, HEAD>(w, x, y, n_out, int(blockIdx.x) - role.blocks, int(gridDim.x) - role.blocks);
+ }
+ 
++// Whether the launchers instantiate an N-column kernel with role X (a KvRole serves one column count only).
++template <class X, int N>
++constexpr bool role_takes = true;
++// STRATA_QSA_KV_ROLE: two small g11 GEMVs of the same input and column count (QSA's k and v, 512 rows each) as front
++// blocks of another GEMV (q): blocks [0, k.blocks) run k's g11 rows as a k.blocks grid would, the next v.blocks v's.
++// One instantiation per (k, v) type pair, so q's kernel keeps max(q, k, v) registers.
++struct KvMat {
++    const void* w;
++    float* y;
++    int blocks;
++};
++template <int NC, class GK, class GV>
++struct KvRole {
++    KvMat k, v;
++    const Q81Block* x;
++    int n_out;    // rows of k and of v
++    int blocks;   // k.blocks + v.blocks
++    __device__ __forceinline__ void run(int b) const {
++        if (b < k.blocks)
++            g11_rows<GK, NC, 10, false>(static_cast<const typename GK::Block*>(k.w), x, k.y, n_out, b, k.blocks);
++        else
++            g11_rows<GV, NC, 10, false>(static_cast<const typename GV::Block*>(v.w), x, v.y, n_out, b - k.blocks, v.blocks);
++    }
++};
++template <int NC, class GK, class GV, int N>
++constexpr bool role_takes<KvRole<NC, GK, GV>, N> = NC == N;
++
+ int g_g11 = -1;        // native_mmvq_g11_tune: -1 the environment (STRATA_MMVQ_G11), 0 off, 1 on
+ int g_g11_grid = 0;    // blocks of the grid (0: g11_blocks's choice)
+ bool g11_device() {
+@@ -2701,7 +2728,8 @@ void g11_launch(const void* weights, const void* x_q8_1, float* y, int n_out, in
+ #define STRATA_G11_CASE(N)                                                                                             \
+     case N:                                                                                                            \
+         if constexpr (std::is_same_v<X, NoRole>) native_mmvq_g11_kernel<G, N, BPR, HEAD><<<blocks, 4 * WARP, 0, s>>>(w, x, y, n_out); \
+-        else native_mmvq_g11_role_kernel<G, N, BPR, HEAD, X><<<blocks, 4 * WARP, 0, s>>>(w, x, y, n_out, role);        \
++        else if constexpr (role_takes<X, N>)                                                                          \
++            native_mmvq_g11_role_kernel<G, N, BPR, HEAD, X><<<blocks, 4 * WARP, 0, s>>>(w, x, y, n_out, role);        \
+         break;
+         STRATA_G11_CASE(1) STRATA_G11_CASE(2) STRATA_G11_CASE(3) STRATA_G11_CASE(4)
+ #undef STRATA_G11_CASE
+@@ -3174,12 +3202,14 @@ void r4_launch(int ggml_type, const void* weights, const Q81Block* x, float* y,
+                cudaStream_t s, const X& role = X()) {
+ #define STRATA_R4(N)                                                                                                    \
+     case N:                                                                                                             \
++        if constexpr (role_takes<X, N>) {                                                                               \
+         if (ggml_type == 12) r4_q45k_kernel<false, N, BPR, X><<<blocks, 4 * WARP, 0, s>>>(weights, x, y, n_out, role);  \
+         else if (ggml_type == 13) r4_q45k_kernel<true, N, BPR, X><<<blocks, 4 * WARP, 0, s>>>(weights, x, y, n_out, role); \
+         else if (ggml_type == 14)                                                                                       \
+             r4_q6k_kernel<N, BPR, X><<<blocks, 4 * WARP, 0, s>>>(static_cast<const Q6KBlock*>(weights), x, y, n_out, role); \
+         else r4_iq4xs_kernel<N, BPR, X><<<blocks, 4 * WARP, 0, s>>>(static_cast<const IQ4XSBlock*>(weights), x, y, n_out, \
+                                                                    role);                                               \
++        }                                                                                                               \
+         break;
+     switch (ncols) { STRATA_R4(1) STRATA_R4(2) STRATA_R4(3) STRATA_R4(4) STRATA_R4(5) STRATA_R4(6) }
+ #undef STRATA_R4
+@@ -3216,13 +3246,17 @@ bool r4_mmvq(int ggml_type, const void* weights, const void* x_q8_1, float* y, i
+     const auto* x = static_cast<const Q81Block*>(x_q8_1);
+     if (ggml_type == 21) {
+         if constexpr (std::is_same_v<X, NoRole>) return iq3s_r4_mmvq(weights, x_q8_1, y, n_in, n_out, ncols, blocks, s);
+-        else return iq3s_r4_mmvq(weights, x_q8_1, y, n_in, n_out, ncols, blocks, s, role.a);
++        else if constexpr (std::is_same_v<X, ConvAbRole>) return iq3s_r4_mmvq(weights, x_q8_1, y, n_in, n_out, ncols, blocks, s, role.a);
++        else return false;   // no IQ3_S kernel carries a KvRole
+     }
+     if (ggml_type == 14 && n_in == 6144 && ncols <= 5) {   // the value-width Q6_K: two rows a wave
+         const unsigned b2 = grid(unsigned((n_out + 7) / 8));
+         const auto* w = static_cast<const Q6KBlock*>(weights);
+         switch (ncols) {
+-#define STRATA_R2(N) case N: r2_q6k_kernel<N, 24, X><<<b2 + role.blocks, 4 * WARP, 0, s>>>(w, x, y, n_out, role); break;
++#define STRATA_R2(N)                                                                                                    \
++    case N:                                                                                                             \
++        if constexpr (role_takes<X, N>) r2_q6k_kernel<N, 24, X><<<b2 + role.blocks, 4 * WARP, 0, s>>>(w, x, y, n_out, role); \
++        break;
+             STRATA_R2(3) STRATA_R2(4) STRATA_R2(5)
+ #undef STRATA_R2
+         }
+@@ -4463,6 +4497,44 @@ std::size_t native_mmvq_weight_bytes(int ggml_type, int n_in, int n_out) {
+     return row_bytes * std::size_t(n_out);
+ }
+ 
++#if defined(__HIPCC__)
++template <class GK, class GV>
++bool kv_role_mmvq(int q_type, const void* wq, float* yq, int n_q, KvMat k, KvMat v, const void* x_q8_1, int n_kv,
++                  int n_in, int ncols, void* stream) {
++    const auto* x = static_cast<const Q81Block*>(x_q8_1);
++    const int b = k.blocks + v.blocks;
++    switch (ncols) {
++    case 2: return g11_mmvq(q_type, wq, x_q8_1, yq, n_in, n_q, 2, stream, KvRole<2, GK, GV>{k, v, x, n_kv, b});
++    case 3: return g11_mmvq(q_type, wq, x_q8_1, yq, n_in, n_q, 3, stream, KvRole<3, GK, GV>{k, v, x, n_kv, b});
++    case 4: return g11_mmvq(q_type, wq, x_q8_1, yq, n_in, n_q, 4, stream, KvRole<4, GK, GV>{k, v, x, n_kv, b});
++    }
++    return false;
++}
++#endif
++bool native_mmvq_kv_role(int q_type, const void* wq, float* yq, int n_q, int k_type, const void* wk, float* yk,
++                         int v_type, const void* wv, float* yv, int n_kv, const void* x_q8_1, int n_in, int ncols,
++                         void* stream) {
++#if defined(__HIPCC__)
++    // k and v must be calls native_mmvq gives to g11_shape (2560 inputs, below r4's 2048 rows); the light g11 types only
++    // (Q4_K / Q5_K bodies would cost q's kernel waves)
++    if (ncols < 2 || ncols > 4 || n_in != 2560 || n_kv >= 2048 || !g11_on() || !g11_device() || !wk || !wv || !yk || !yv)
++        return false;
++    if (q_type == 14 && ncols == 4) return false;   // r4_q6k<4>: 120 -> 122+ VGPRs, 12 -> 10 waves a SIMD
++    const int kb = int(g11_blocks(n_kv, ncols));
++    const KvMat k{wk, yk, kb}, v{wv, yv, kb};
++    const auto go = [&](auto gk, auto gv) {
++        return kv_role_mmvq<decltype(gk), decltype(gv)>(q_type, wq, yq, n_q, k, v, x_q8_1, n_kv, n_in, ncols, stream);
++    };
++    if (k_type == 14 && v_type == 14) return go(G11Q6K{}, G11Q6K{});
++    if (k_type == 14 && v_type == 23) return go(G11Q6K{}, G11IQ4XS{});
++    if (k_type == 23 && v_type == 14) return go(G11IQ4XS{}, G11Q6K{});
++    if (k_type == 23 && v_type == 23) return go(G11IQ4XS{}, G11IQ4XS{});
++    return false;
++#else
++    return false;
++#endif
++}
++
+ bool native_mmvq_conv_ab(int ggml_type, const void* weights, const void* x_q8_1, float* y, int n_in, int n_out, int ncols,
+                          const GdnConvAbArgs& ab, void* stream) {
+ #if defined(__HIPCC__)
+diff --git a/src/kernels/mmvq_g11_parity.cpp b/src/kernels/mmvq_g11_parity.cpp
+index 75066fe75..c079a9184 100644
+--- a/src/kernels/mmvq_g11_parity.cpp
++++ b/src/kernels/mmvq_g11_parity.cpp
+@@ -140,7 +140,36 @@ struct ConvAb {
+     }
+ };
+ ConvAb g_cab;
+-int g_role_runs = 0;
++int g_role_runs = 0, g_kv_runs = 0;
++// STRATA_QSA_KV_ROLE: 512-row k / v weights of each g11 type (random bytes, sane scales), outputs for the role call
++struct KvW {
++    int type;
++    void* w;
++};
++std::vector<KvW> g_kv;
++float *g_ky = nullptr, *g_vy = nullptr, *g_kref = nullptr, *g_vref = nullptr;
++bool kv_init(std::mt19937& rng) {
++    const int types[4][3] = {{23, 136, 0}, {12, 144, 0}, {13, 176, 0}, {14, 210, 208}};   // type, block bytes, scale at
++    for (const auto& t : types) {
++        const std::size_t nb = 512u * 10u, bytes = nb * (std::size_t) t[1];
++        std::vector<uint8_t> w(bytes);
++        for (auto& b : w) b = (uint8_t) (rng() & 0xff);
++        for (std::size_t k = 0; k < nb; ++k) {
++            const uint16_t h = sane_half(rng);
++            std::memcpy(&w[k * (std::size_t) t[1] + (std::size_t) t[2]], &h, 2);
++            if (t[0] == 12 || t[0] == 13) {
++                const uint16_t h2 = sane_half(rng);
++                std::memcpy(&w[k * (std::size_t) t[1] + 2], &h2, 2);
++            }
++        }
++        void* d = nullptr;
++        if (!ck(cudaMalloc(&d, bytes), "malloc kv") || !ck(cudaMemcpy(d, w.data(), bytes, cudaMemcpyHostToDevice), "copy kv")) return false;
++        g_kv.push_back({t[0], d});
++    }
++    for (float** p : {&g_ky, &g_vy, &g_kref, &g_vref})
++        if (!ck(cudaMalloc(p, 4u * 512u * 4u), "malloc kvy")) return false;
++    return true;
++}
+ 
+ int run_case(const Case& c, bool bench, cudaStream_t s) {
+     const std::size_t wbytes = native_mmvq_weight_bytes(c.type, c.n_in, c.n_out);
+@@ -200,6 +229,36 @@ int run_case(const Case& c, bool bench, cudaStream_t s) {
+                 std::printf("FAIL %-24s T=%d grid=%d: %lld bits differ, %lld non-finite of %zu\n", c.name, T, grid, diff,
+                             nonfinite, a.size());
+             }
++            // the same GEMV with k and v GEMVs in front (k, v of every type pair, 512 rows)
++            if (c.n_in == 2560 && c.n_out >= 2048 && c.n_out < 65536 && T <= 4) {
++                for (const KvW& kw : g_kv)
++                    for (const KvW& vw : g_kv) {
++                        native_mmvq(kw.type, kw.w, xq, g_kref, 2560, 512, T, s);
++                        native_mmvq(vw.type, vw.w, xq, g_vref, 2560, 512, T, s);
++                        cudaMemsetAsync(yg, 0xff, ybytes, s);
++                        cudaMemsetAsync(g_ky, 0xff, 4u * 512u * 4u, s);
++                        cudaMemsetAsync(g_vy, 0xff, 4u * 512u * 4u, s);
++                        const bool took = native_mmvq_kv_role(c.type, dw[0], yg, c.n_out, kw.type, kw.w, g_ky, vw.type, vw.w,
++                                                              g_vy, 512, xq, c.n_in, T, s);
++                        ck(cudaStreamSynchronize(s), "kv role");
++                        if (!took) continue;
++                        ++g_kv_runs;
++                        ck(cudaMemcpy(b.data(), yg, ybytes, cudaMemcpyDeviceToHost), "read kv q");
++                        long long qd = 0, kd = 0;
++                        for (std::size_t i = 0; i < a.size(); ++i) qd += a[i] != b[i];
++                        std::vector<uint32_t> r1((std::size_t) T * 512), r2(r1.size());
++                        for (int m = 0; m < 2; ++m) {
++                            cudaMemcpy(r1.data(), m ? g_vref : g_kref, r1.size() * 4, cudaMemcpyDeviceToHost);
++                            cudaMemcpy(r2.data(), m ? g_vy : g_ky, r2.size() * 4, cudaMemcpyDeviceToHost);
++                            for (std::size_t i = 0; i < r1.size(); ++i) kd += r1[i] != r2[i];
++                        }
++                        if (qd != 0 || kd != 0) {
++                            ++bad;
++                            std::printf("FAIL %-24s T=%d grid=%d kv role (k %d, v %d): q %lld, k/v %lld bits differ\n", c.name,
++                                        T, grid, kw.type, vw.type, qd, kd);
++                        }
++                    }
++            }
+             // the same GEMV with the conv/ab blocks in front (T <= 4 is where the engine fuses them; 5-6 must work too)
+             if (c.n_in == 2560) {
+                 for (int k = 0; k < 2; ++k)
+@@ -254,11 +313,11 @@ int main(int argc, char** argv) {
+     const char* only = std::getenv("MMVQ_G11_ONLY");   // only the cases whose name contains this
+     setenv("STRATA_GDN_AB_ILP", "1", 0);   // the conv/ab kernel the role fuses
+     std::mt19937 crng(5u);
+-    if (!g_cab.init(crng)) return 1;
++    if (!g_cab.init(crng) || !kv_init(crng)) return 1;
+     int bad = 0;
+     for (const Case& c : CASES)
+         if (only == nullptr || std::strstr(c.name, only) != nullptr) bad += run_case(c, bench, s);
+-    std::printf("conv_ab role runs: %d\n", g_role_runs);
++    std::printf("conv_ab role runs: %d, kv role runs: %d\n", g_role_runs, g_kv_runs);
+     std::printf("%s\n", bad ? "mmvq_g11_parity: FAIL" : "mmvq_g11_parity: OK (every case, T 1-6, four grids, bitwise)");
+     return bad ? 1 : 0;
+ }

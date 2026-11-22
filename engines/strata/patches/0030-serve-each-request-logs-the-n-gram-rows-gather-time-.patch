@@ -1,0 +1,34 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: blackhat-7 <44942105+blackhat-7@users.noreply.github.com>
+Date: Tue, 17 Nov 2026 07:12:25 +0530
+Subject: [PATCH 30/33] serve: each request logs the n-gram rows' gather time
+ (the verifier's host ms) and windows, to see cold-row stalls in real use
+
+---
+ src/program/generate.cpp | 6 ++++++
+ 1 file changed, 6 insertions(+)
+
+diff --git a/src/program/generate.cpp b/src/program/generate.cpp
+index dc7d4598c..2c6831f03 100644
+--- a/src/program/generate.cpp
++++ b/src/program/generate.cpp
+@@ -14199,6 +14199,7 @@ int main(int argc, char** argv) {
+             // ms_begin/ms_wait are cumulative since boot; the log line used to print them next to per-request deltas,
+             // so the host time read as if it belonged to this request.  Take deltas here like every other column.
+             std::array<double, 3> begin_before{}, wait_before{};
++            const double ngram_host_before = ver.ms_host;   // the verifier's host time: the n-gram rows' gather
+             for (int r = 0; r < 3; ++r) if (o.expert_cache_remote[(size_t) r] > 0)
+             {
+                 remote_before[(size_t) r] = remote_experts[(size_t) r].computed();
+@@ -17801,6 +17802,11 @@ int main(int argc, char** argv) {
+                                      "of %lld windows\n", (long long) t2_rej[0], (long long) t2_hit[0], (long long) t2_rej[1],
+                              (long long) t2_hit[1], (long long) t2_rej[2], (long long) t2_hit[2], (long long) t2_rej[3],
+                              (long long) t2_hit[3], (long long) dec_windows);
++            // the n-gram (PLE) rows a window gathers on the host thread: cold rows read from the SSD stall the window
++            if (dec_windows > 0)
++                std::fprintf(stderr, "strata serve: n-gram rows: %.0f ms gathering in %lld windows in this request (%.2f ms a window)\n",
++                             ver.ms_host - ngram_host_before, (long long) dec_windows,
++                             (ver.ms_host - ngram_host_before) / (double) dec_windows);
+             for (int r = 0; r < 3; ++r) if (o.expert_cache_remote[(size_t) r] > 0)
+                 std::fprintf(stderr, "strata serve: CUDA%d: %lld expert entries, %lld active layer launches, %.1f MiB returned "
+                                      "(%.1f MiB with full rows) in this request; host %.0f ms staging+launching, %.0f ms "

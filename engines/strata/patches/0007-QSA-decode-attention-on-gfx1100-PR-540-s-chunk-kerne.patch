@@ -1,0 +1,88 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: blackhat-7 <44942105+blackhat-7@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 05:18:51 +0530
+Subject: [PATCH 07/33] QSA decode attention on gfx1100: PR #540's chunk kernel
+ and the bounded merge by default
+
+Port of opt7/integrate e755353d onto v0.2.9's design: pre75_attn() takes gfx1100 too (v0.2.9 runs PR #540's kernel
+by default on gfx103x only, STRATA_ATTN_PRE75=1 elsewhere), and attn_merge_v2() defaults to v0.2.9's
+attn_merge_v2_kernel on gfx1100 - the merge bounded by the width with batched loads, the same idea as our r7
+STRATA_ATTN_MERGE_LIVE, which is therefore not ported. Both bitwise the default kernels (STRATA_ATTN_PRE75=0,
+STRATA_ATTN_MERGE_V2=0 turn them off).
+Measured on 0.1.43 (r7): a 4-token window's attention 0.59 -> 0.37 ms, code +3.4% (ABBA).
+---
+ src/kernels/cuda/qsa_decode_attn.cu | 31 ++++++++++++++++++++++-------
+ 1 file changed, 24 insertions(+), 7 deletions(-)
+
+diff --git a/src/kernels/cuda/qsa_decode_attn.cu b/src/kernels/cuda/qsa_decode_attn.cu
+index fbbef636e..c74d14352 100644
+--- a/src/kernels/cuda/qsa_decode_attn.cu
++++ b/src/kernels/cuda/qsa_decode_attn.cu
+@@ -1,13 +1,12 @@
+ // src/kernels/cuda/qsa_decode_attn.cu - see include/strata/kernels/qsa_decode_attn.hpp.
+ #include "strata/kernels/qsa_decode_attn.hpp"
++#include "strata/kernels/gfx_arch.hpp"
+ #include "strata/core/sm75_series.hpp"
+ #include "strata/core/sm120_series.hpp"
+ #include "strata/core/geometry.hpp"
+ #include "strata/kernels/kv_q8.hpp"
+ #include "strata/kernels/kv_q4.hpp"
+-#if defined(STRATA_HIP_GFX906)
+-#include "strata/kernels/gfx_arch.hpp"
+-#endif
++
+ 
+ #include <cuda_fp16.h>
+ #include <cuda_runtime.h>
+@@ -861,7 +860,8 @@ bool query_swizzle_gfx906_device() {
+ 
+ #if defined(STRATA_ATTN_PRE75_BUILT)
+ // CUDA: the current device is below sm_75 (experimental build) or STRATA_ATTN_DAILY=1 (any card); HIP: it is gfx103x
+-// (per device: a layer split can mix cards).
++// or gfx1100 (per device: a layer split can mix cards).  gfx1100 (7900 XTX, Flash-Next, r7): a 4-token window's
++// attention 0.59 -> 0.37 ms with the bounded merge below, code +3.4% (ABBA), the same bits.
+ // STRATA_ATTN_PRE75=0 turns PR #540's kernel off (A/B); on HIP =1 also runs it on another wave32 card.
+ bool pre75_attn() {
+     static const int env = [] {
+@@ -882,7 +882,8 @@ bool pre75_attn() {
+     if (cc[dev] == 0) {   // 2: gfx103x, 1: another card
+         hipDeviceProp_t prop{};
+         if (hipGetDeviceProperties(&prop, dev) != hipSuccess) { (void) hipGetLastError(); return false; }
+-        cc[dev] = std::strncmp(prop.gcnArchName, "gfx103", 6) == 0 ? 2 : 1;
++        cc[dev] = std::strncmp(prop.gcnArchName, "gfx103", 6) == 0 || strata::kernels::gfx_arch_is(prop.gcnArchName, "gfx1100")
++                      ? 2 : 1;
+     }
+     return env == 1 || cc[dev] == 2;
+ #else
+@@ -923,13 +924,29 @@ int attn_kv_mode(const QsaAttnPools& p) {
+ }
+ 
+ // STRATA_ATTN_MERGE_V2: 1 merges with attn_merge_v2_kernel, 0 with attn_merge_kernel.  Unset it follows
+-// STRATA_ATTN_DAILY (the Daily had it on by default on NVIDIA), so upstream's merger stays the default.
++// STRATA_ATTN_DAILY (the Daily had it on by default on NVIDIA), so upstream's merger stays the default, except on
++// gfx1100, where the bounded merge (our r7 STRATA_ATTN_MERGE_LIVE, the same kernel idea) was measured with PR #540's
++// chunk kernel (above).
+ int attn_merge_v2() {
+     static const int env = [] {
+         const char* v = std::getenv("STRATA_ATTN_MERGE_V2");
+         return v != nullptr && *v != '\0' ? (std::atoi(v) != 0 ? 1 : 0) : -1;
+     }();
+-    return env >= 0 ? env : (daily_attn() ? 1 : 0);
++    if (env >= 0) return env;
++#if defined(__HIPCC__)
++    static int per_dev[64];   // 0 unknown, 1 no, 2 yes
++    int dev = 0;
++    if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) { (void) cudaGetLastError(); return 0; }
++    if (per_dev[dev] == 0) {
++        hipDeviceProp_t prop{};
++        per_dev[dev] = hipGetDeviceProperties(&prop, dev) == hipSuccess && strata::kernels::gfx_arch_is(prop.gcnArchName, "gfx1100")
++                           ? 2 : 1;
++        (void) hipGetLastError();
++    }
++    return per_dev[dev] == 2 ? 1 : 0;
++#else
++    return daily_attn() ? 1 : 0;
++#endif
+ }
+ 
+ // the merge of `n_q` queries' partials: v2 = 0 attn_merge_kernel, 1 attn_merge_v2_kernel (bitwise the same output)

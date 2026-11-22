@@ -1,0 +1,364 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: blackhat-7 <44942105+blackhat-7@users.noreply.github.com>
+Date: Mon, 2 Nov 2026 04:25:26 +0530
+Subject: [PATCH 22/33] STRATA_WAIT_PF: a layer's waits read the next layer's
+ dense weights into the Infinity Cache (opt-in)
+
+Wait B (the PCIe share in staging) gets STRATA_WAIT_PF_BLOCKS (32) more blocks of 256 threads, and the combine's wait
+for the CPU rows (STRATA_COMBINE_MAPPED) twice as many of 128.  While the waiting thread spins, they read the next
+layer's ~66 MB of dense weights (hyper-connection reads first, the shared expert last); the waiting thread bumps a
+device word when its flag is up and they stop within one chunk.  The next layer's reads then hit the 96 MB cache.
+Nothing computed changes.  Measured on the installed run config (sd0, same windows, paired median a window): code
+-0.60 ms (+3.0%), prose -1.11 ms (+5.2%), edit -1.51 ms (+5.5%); windows bit-identical to stock v0.2.9.
+---
+ include/strata/core/verify.hpp            |  4 ++
+ include/strata/kernels/native_moe.hpp     |  3 +-
+ include/strata/kernels/verify_kernels.hpp | 14 +++++
+ src/core/verify.cpp                       | 65 ++++++++++++++++++++++-
+ src/kernels/cuda/native_moe.cu            | 29 ++++++++--
+ src/kernels/cuda/verify_kernels.cu        | 19 +++++++
+ src/kernels/cuda/wait_prefetch.cuh        | 48 +++++++++++++++++
+ 7 files changed, 176 insertions(+), 6 deletions(-)
+ create mode 100644 src/kernels/cuda/wait_prefetch.cuh
+
+diff --git a/include/strata/core/verify.hpp b/include/strata/core/verify.hpp
+index eab87ef5f..9fea77154 100644
+--- a/include/strata/core/verify.hpp
++++ b/include/strata/core/verify.hpp
+@@ -39,6 +39,8 @@
+ #include <string>
+ #include <vector>
+ 
++namespace strata::kernels { struct WaitPrefetch; }
++
+ namespace strata::core {
+ 
+ /// 0.1.43 (STRATA_ADAPT_OVERLAP): the adaptive tier's copies still landing while a decode window runs.  The window's
+@@ -534,6 +536,8 @@ private:
+     uint32_t* skip_ = nullptr;            ///< E-6: per group, the ring whose plan the device built (0: the host's)
+     unsigned* qcnt_ = nullptr;             ///< S26 STRATA_QFUSE: the HC read's q8_1 group counters (n_embd / 32)
+     unsigned* tail_ticket_ = nullptr;      ///< STRATA_ROUTER_TAIL: its launches' ticket (each leaves it zero)
++    strata::kernels::WaitPrefetch* pf_tab_ = nullptr;   ///< STRATA_WAIT_PF: per layer [lb_, le_), the next layer's weights
++    int pf_blocks_ = 0;
+     unsigned long long* slot_off_d_ = nullptr;   ///< E-6: the slot offsets on the device
+     int64_t lb_ = 0, le_ = -1;           ///< set_stage: the layers this verifier runs (-1: to the last)
+     int handoff_rows_ = 0;               ///< set_handoff_rows (0: kVerifyNarrowT)
+diff --git a/include/strata/kernels/native_moe.hpp b/include/strata/kernels/native_moe.hpp
+index e950ebacb..241d3f719 100644
+--- a/include/strata/kernels/native_moe.hpp
++++ b/include/strata/kernels/native_moe.hpp
+@@ -2,6 +2,7 @@
+ #include <cstdint>
+ 
+ namespace strata::kernels {
++struct WaitPrefetch;   // verify_kernels.hpp
+ // Configure before constructing/capturing sessions. Existing captures keep their
+ // selected kernels; changing this flag does not rewrite an existing graph.
+ void native_moe_combine_set_enabled(bool enabled);
+@@ -31,7 +32,7 @@ void native_moe_combine_multi_hits_added(const float* parts, const float* hits,
+ void native_moe_combine_multi_hits_x(const float* parts, const float* hits, const int32_t* dst, const int32_t* count,
+                                      const float* weights, const float* shared, const float* shared_gate, float* output,
+                                      int64_t n_embd, int64_t k, int n_tok, const uint32_t* flag, uint32_t value,
+-                                     void* stream);
++                                     void* stream, WaitPrefetch* pf = nullptr, int pf_blocks = 0);
+ void native_moe_combine_multi(const float* parts, const float* weights, const float* shared, float* output,
+                               int64_t n_embd, int64_t k, int n_tok, void* stream);
+ /// STRATA_VERIFY_RESIDENT: the same, reading every part as `0.0f + hit[i]` - bitwise what a zeroed part row plus
+diff --git a/include/strata/kernels/verify_kernels.hpp b/include/strata/kernels/verify_kernels.hpp
+index 921e99632..1058cb75a 100644
+--- a/include/strata/kernels/verify_kernels.hpp
++++ b/include/strata/kernels/verify_kernels.hpp
+@@ -75,6 +75,20 @@ bool gdn_commit_layers(float* state, int64_t state_stride, int64_t conv_off, con
+ /// Spin until *flag >= value (a mapped host flag).  The value is fixed at capture, so several rings can be
+ /// outstanding at once (the split verify window keeps two).
+ void wait_flag_ge(const uint32_t* flag, uint32_t value, void* stream);
++/// STRATA_WAIT_PF: what a verify layer's GPU waits read into the last-level cache (gfx1100: the 96 MB Infinity Cache)
++/// while the GPU has nothing else to do - the next layer's dense weights, so its reads hit the cache instead of DRAM.
++/// One per layer, in device memory.  Values are read and dropped; no computed value changes.
++struct WaitPrefetch {
++    static constexpr int kMax = 32;
++    int n = 0;                       ///< ranges
++    uint32_t gen = 0;                ///< bumped by the waiting thread as its wait ends: the prefetch blocks stop
++    uint32_t sink = 0;               ///< keeps the loads (written only if the dropped values hash to a magic number)
++    uint32_t pad = 0;
++    const void* p[kMax] = {};        ///< 16-byte aligned
++    uint64_t n16[kMax] = {};         ///< 16-byte words
++};
++/// wait_flag_ge plus `blocks` blocks that read `pf`'s ranges until the wait ends (at most one chunk after it).
++void wait_flag_ge_prefetch(const uint32_t* flag, uint32_t value, WaitPrefetch* pf, int blocks, void* stream);
+ /// wait_flag_ge and copy_i32_from_mapped in ONE launch (143-amdk): thread 0 spins on *flag >= value, the block then
+ /// copies dst[0, n) = src[0, n) (mapped host memory, volatile reads).  One kernel node fewer per layer: a dependent
+ /// kernel costs ~2.4 us on a gfx1201 graph whatever it does.  n <= 128 * k for any k (a strided loop).
+diff --git a/src/core/verify.cpp b/src/core/verify.cpp
+index 5b9ec9b40..6514b32d1 100644
+--- a/src/core/verify.cpp
++++ b/src/core/verify.cpp
+@@ -307,6 +307,19 @@ bool sh_gate_tail_on() { static const bool on = env_on("STRATA_SH_GATE_TAIL"); r
+ // STRATA_COMBINE_MAPPED=1: the CPU rows' wait and copy (copy_rows_from_mapped_after) folded into the combine, which reads
+ // them from the mapped rows - one launch fewer a layer, after the CPU's rows, so on every layer's critical path
+ bool combine_mapped_on() { static const bool on = env_on("STRATA_COMBINE_MAPPED"); return on; }
++// STRATA_WAIT_PF=1: a layer's waits for the PCIe share (wait B) and the CPU rows (the combine's wait) read the next
++// layer's dense weights into the last-level cache while the GPU idles (gfx1100: 96 MB Infinity Cache, a layer's ~65 MB
++// fits), so that layer's reads come from the cache.  STRATA_WAIT_PF_BLOCKS (32) blocks of 256 threads; the combine
++// adds twice as many of its 128.  Returns 0 when off.
++int wait_pf_blocks() {
++    static const int n = [] {
++        if (!env_on("STRATA_WAIT_PF")) return 0;
++        const char* v = std::getenv("STRATA_WAIT_PF_BLOCKS");
++        const int b = v != nullptr ? std::atoi(v) : 32;
++        return b > 0 && b <= 512 ? b : 32;
++    }();
++    return n;
++}
+ // STRATA_QSA_GATE_Q8=1: a QSA layer's output gate writes the out-projection's q8_1 image itself (one launch fewer)
+ bool qsa_gate_q8_on() { static const bool on = env_on("STRATA_QSA_GATE_Q8"); return on; }
+ // STRATA_T1_FUSE=1: a one-token window takes the router tail and the folded combine too (their rows are the per-token
+@@ -737,6 +750,7 @@ Verifier::~Verifier() {
+     if (h_commitd_) cudaFreeHost(h_commitd_);
+     if (qcnt_) cudaFree(qcnt_);
+     if (tail_ticket_) cudaFree(tail_ticket_);
++    if (pf_tab_) cudaFree(pf_tab_);
+     if (d_spec_) cudaFree(d_spec_);
+     if (tap_file_) std::fclose(tap_file_);
+     if (tap_dev_) cudaFree(tap_dev_);
+@@ -1228,6 +1242,51 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
+         }
+         if (!ok2) { cudaGetLastError(); all_resident_ = false; device_plan_ = false; }
+     }
++    if (wait_pf_blocks() > 0 && le_ - lb_ >= 2 && !all_resident_ && !device_plan_) {
++        // layer l's waits read layer l + 1's dense weights, the most time saved per byte first (r10-icache, T4: the
++        // hyper-connection reads, then the router, gate and out projections; qkv / q least), the shared expert last.
++        // `native`: the kernels read the GGUF form (native_data), else the arena's (`data`).
++        struct Name { const char* s; bool native; };
++        static const Name kNames[] = {
++            {"hc_attn_down.weight", false}, {"hc_attn_up.weight", false}, {"hc_attn_inject.weight", false},
++            {"hc_attn_norm.weight", false}, {"hc_ffn_down.weight", false}, {"hc_ffn_up.weight", false},
++            {"hc_ffn_inject.weight", false}, {"hc_ffn_norm.weight", false}, {"ffn_gate_inp.weight", false},
++            {"attn_gate.weight", true}, {"ssm_out.weight", true}, {"attn_output.weight", true},
++            {"ssm_alpha.weight", false}, {"ssm_beta.weight", false}, {"ssm_conv1d.weight", false},
++            {"attn_k.weight", true}, {"attn_v.weight", true}, {"indexer.k_proj.weight", false},
++            {"indexer.q_proj.weight", false}, {"attn_qkv.weight", true}, {"attn_q.weight", true},
++            {"ffn_gate_inp_shexp.weight", false}, {"ffn_gate_shexp.weight", true}, {"ffn_up_shexp.weight", true},
++            {"ffn_down_shexp.weight", true}};
++        std::vector<strata::kernels::WaitPrefetch> tab((size_t) (le_ - lb_));
++        uint64_t total = 0;
++        for (int64_t l = lb_; l + 1 < le_; ++l) {
++            const LayerView v(wt, l + 1);
++            auto& e = tab[(size_t) (l - lb_)];
++            for (const Name& nm : kNames) {
++                const WeightRef* w = v.get(nm.s);
++                if (w == nullptr || e.n == strata::kernels::WaitPrefetch::kMax) continue;
++                const void* ptr = nm.native ? w->native_data : w->data;
++                const uint64_t bytes = !nm.native ? w->bytes
++                    : (uint64_t) strata::kernels::native_mmvq_weight_bytes(w->native_type, (int) w->ne0, (int) w->ne1);
++                if (ptr == nullptr || ((uintptr_t) ptr & 15u) != 0 || bytes < 16) continue;
++                e.p[e.n] = ptr;
++                e.n16[e.n] = bytes / 16;
++                ++e.n;
++                total += bytes / 16 * 16;
++            }
++        }
++        const size_t tb = tab.size() * sizeof(strata::kernels::WaitPrefetch);
++        if (cudaMalloc((void**) &pf_tab_, tb) != cudaSuccess ||
++            cudaMemcpy(pf_tab_, tab.data(), tb, cudaMemcpyHostToDevice) != cudaSuccess) {
++            cudaGetLastError();
++            if (pf_tab_) cudaFree(pf_tab_);
++            pf_tab_ = nullptr;
++        } else {
++            pf_blocks_ = wait_pf_blocks();
++            std::fprintf(stderr, "strata verify: STRATA_WAIT_PF: the waits read the next layer's %.1f MiB (mean), %d blocks\n",
++                         (double) total / 1048576.0 / (double) (le_ - lb_ - 1), pf_blocks_);
++        }
++    }
+     std::fprintf(stderr, "strata verify: window up to %d tokens, %.1f MiB of device buffers%s\n", max_t,
+                  (double) count.used / 1048576.0,
+                  all_resident_ ? " (100% VRAM resident: zero-doorbell graph)" : "");
+@@ -2408,6 +2467,8 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
+             if (device_plan_) wait_flag_ge_or(m_flagB_, ring, skip_ + grp, cs);
+             else if (m_bal_ != nullptr)   // set_pcie_balance: the PCIe part starts
+                 wait_flag_ge_stamped(m_flagB_, ring, m_bal_ + ((l - lb_) * 2 + grp) * 4 + 1, nullptr, cs);
++            else if (pf_tab_ != nullptr && l + 1 < le_)   // STRATA_WAIT_PF
++                wait_flag_ge_prefetch(m_flagB_, ring, pf_tab_ + (l - lb_), pf_blocks_, cs);
+             else wait_flag_ge(m_flagB_, ring, cs);                 // the PCIe share is in staging (DMA) or mapped
+             if (sink_.pcie_mode == 2) {                            // stage it with a copy kernel, then point at staging
+                 const int64_t per = G == 2 ? kStagingBlobs / 2 : kStagingBlobs;
+@@ -2467,7 +2528,9 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
+                     native_moe_combine_multi_hits_x(rows_in_combine ? m_ymiss_ + (size_t) tb * K * N : parts_ + (size_t) tb * K * N,
+                                                     hit_out, p_dst, p_counts + 1, w_ + tb * K, shared_ + tb * N,
+                                                     sg_tail_[grp] ? sh_g_ + tb : nullptr, bo_ + tb * N, N, K, n,
+-                                                    rows_in_combine ? m_flag_ : nullptr, ring, cs);
++                                                    rows_in_combine ? m_flag_ : nullptr, ring, cs,
++                                                    rows_in_combine && pf_tab_ != nullptr && l + 1 < le_ ? pf_tab_ + (l - lb_) : nullptr,
++                                                    2 * pf_blocks_);
+                 else
+                 native_moe_combine_multi_hits_added(parts_ + (size_t) tb * K * N, hit_out, p_dst, p_counts + 1, w_ + tb * K,
+                                                     shared_ + tb * N, bo_ + tb * N, N, K, n, cs);
+diff --git a/src/kernels/cuda/native_moe.cu b/src/kernels/cuda/native_moe.cu
+index cf3b62191..2f712d931 100644
+--- a/src/kernels/cuda/native_moe.cu
++++ b/src/kernels/cuda/native_moe.cu
+@@ -23,6 +23,7 @@
+ #include "strata/kernels/native_moe.hpp"
+ #include "strata/kernels/verify_kernels.hpp"
+ #include "strata/kernels/dp4a.hpp"
++#include "wait_prefetch.cuh"
+ #include <cuda_runtime.h>
+ #include <atomic>
+ #include <cstddef>
+@@ -146,18 +147,30 @@ __global__ void combine_k10_vec4_hits(const float4* __restrict__ parts4, const f
+ //    wrote, plus the hit, as the unfused kernel adds them)
+ //  GATED (STRATA_SH_GATE_TAIL): shared_expert_multi's sigmoid_scale_rows_vec4_kernel - `shared4` is the unscaled
+ //    shared expert row, scaled here by that kernel's gate expression and its separately rounded product
+-template <bool MAPPED, bool GATED>
++//  PF (STRATA_WAIT_PF, with MAPPED): the blocks past the combine's `nbx` in row 0 read `pf`'s ranges (the next layer's
++//    weights) while the wait lasts; the first block's waiting thread stops them
++template <bool MAPPED, bool GATED, bool PF = false>
+ __global__ void combine_k10_vec4_hits_x(const float4* parts4, const float4* __restrict__ hits4,
+                                         const int32_t* __restrict__ dst, const int32_t* __restrict__ count,
+                                         const float* __restrict__ weights, const float4* __restrict__ shared4,
+                                         const float* __restrict__ sg, float4* __restrict__ output4, int64_t n4,
+-                                        const volatile uint32_t* flag, uint32_t value) {
++                                        const volatile uint32_t* flag, uint32_t value, WaitPrefetch* pf = nullptr,
++                                        unsigned nbx = 0) {
++    if constexpr (PF) {
++        if (blockIdx.x >= nbx) {
++            if (blockIdx.y == 0) wait_prefetch_run(pf, flag, value, (int) (blockIdx.x - nbx), (int) (gridDim.x - nbx));
++            return;
++        }
++    }
+     const int64_t tk = blockIdx.y;
+     __shared__ int hit_mask;
+     if (threadIdx.x == 0) {
+         if constexpr (MAPPED) {
+             while (*flag < value) strata_spin_pause();
+             __threadfence_system();
++            if constexpr (PF) {
++                if (blockIdx.x == 0 && blockIdx.y == 0) wait_prefetch_release(pf);
++            }
+         }
+         hit_mask = 0;
+     }
+@@ -269,7 +282,7 @@ void native_moe_combine_multi_hits_added(const float* parts, const float* hits,
+ void native_moe_combine_multi_hits_x(const float* parts, const float* hits, const int32_t* dst, const int32_t* count,
+                                      const float* weights, const float* shared, const float* shared_gate, float* output,
+                                      int64_t n_embd, int64_t k, int n_tok, const uint32_t* flag, uint32_t value,
+-                                     void* stream) {
++                                     void* stream, WaitPrefetch* pf, int pf_blocks) {
+     if (!stream || !native_moe_combine_hits_supported(parts, shared, output, n_embd, k, n_tok) || ((uintptr_t) hits & 15u) != 0)
+         throw std::invalid_argument("native MoE combine (hits, folded) requires k = 10, aligned spans, 1..8 tokens");
+     const int64_t n4 = n_embd >> 2;
+@@ -280,7 +293,15 @@ void native_moe_combine_multi_hits_x(const float* parts, const float* hits, cons
+     const auto* s4 = reinterpret_cast<const float4*>(shared);
+     auto* o4 = reinterpret_cast<float4*>(output);
+     const auto* f = reinterpret_cast<const volatile uint32_t*>(flag);
+-    if (flag != nullptr && shared_gate != nullptr)
++    if (flag != nullptr && pf != nullptr && pf_blocks > 0) {   // STRATA_WAIT_PF
++        const dim3 gp(grid.x + (unsigned) pf_blocks, grid.y);
++        if (shared_gate != nullptr)
++            combine_k10_vec4_hits_x<true, true, true><<<gp, 128, 0, st>>>(p4, h4, dst, count, weights, s4, shared_gate, o4, n4, f,
++                                                                       value, pf, grid.x);
++        else
++            combine_k10_vec4_hits_x<true, false, true><<<gp, 128, 0, st>>>(p4, h4, dst, count, weights, s4, nullptr, o4, n4, f,
++                                                                        value, pf, grid.x);
++    } else if (flag != nullptr && shared_gate != nullptr)
+         combine_k10_vec4_hits_x<true, true><<<grid, 128, 0, st>>>(p4, h4, dst, count, weights, s4, shared_gate, o4, n4, f, value);
+     else if (flag != nullptr)
+         combine_k10_vec4_hits_x<true, false><<<grid, 128, 0, st>>>(p4, h4, dst, count, weights, s4, nullptr, o4, n4, f, value);
+diff --git a/src/kernels/cuda/verify_kernels.cu b/src/kernels/cuda/verify_kernels.cu
+index dc7afe0ff..db2b4e432 100644
+--- a/src/kernels/cuda/verify_kernels.cu
++++ b/src/kernels/cuda/verify_kernels.cu
+@@ -12,6 +12,7 @@
+ #include "strata/kernels/gfx_arch.hpp"
+ #include "strata/kernels/pdl.hpp"
+ #include "gdn_conv_ab.cuh"
++#include "wait_prefetch.cuh"
+ 
+ #include <cuda_fp16.h>
+ #include <cuda_runtime.h>
+@@ -1311,6 +1312,19 @@ __global__ void wait_flag_ge_kernel(const volatile uint32_t* flag, uint32_t valu
+     __threadfence_system();
+ }
+ 
++// STRATA_WAIT_PF: block 0 is wait_flag_ge_kernel; the others read the next layer's weights until it is done
++__global__ void wait_flag_ge_prefetch_kernel(const volatile uint32_t* flag, uint32_t value, WaitPrefetch* pf) {
++    if (blockIdx.x == 0) {
++        if (threadIdx.x == 0) {
++            while (*flag < value) strata_spin_pause();
++            __threadfence_system();
++            wait_prefetch_release(pf);
++        }
++        return;
++    }
++    wait_prefetch_run(pf, flag, value, (int) blockIdx.x - 1, (int) gridDim.x - 1);
++}
++
+ // the GPU's clock in ns (the same sources as gpu_stamp_kernel)
+ __device__ __forceinline__ unsigned long long strata_now_ns() {
+     unsigned long long t;
+@@ -1659,6 +1673,11 @@ void wait_flag_ge(const uint32_t* flag, uint32_t value, void* stream) {
+     check("wait_flag_ge");
+ }
+ 
++void wait_flag_ge_prefetch(const uint32_t* flag, uint32_t value, WaitPrefetch* pf, int blocks, void* stream) {
++    wait_flag_ge_prefetch_kernel<<<1 + blocks, 256, 0, (cudaStream_t) stream>>>(flag, value, pf);
++    check("wait_flag_ge_prefetch");
++}
++
+ void wait_flag_ge_stamped(const uint32_t* flag, uint32_t value, unsigned long long* t_in, unsigned long long* t_out,
+                           void* stream) {
+     wait_flag_ge_stamped_kernel<<<1, 1, 0, (cudaStream_t) stream>>>(flag, value, t_in, t_out);
+diff --git a/src/kernels/cuda/wait_prefetch.cuh b/src/kernels/cuda/wait_prefetch.cuh
+new file mode 100644
+index 000000000..3469386ce
+--- /dev/null
++++ b/src/kernels/cuda/wait_prefetch.cuh
+@@ -0,0 +1,48 @@
++#pragma once
++// STRATA_WAIT_PF: the prefetch blocks of a GPU wait (WaitPrefetch in verify_kernels.hpp).
++#include "strata/kernels/verify_kernels.hpp"
++
++namespace strata::kernels {
++
++// The waiting thread, once the wait is over (after its fence): the launch's prefetch blocks stop at their next chunk.
++__device__ __forceinline__ void wait_prefetch_release(WaitPrefetch* pf) { atomicAdd(&pf->gen, 1u); }
++
++// One prefetch block (b of nb): reads pf's ranges while the wait lasts.  It reads `gen` before the flag: had the
++// waiting thread bumped `gen` before that read, it had seen the flag up, so this block sees it up too and stops at
++// once; otherwise the bump is still to come and the block sees it within a chunk.  A block never runs past the wait
++// by more than one chunk (blockDim x 8 x 16 bytes).
++__device__ __forceinline__ void wait_prefetch_run(WaitPrefetch* pf, const volatile uint32_t* flag, uint32_t value,
++                                                  int b, int nb) {
++    __shared__ uint32_t s_g0;
++    __shared__ int s_up;
++    const volatile uint32_t* gen = &pf->gen;
++    if (threadIdx.x == 0) {
++        s_g0 = *gen;
++        __threadfence();   // the gen read is done before the flag read
++        s_up = *flag >= value;
++    }
++    __syncthreads();
++    if (s_up) return;
++    const uint32_t g0 = s_g0;
++    constexpr int U = 8;   // 8 independent 16-byte loads in flight per thread
++    const uint64_t bt = blockDim.x;
++    const int n = pf->n;
++    uint32_t acc = 0;
++    for (int k = 0; k < n; ++k) {
++        const uint4* p = (const uint4*) pf->p[k];
++        const uint64_t m = pf->n16[k];
++        for (uint64_t i = (uint64_t) b * bt * U + threadIdx.x; i < m; i += (uint64_t) nb * bt * U) {
++            const uint32_t g = *gen;
++            uint4 v[U];
++#pragma unroll
++            for (int u = 0; u < U; ++u) v[u] = i + u * bt < m ? p[i + u * bt] : make_uint4(0u, 0u, 0u, 0u);
++#pragma unroll
++            for (int u = 0; u < U; ++u) acc ^= v[u].x ^ v[u].y ^ v[u].z ^ v[u].w;
++            if (g != g0) goto done;
++        }
++    }
++done:
++    if (acc == 0x9e3779b9u) pf->sink = acc;
++}
++
++}  // namespace strata::kernels

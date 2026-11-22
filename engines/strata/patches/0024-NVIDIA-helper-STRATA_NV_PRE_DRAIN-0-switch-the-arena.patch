@@ -1,0 +1,37 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: blackhat-7 <44942105+blackhat-7@users.noreply.github.com>
+Date: Mon, 16 Nov 2026 01:34:04 +0530
+Subject: [PATCH 24/33] NVIDIA helper: STRATA_NV_PRE_DRAIN=0 switch; the arena
+ pin check samples each layer's ends
+
+The resident RAM mode's blob() may read a file, so asking for every expert to find the arena's extent could read
+the whole model; an arena is one linear block, so its layer ends and summed sizes agree exactly only then.
+---
+ src/core/remote_experts.cpp | 8 +++++---
+ 1 file changed, 5 insertions(+), 3 deletions(-)
+
+diff --git a/src/core/remote_experts.cpp b/src/core/remote_experts.cpp
+index fdcaebc19..76025dae3 100644
+--- a/src/core/remote_experts.cpp
++++ b/src/core/remote_experts.cpp
+@@ -413,15 +413,17 @@ bool RemoteExperts::open_nv(int slots, int64_t layers, int64_t experts,
+     {   // the arena pinned for this card too, when it is one block, so the adaptive tier's fills are plain DMA
+         uintptr_t lo = UINTPTR_MAX, hi = 0;
+         uint64_t total = 0;
++        // each layer's first and last blob only: in the resident RAM mode blob() may read a file, and an arena is
++        // one linear block, so its ends and the summed sizes agree only then
+         for (int64_t l = 0; l < layers && lo != 0; ++l)
+-            for (int64_t e = 0; e < experts; ++e) {
++            for (const int64_t e : {(int64_t) 0, experts - 1}) {
+                 const uint8_t* b = source.blob(l, e);
+                 if (b == nullptr) { lo = 0; break; }
+                 lo = std::min(lo, (uintptr_t) b);
+                 hi = std::max(hi, (uintptr_t) b + (uintptr_t) lay.blob_bytes(l));
+-                total += lay.blob_bytes(l);
+             }
+-        const bool block = lo != 0 && hi > lo && hi - lo <= total + total / 64;
++        for (int64_t l = 0; l < layers; ++l) total += lay.blob_bytes(l) * (uint64_t) experts;
++        const bool block = lo != 0 && hi > lo && hi - lo == total;
+         const char* why = !block ? "the arena is not one block" : nv->register_host((void*) lo, hi - lo) != 0 ? nv->last_error() : nullptr;
+         std::fprintf(stderr, "strata generate: NVIDIA helper: %s\n",
+                      why ? (std::string("arena not pinned for it (") + why + "); its swaps copy through staging").c_str()

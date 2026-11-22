@@ -1,0 +1,35 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: blackhat-7 <44942105+blackhat-7@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 05:36:54 +0530
+Subject: [PATCH 12/33] docs/AMD_HIP.md: the gfx1100 decode switches of this
+ branch, which are default and which the run config sets
+
+---
+ docs/AMD_HIP.md | 14 ++++++++++++++
+ 1 file changed, 14 insertions(+)
+
+diff --git a/docs/AMD_HIP.md b/docs/AMD_HIP.md
+index 8aba6c965..aad18e077 100644
+--- a/docs/AMD_HIP.md
++++ b/docs/AMD_HIP.md
+@@ -362,6 +362,20 @@ Past about 135K cells (and from about 90K cells on a prompt read) the top-k sele
+ the same ids as the reference radix. On an R9700 a fresh 500K-token prompt reads 34% faster than with the reference kernel
+ (716 -> 962 tok/s; 1,284 tok/s with the exact scorer above).
+ 
++### gfx1100 decode switches of this branch (RX 7900 XTX)
++
++Every one keeps the main model's bits (window hashes and emitted argmaxes equal v0.2.9's on the code / prose / edit
++follow texts with `--suffix-draft 0` and a fixed `--expert-cache`). On by default on gfx1100
++(`STRATA_GFX1100_DEFAULTS=0` turns the table off; a switch you set is kept): `STRATA_ROUTE_DPP`, `STRATA_ROUTER_TAIL`,
++`STRATA_GDN_AB_ILP`, `STRATA_FUSE_CONVAB`, `STRATA_MULTI_BLOCK_ARGMAX`, `STRATA_UMWAIT` (Linux), `STRATA_POOL_GUIDED=32`.
++On by default on gfx1100 in the code, each with its `=0`: the pipelined HC down read and the read in one kernel
++(`STRATA_GR_PIPE`, `STRATA_GR_ONE`), the dense GEMVs (`STRATA_MMVQ_G11`, `STRATA_MMVQ_R4`), the draft kernel diet
++(`STRATA_MTP_FUSE`), PR #540's decode attention with the bounded merge (`STRATA_ATTN_PRE75`, `STRATA_ATTN_MERGE_V2`),
++the v2 prompt attention (`STRATA_PA_V2`, with `STRATA_HIP_WMMA=1`). Opt-in (the run config sets them): the launch cuts
++`STRATA_SH_GATE_TAIL`, `STRATA_COMBINE_MAPPED`, `STRATA_QSA_GATE_Q8`, `STRATA_MAPPED_FAST`, `STRATA_T1_FUSE`,
++`STRATA_QSA_FOLD`, `STRATA_ROUTER_TAIL_ROWS=4`; the draft side `STRATA_MTP_NO_RCOPY`, `STRATA_MTP_MIX_FUSED` (moves
++draft probabilities in their last bits), `STRATA_SPEC_CUM` / `STRATA_SPEC_CUM_ACC` (draft stop), `STRATA_MTP_CTX_ROWS`.
++
+ ## Linux: verify timeouts while the kernel reclaims host memory
+ 
+ A `verify: timed out at layer N` or "no progress for 60 s" message does not by itself mean a kernel bug. Two community
