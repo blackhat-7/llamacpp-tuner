@@ -249,6 +249,8 @@ def test_server_translates_messages_and_forwards_the_rest():
         forwarded = json.loads(
             post(f"{base}/v1/chat/completions", {"model": "m", "messages": []})
         )
+        greedy = {"model": "m", "messages": [], "temperature": 0}
+        forwarded_greedy = json.loads(post(f"{base}/v1/chat/completions", greedy))
     finally:
         server.shutdown()
         loom.shutdown()
@@ -259,7 +261,16 @@ def test_server_translates_messages_and_forwards_the_rest():
     assert reply["content"] == [{"type": "text", "text": "Hi"}]
     assert [e["type"] for e in streamed][-2:] == ["message_delta", "message_stop"]
     assert counted == {"input_tokens": 1}
-    assert forwarded["echo"] == {"model": "m", "messages": []}
+    # Without a temperature Loom decodes greedily, which makes Inkling loop.
+    assert forwarded["echo"] == {"model": "m", "messages": [], "temperature": 1.0}
+    assert forwarded_greedy["echo"] == greedy
+
+
+def test_temperature_defaults_to_one_and_keeps_a_given_value():
+    base = {"model": "m", "messages": [{"role": "user", "content": "hi"}]}
+
+    assert to_openai(base)["temperature"] == 1.0
+    assert to_openai({**base, "temperature": 0})["temperature"] == 0
 
 
 def test_effort_becomes_the_reasoning_level():

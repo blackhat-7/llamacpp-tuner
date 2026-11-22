@@ -2,7 +2,8 @@
 
 Claude Code (claude-local) speaks only /v1/messages, and reads the context window
 from llama.cpp's `meta.n_ctx` in /v1/models. This server translates both and
-forwards every other request (the OpenAI API that Pi and opencode use) as is.
+forwards every other request (the OpenAI API that Pi and opencode use) as is,
+except that a chat request without a temperature gets TEMPERATURE.
 """
 
 import http.client
@@ -13,6 +14,10 @@ from collections.abc import Iterator
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 STOP_REASONS = {"stop": "end_turn", "length": "max_tokens", "tool_calls": "tool_use"}
+# A request without a temperature means 1 in both APIs, and 1 is what Inkling's GGUF
+# recommends. Loom decodes greedily instead, and greedy decoding makes Inkling's
+# thinking repeat the same paragraphs until max_tokens.
+TEMPERATURE = 1.0
 
 
 def _text(content: str | list[dict]) -> str:
@@ -78,7 +83,11 @@ def to_openai(body: dict) -> dict:
             messages.append(_assistant(content))
         else:
             messages.extend(_user(content))
-    request: dict = {"model": body["model"], "messages": messages}
+    request: dict = {
+        "model": body["model"],
+        "messages": messages,
+        "temperature": TEMPERATURE,
+    }
     for name in ("max_tokens", "temperature", "top_p", "top_k"):
         if name in body:
             request[name] = body[name]
@@ -411,8 +420,11 @@ def make_server(host: str, port: int, upstream: str) -> ThreadingHTTPServer:
                 with generating:
                     self._guarded(lambda: self._message(json.loads(raw)))
             elif path == "/v1/chat/completions":
+                request = json.loads(raw)
+                request.setdefault("temperature", TEMPERATURE)
+                sampled = json.dumps(request).encode()
                 with generating:
-                    self._guarded(lambda: self._forward("POST", raw))
+                    self._guarded(lambda: self._forward("POST", sampled))
             else:
                 self._guarded(lambda: self._forward("POST", raw))
 

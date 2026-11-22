@@ -16,6 +16,8 @@ It is the user's one-GPU stack: best quality and context on the XTX alone, with 
 | 195K | 104 (90) | 82 (75) | - | 100 s (138) |
 
 - Round 2 numbers are one session each, 2026-11-22 14:09-14:20; "was" is `kv8w4096` (round 1). 195K recall 3/3.
+- The table is greedy. Clients that send no temperature get 1 from `messages.py` (greedy loops in thinking), and
+  decode is slower at 1: 92 vs 153 t/s on a 66K Claude Code turn.
 - Context 196,608 tokens. A growing chat reuses its cache (a 64K follow-up starts in 2 s, not 22 s).
 - 0.3 GB RAM, 21.6 GB VRAM idle (25.2 GB peak at 195K), idle CPU 0%. Starting it asks `sudo` once only when the
   shell's memory-lock ceiling is below 64 MiB (see "Serving through lct").

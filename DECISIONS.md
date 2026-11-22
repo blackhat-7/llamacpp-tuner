@@ -155,3 +155,7 @@ Configs no longer have to sit inside the checkout. On this PC they are symlinks 
 ## 2026-11-22: Inkling round 2 serves as `kv8-r2`, preset `xtx-r2` (draft depth 3, dynamic spans, prompt chunk 1,024)
 Static depth 3 lost prose at long context (-15% at 64K, -22% at 195K) while winning code and edits, so `dynspan.py` verifies 2 tokens instead of 4 while first drafts keep missing; depth 1 everywhere would give up +20-37% on code and edits.
 Changes that pass kernel tests but have no end-to-end run (reduced draft head, `--sconv`) stay out: one passed its tests and still failed registration.
+
+## 2026-11-22: The Loom translator gives chat requests temperature 1 when the client names none
+Loom decodes greedily without a temperature, and greedy Inkling loops in its thinking: one Claude Code turn repeated six paragraphs 72 times until its 32,000-token cap. Claude Code, Hermes and Pi send none; both APIs and Inkling's GGUF say 1.
+Replayed at 1, that turn ended in 1.3-2.3K tokens (4 of 4 runs). Cost: decode 92 vs 153 t/s on that 66K turn, since fewer drafts match a sampled token. An explicit temperature passes through; the experiments send 0.
