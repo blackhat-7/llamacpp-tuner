@@ -1,0 +1,1 @@
+Write a Python module that implements an LRU cache with a TTL per entry, thread safety, and a decorator for memoizing functions. Include type hints, docstrings, and a set of pytest tests covering expiry, eviction order and concurrent access.

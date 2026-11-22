@@ -1,0 +1,1 @@
+Explain in detail how a modern CPU executes instructions out of order: register renaming, the reorder buffer, reservation stations, branch prediction and speculative execution, and why Spectre was possible. Write it as an essay for a curious engineer.

@@ -1,0 +1,1 @@
+[{"name": "short_t1", "prompt_file": "$LCT_HOME/model-hunt/prompt_inkling_1000.txt", "question": "Ignore the dump above for this task. Write a self-contained C++17 program: an LRU cache class template with get/put/erase and a capacity, plus a main() that tests it with asserts. Output only the code.", "max_tokens": 6, "temperature": 1.0, "repeat": 60}]

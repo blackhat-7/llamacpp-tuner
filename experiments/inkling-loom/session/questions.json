@@ -1,0 +1,5 @@
+{
+ "code": "Ignore the dump above for this task. Write a self-contained C++17 program: an LRU cache class template with get/put/erase and a capacity, plus a main() that tests it with asserts. Output only the code.",
+ "prose": "Ignore the dump above for this task. In plain English, write about 400 words on how the printing press changed Europe. No headings, no lists.",
+ "recall": "Somewhere in the dump above are three comments of the form 'NOTE: the deploy key for project X is Y.' List each project and its key, one per line as 'X: Y'. Output nothing else."
+}
