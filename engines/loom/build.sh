@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Rebuild our Inkling-2-Mini Loom package: the upstream package plus 8-bit KV, attention v2, a drafter window,
 # round 2 (attention, prefill, dense and MoE kernels, dynamic draft spans) and our presets, then the same
-# package with image input (<output>v). See README.md.
+# package with image input (<output>v) and that package with Inkling-2-Mini-Unbound v2's attention (<output>vu).
+# See README.md.
 # Usage: engines/loom/build.sh [--force] [--output DIR]
 set -euo pipefail
 
@@ -14,6 +15,11 @@ window=4096
 mmproj_revision=ea0c79b2ecd73669e774c8519b79bfabfddbc027
 mmproj_f16_sha256=3bff75ffeb2d6e0371ba7bd42e30d26a7d98aea681fa44b03b5a20891cfa2c5f
 mmproj_q8_sha256=313c8ae7ebd3dc1740c6b3eaa5b21857a2182c2e2c3569a41b4f4972169d7525
+# Any v2 size works as the donor: all keep the edited attention at Q8_0. IQ2_M is the smallest download.
+unbound_revision=c61cf03fae7fc06594361a55efbcc730293c0846
+unbound_donor=Inkling-2-Mini-Unbound-v2-IQ2_M.gguf
+unbound_donor_sha256=91d02db308b9a662675c588fc3ae23bfd24465ffa83ab140a3c2780bfa3604a0
+unbound_sha256=7286a4b2ddc2bab543a9a795d823638b5a4ddde6699f5ff1e9ed2adea85c40ae
 
 die() { echo "build.sh: $*" >&2; exit 1; }
 
@@ -23,7 +29,7 @@ while (($#)); do
   case $1 in
     --force) force=1 ;;
     --output) out=${2:?--output needs a directory}; shift ;;
-    -h | --help) sed -n '2,4p' "$0"; exit 0 ;;
+    -h | --help) sed -n '2,6p' "$0"; exit 0 ;;
     *) die "unknown argument: $1" ;;
   esac
   shift
@@ -106,4 +112,24 @@ rm -rf "${out}v.partial"
 trap 'rm -rf "${out}v.partial"' EXIT
 "${py[@]}" "$here/tools/vision/vision.py" "$out" "${out}v.partial" "$mmproj"
 install "${out}v.partial" "${out}v"
+
+# Uncensored (2026-11-22): ${out}vu = ${out}v with Inkling-2-Mini-Unbound v2's 120 attention tensors
+# (tools/unbound.py). Same layout and file name, so the programs run it unchanged.
+unbound_dir=$LCT_HOME/loom/unbound
+unbound=$unbound_dir/Inkling-2-Mini-UD-Q4_K_XL-unbound-v2.gguf
+if [[ ! -f $unbound ]]; then
+  donor=$unbound_dir/$unbound_donor
+  "$venv/bin/hf" download nokeepai/Inkling-2-Mini-Unbound-GGUF "$unbound_donor" --revision "$unbound_revision" \
+    --local-dir "$unbound_dir" >/dev/null
+  echo "$unbound_donor_sha256  $donor" | sha256sum --quiet -c - || die "$donor: unexpected sha256"
+  uv run --python 3.12 --no-project --with gguf==0.19.0 --with numpy==2.5.5 \
+    python -I "$here/tools/unbound.py" "$src/parameter/Inkling-2-Mini-UD-Q4_K_XL.gguf" "$donor" "$unbound.partial"
+  mv "$unbound.partial" "$unbound"
+fi
+echo "$unbound_sha256  $unbound" | sha256sum --quiet -c - || die "$unbound: unexpected sha256"
+rm -rf "${out}vu.partial"
+trap 'rm -rf "${out}vu.partial"' EXIT
+cp -al "${out}v" "${out}vu.partial"
+ln -f "$unbound" "${out}vu.partial/parameter/Inkling-2-Mini-UD-Q4_K_XL.gguf"
+install "${out}vu.partial" "${out}vu"
 trap - EXIT

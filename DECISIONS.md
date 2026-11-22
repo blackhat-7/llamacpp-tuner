@@ -163,3 +163,6 @@ Replayed at 1, that turn ended in 1.3-2.3K tokens (4 of 4 runs). Cost: decode 92
 ## 2026-11-22: Inkling sees images: `kv8-r2v` adds Loom's image component to `kv8-r2`, with a Q8_0 projector
 The text programs stay as they are (round 1/2 tools anchor on them); only `control.loom` (a per-message renderer for image requests) and `g_embed` change, so text output is byte-identical.
 Q8_0 instead of F16 keeps the 196,608 context (F16 needs 0.64 GB, which does not fit at 195K); images are capped at 1,024 tokens to keep the encoder's workspace small.
+
+## 2026-11-22: Inkling-2-Mini-Unbound v2 serves as its own profile `inkling-unbound`, not as the default
+v2 changes only 120 Q8_0 attention tensors, so `tools/unbound.py` copies them into our unsloth file: same layout, no program change. It costs code decode (179 vs 208 t/s, drafter mismatch) and thinks longer (edit task 2/3 vs 3/3 at temperature 1), so `inkling` stays on `kv8-r2v` until the user picks.

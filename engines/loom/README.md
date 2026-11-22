@@ -60,6 +60,14 @@ it leave:
     lct sends one 1-token text request at start: an image as the very first request activates both workspaces
     together, which does not fit.
 
+13. Uncensored, `kv8-r2vu` (`tools/unbound.py`): `kv8-r2v` with the 120 attention tensors (q, k, v, output, gate of
+    all 24 layers) of `nokeepai/Inkling-2-Mini-Unbound` v2 copied in byte for byte from its IQ2_M file (every v2
+    size keeps them at Q8_0, as our file does). Same layout and file name, so the programs run it unchanged.
+    Untouched tensors are byte-equal in both files (norms, and attn_rel checked against v2's Q8_0 by range reads).
+    Profile `inkling-unbound`, stack `local-inkling-unbound`. Short code / prose 179 / 151 t/s vs 208 / 141 (the
+    drafter was trained on the original); quality check 16/18 vs 17/18 (the edit task ran to its 16K cap; at
+    temperature 1, 2 of 3 passed vs 3 of 3, using 6-16K tokens vs 7-9K).
+
 All together, short code / prose / edit 141 / 121 / 133 to 193 / 146 / 176 t/s; 64K code / prose 114 / 104 to
 148 / 108; 195K 90 / 75 to 104 / 82; 195K recall 3/3.
 
