@@ -5,6 +5,9 @@ Each line carries its own done-check. A task too big for one session gets split 
 
 ## Now
 
+- [x] **Reproducible repo.** Engine changes, run configs and profiles move from `tmp/` and unpushed branches into `engines/`, `profiles.toml` and `experiments/`; engines become `llamacpp_tuner/backends/` (`docs/architecture.md`). Done 2026-11-22: Strata rebuilt from v0.2.9 + 33 patches (tree = live source), Loom byte-identical, llama.cpp/ROCr pinned; 150 tests; `embed` restarted through the new code; isolated review's 10 findings fixed. `inkling`'s restart through the new code is left to the session benchmarking the XTX.
+- [ ] **Publish the Strata drafter.** After `uv run hf auth login`: `engines/strata/publish-drafter.sh ~/Documents/projects/Strata-data/mtp/rt-sd2-swift`, then commit the download line it writes into `engines/strata/README.md`. Done when a fresh `hf download` matches the local sha256.
+
 ### Two GPUs: the 4070 as the XTX engine's expert helper (branch `feat/dual-gpu-helper`; engine `opt12/nvhelper`)
 
 - [x] **A CUDA helper for the HIP engine.** Strata's `--expert-cache-device1` on the 4070 through a CUDA plugin. Done 2026-11-16: engine `4a79cf5a`; generate mode code/prose/edit +11/+20/+40% (fixed ranking), +9/+6/+32% adaptive with `--spec 6`; server +5/+1/+21%.
