@@ -30,9 +30,12 @@ Each line carries its own done-check. A task too big for one session gets split 
 ### Inkling-2-Mini on one GPU (Loom; `docs/inkling-loom-research.md`)
 
 - [x] **Inkling-2-Mini on the XTX alone, near 100 t/s with 200K context.** Done 2026-11-22: llama.cpp is op-bound (30-34 t/s); Loom + 8-bit KV + attention kernel v2 + drafter window 4,096 gives 140 / 121 short, 90 / 75 at 195K; stack `local-inkling`, `lct serve --backend loom`, Anthropic API for claude-local (`messages.py`).
-- [ ] **Span-v2 for verification.** `tmp/loom/attn-bench/spa_p4.loom` shares K/V loads across verify tokens (*est.* +8% at 195K). Done when it serves verify spans in `kv8w4096` and 195K code / prose are measured against 90 / 75.
-- [ ] **The drafter's KV as a 4K ring.** It stores the whole context but reads 4K. Done when 262,144 context loads with the drafter and prefix cache on and 195K speed holds.
-- [ ] **Faster prompt reads on Loom.** ~1,420 t/s at 195K (2.3 min). Done when a fresh 195K read is measured faster with identical output.
+- [x] **Round 2: decode and prompt reads to the max.** Done 2026-11-22: five workstreams (attention, dense fusion, MoE, prefill, dynamic draft spans); package `kv8-r2` (`engines/loom/build.sh`), preset `xtx-r2`: short code / prose / edit 141 / 121 / 133 -> 193 / 146 / 176 t/s, 64K 114 / 104 -> 148 / 108, 195K 90 / 75 -> 104 / 82, 64K read 28.8 -> 22.0 s, 195K read 138 -> 100 s, recall 3/3.
+- [ ] **Reduced draft head.** 32K-token draft vocabulary (`experiments/inkling-loom/r2/spec/`): head read 259 -> 42.5 MB a draft step (*est.* +5%). The first build failed registration; the fix is built, not loaded. Done when a package with it registers and short code / prose / edit are measured against `kv8-r2`.
+- [ ] **Faster global flash attention for prompt reads.** ~27 of ~123 TFLOP/s; ~53% of a 187K read. The prefetch variant (`PREFILL_ATTN=pf`) passes its test. Done when a 64K and a 187K read are timed against `kv8-r2` (22.0 / ~95 s) with recall 3/3.
+- [ ] **Dynamic spans over more lengths.** Padding tokens now skip the experts, so odd spans can pay. Done when static step costs at depths 1-7 are measured and `dynspan.py --lengths ...` on a depth-7 preset is compared with `xtx-r2`.
+- [ ] **`--sconv` and span-v2.** `dense_edit.py --sconv` passes its kernel tests; span-v2 (`experiments/inkling-loom/kernels/spa_p4.loom`) predates round 2. Done when each is measured end to end against `kv8-r2`.
+- [ ] **The drafter's KV as a 4K ring.** It stores the whole context but reads 4K. Done when 262,144 context loads with the drafter and prefix cache on and 195K speed holds (the freed ~0.8 GB would also allow a 1,536-2,048 prompt chunk).
 - [ ] **Inkling's quality on our own tasks.** Only reports so far. Done when `tmp/ab-eval` (or forseti) scores it beside the 27B and Flash-Next.
 
 - [x] **Keep-awake on by default.** `lct serve` holds AMD GPUs awake for every profile and stack; `--no-keep-awake` opts out; does nothing without ROCm. Done 2026-11-15: 122 tests; live `ornith-vk` with no flag logged the hold and stayed awake while idle.

@@ -1,23 +1,24 @@
 # Inkling-2-Mini on the 7900 XTX alone
 
-Research of 2026-11-21 and 2026-11-22. Measured on this box unless marked *est.* (arithmetic) or "reported"
+Research of 2026-11-21 and 2026-11-22 (round 2: the afternoon of 2026-11-22). Measured on this box unless marked *est.* (arithmetic) or "reported"
 (Reddit and Hacker News, the first two days after the release). Speeds are decode t/s, greedy, over all generated
 tokens; the model always thinks.
 
 ## Now
 
-Stack `local-inkling` = profile `inkling` (Loom, package `tmp/loom/kv8w4096`, preset `xtx-kv8-196k`) + `embed`.
+Stack `local-inkling` = profile `inkling` (Loom, package `tmp/loom/kv8-r2`, preset `xtx-r2`) + `embed`.
 It is the user's one-GPU stack: best quality and context on the XTX alone, with the 4070 free for the desktop and games.
 
-| depth | code | prose | drafter off |
-|---|---|---|---|
-| short (1.3K) | 140 | 121 | 110 |
-| 64K | 114 | 104 | 93 |
-| 195K | 90 | 75 | 73 |
+| depth | code | prose | edit | fresh prompt read |
+|---|---|---|---|---|
+| short (1.3K) | 193 (was 141) | 146 (121) | 176 (133) | - |
+| 64K | 148 (114) | 108 (104) | - | 22.0 s (28.8) |
+| 195K | 104 (90) | 82 (75) | - | 100 s (138) |
 
-- Context 196,608 tokens. Reading a fresh 195K prompt takes 2.3 min (~1,420 t/s); a growing chat reuses its cache
-  (a 64K follow-up starts in 2 s, not 29 s).
-- 0.3 GB RAM, 24.0 of 24 GB VRAM, idle CPU 0%. Starting it asks `sudo` once (see "Serving through lct").
+- Round 2 numbers are one session each, 2026-11-22 14:09-14:20; "was" is `kv8w4096` (round 1). 195K recall 3/3.
+- Context 196,608 tokens. A growing chat reuses its cache (a 64K follow-up starts in 2 s, not 22 s).
+- 0.3 GB RAM, 21.6 GB VRAM idle (25.2 GB peak at 195K), idle CPU 0%. Starting it asks `sudo` once only when the
+  shell's memory-lock ceiling is below 64 MiB (see "Serving through lct").
 - Quality, reported only (no own eval yet): about Qwen3.8-27B level, below Flash-Next on average. Strengths: prose,
   fewer thinking tokens. Weaknesses: refusals and preaching, failed tool calls (92% vs 97-100% in one 37-question
   eval), giant one-shot bash commands. Thinking loops stop with temp 1.0, top-p 1.0, top-k 0, min-p 0.
@@ -70,9 +71,50 @@ Not integrated: **span-v2**, a verify kernel that shares K/V loads across the 2 
 against the old span kernel; 0.92-0.96 ms vs 1.13 ms a layer for two v2 rows at 195K (*est.* +8% at 195K). It is
 slower than v2 for a single token, so it would serve only verify spans.
 
+### Round 2 (2026-11-22 afternoon): five workstreams
+
+A profile at depth 1 (12.9 ms of device time a verify step) split the work. Five agents each owned one part and
+shared the GPU through a lock; each change is a tool in `engines/loom/tools/` (applied in this order), with its
+kernel tests (a negative control each) in `experiments/inkling-loom/r2/`.
+
+1. **Draft depth and dynamic spans.** Static depth 3 (verify 4 tokens) beat depth 1 at short context for code
+   (+20%) and edits (+12%) but lost prose (-2% short, -15% at 64K, -22% at 195K). A step's cost depends on its
+   verify shape: span 2 ~13.2 ms, spans 3-4 ~17.7 ms (shapes are powers of two), span 5 ~26.2 ms. `dynspan.py`
+   verifies 2 tokens instead of 4 while a moving average of first-draft misses is above 90/256 (shift 3), so prose
+   gets short spans and code long ones. Short average of code/prose/edit jobs: 146.0 vs 138.6 (static d3) vs 130.0
+   (d1). It edits only `control.loom` and `prepare.loom`.
+2. **Attention.** The SWA verify kernel ran at ~215 GB/s (18.6 us a call at span 2, 28.8 at span 4); one new kernel
+   for single tokens and spans loads each key once for the 3 query heads: 8 / 10 / 13 us at spans 1 / 2 / 4. The
+   combine went from 11-22 to 1-6 us; global v2 uses one split per 256 keys (was 8), so short-context calls drop
+   from 55 to 23 us. Alone: short d1 code / prose / edit +9.5 / +5.3 / +8%, d3 code 187.8; 195K step -3.5%.
+   Padding rows of a verify shape exit at once (they were already marked not live).
+3. **Dense layers.** All projections of a layer visit in one launch (46 -> 27.6 us, ~825 GB/s), RMS norm fused
+   with q8 quantization (three norms in one launch: 10.7 -> 3.4 us), the loop controllers and the mixes fused.
+   The program's launch sites drop from 9,122 to 8,465 (with the other tools); output bit-identical; +7-8% on every job.
+4. **MoE.** The expert kernels reach 86-88% of a plain read of the same bytes, and the infinity cache already
+   removes repeated reads across span tokens (consecutive tokens share ~4 of 8 experts), so only small gains: a
+   one-wave router (3.6 -> 2.7 us) and 2-row gate/up (~1%). Padding tokens of a verify shape now skip the experts
+   (span 5 ran as an 8-token shape: MoE went from 5.1 to 9.9 ms); this pays only once odd spans are used.
+5. **Prefill.** `prepare.loom` built drafter proposal stages for up to 1,024 spans although `rows` = 1 lets one span
+   propose; they reserved ~1.5 GiB of workspace, which kept the prompt chunk at 512. Built only up to `rows`, a
+   1,024-token chunk fits at 196K. Split-K global flash attention (4 key ranges a tile) balances the GPU's last
+   round. TTFT 8K / 64K / 187K: 2.57 / 28.75 / 128.0 s -> 2.06 / 22.06 / 94.7 s. Global attention is ~28% of a
+   64K read and ~53% of a 187K one, so a faster attention kernel is the next prefill lever.
+
+Measured, not adopted:
+- **Reduced draft vocabulary** (32,768 most frequent tokens, 99.67% coverage on Inkling's own output): the draft
+  head read drops 259 -> 42.5 MB a draft step (*est.* ~0.85 ms of a d3 step). Its kernel test passes, but the
+  first package failed registration ("stage does not match the token runner bindings": the one-span proposal stage
+  bound different parameter roots than the others). A fix is built, not yet loaded.
+- `--sconv` (fused short-conv kernels): kernel tests pass, registers; no end-to-end run yet.
+- Mix fusion alone: +0.5-1.2% (noise). An O-projection rewrite: 4% on its kernel, left out.
+- n-gram drafting for edits: needs a token-history plane in Loom's draft cache; a simulation of the edit job
+  predicts at most +7% (only ~600 of 4,000 output tokens are copied code; the rest is reasoning).
+- MoE dedup across span tokens: the cache already does it; rewrites of the NVFP4 decode lost.
+
 ### Files
 
-- `engines/loom/build.sh` rebuilds the served package `$LCT_HOME/loom/kv8w4096` (`tmp/loom/kv8w4096` here) from the
+- `engines/loom/build.sh` rebuilds the served package `$LCT_HOME/loom/kv8-r2` (`tmp/loom/kv8-r2` here) from the
   pinned upstream package. `engines/loom/README.md` lists the pins, each change, and how to check a build.
 - `experiments/inkling-loom/`: kernel generators (`gen_v2.py`, `gen_span.py`; span-v2 is `kernels/spa_p4.loom`),
   kernel tests and benchmarks, and the end-to-end session tools. Its README says how to run each.
@@ -98,11 +140,14 @@ slower than v2 for a single token, so it would serve only verify spans.
 
 ## Open leads
 
-- Wire span-v2 into verification: *est.* +8% at 195K.
+- Load the fixed reduced draft head (`experiments/inkling-loom/r2/spec/draft_head.py`): *est.* +5% decode.
+- Dynamic spans over more lengths (`dynspan.py --lengths 2,3,4,6 ...` on a depth-7 preset), now that padding
+  tokens skip the experts; measure static step costs at depths 1-7 first.
+- Prefill: the global flash-attention kernel runs at ~27 of ~123 TFLOP/s. A prefetch variant (`prefill.py`
+  `PREFILL_ATTN=pf`) compiles without spills and passes its test; not timed.
+- Wire span-v2 into verification: the round 2 kernels changed the baseline; re-measure before building it.
 - Keep the drafter's KV as a 4K ring: it now stores the whole context but reads only 4K; the ~0.8 GB freed at 196K
   could carry ~256K context with the drafter on (*est.*).
-- Prompt reads: ~1,420 t/s at 195K; the prefill kernels are untouched.
-- Short-context decode: 8.56 ms of GPU time a token. Top kernels: q8_0 mat-vec at K=2304 (1.46 ms), MoE gate/up in
-  NVFP4 (1.35), MoE down (0.68), LM head (0.58), activation quantization to q8 (0.49).
+  It would also let the prompt chunk grow to 1,536-2,048 (64K read 23.4 s at 1,024 vs 21.0 s at 2,048).
 - `lct live` and the TUI's Live page do not parse Loom's log, so they show no request lanes.
 - No own quality eval yet (`tmp/ab-eval`, forseti) against the 27B and Flash-Next.

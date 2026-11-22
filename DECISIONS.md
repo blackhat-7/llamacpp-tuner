@@ -151,3 +151,7 @@ Five engines in two months each touched `cli.py`, `servers.py` and setup. Now ea
 
 ## 2026-11-22: Strata run configs live in `$LCT_HOME/strata/configs/`; lct finds the Strata checkout from the config's `cwd`
 Configs no longer have to sit inside the checkout. On this PC they are symlinks to the configs in `~/Documents/projects/Strata/`, so nothing there moved.
+
+## 2026-11-22: Inkling round 2 serves as `kv8-r2`, preset `xtx-r2` (draft depth 3, dynamic spans, prompt chunk 1,024)
+Static depth 3 lost prose at long context (-15% at 64K, -22% at 195K) while winning code and edits, so `dynspan.py` verifies 2 tokens instead of 4 while first drafts keep missing; depth 1 everywhere would give up +20-37% on code and edits.
+Changes that pass kernel tests but have no end-to-end run (reduced draft head, `--sconv`) stay out: one passed its tests and still failed registration.

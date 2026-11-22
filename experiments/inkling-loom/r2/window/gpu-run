@@ -1,0 +1,5 @@
+#!/bin/bash
+# Run a GPU command only when the GPU is released: waits while /tmp/xtx-gpu.hold exists (the user's own server
+# is using the XTX), then takes the shared lock. Usage: gpu-run CMD ARGS...
+while [[ -e /tmp/xtx-gpu.hold ]]; do sleep 20; done
+exec flock /tmp/xtx-gpu.lock "$@"

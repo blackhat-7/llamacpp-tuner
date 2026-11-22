@@ -39,5 +39,19 @@
       "cache_target_bytes": 0,
       "prefix_cache_capacity": 1
     }
+  },
+  "xtx-r2": {
+    "service": "chat",
+    "variant": "gguf",
+    "programs": "source",
+    "execution": {
+      "rows": 1,
+      "context_capacity": 196608,
+      "prefill_capacity": 1024,
+      "max_tokens": 32768,
+      "draft_depth": 3,
+      "cache_target_bytes": 0,
+      "prefix_cache_capacity": 1
+    }
   }
 }

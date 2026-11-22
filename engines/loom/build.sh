@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Rebuild our Inkling-2-Mini Loom package: the upstream package plus 8-bit KV, attention v2, a drafter window and
-# our presets. See README.md.
+# Rebuild our Inkling-2-Mini Loom package: the upstream package plus 8-bit KV, attention v2, a drafter window,
+# round 2 (attention, prefill, dense and MoE kernels, dynamic draft spans) and our presets. See README.md.
 # Usage: engines/loom/build.sh [--force] [--output DIR]
 set -euo pipefail
 
@@ -14,7 +14,7 @@ window=4096
 die() { echo "build.sh: $*" >&2; exit 1; }
 
 force=0
-out=$LCT_HOME/loom/kv8w4096
+out=$LCT_HOME/loom/kv8-r2
 while (($#)); do
   case $1 in
     --force) force=1 ;;
@@ -50,6 +50,12 @@ cp "$src"/program/{control,prepare,service,storage}.loom "$tmp/program/"
 patch --quiet --fuzz=0 -p1 -d "$tmp" <"$here/patches/storage-kv8.diff"
 "${py[@]}" "$here/tools/transform.py" "$src/program/llm.loom" "$tmp/program/llm.loom"
 "${py[@]}" "$here/tools/dsp_window.py" "$tmp/program/llm.loom" "$window"
+# Round 2 (2026-11-22). Order matters: each tool anchors on the text the ones before it leave.
+"${py[@]}" "$here/tools/attn/attn.py" "$tmp"
+"${py[@]}" "$here/tools/prefill/prefill.py" "$tmp" >/dev/null
+"${py[@]}" "$here/tools/dense/dense_edit.py" "$tmp" >/dev/null
+"${py[@]}" "$here/tools/moe/moe_opt.py" "$tmp" >/dev/null
+"${py[@]}" "$here/tools/spec/dynspan.py" "$tmp" --lengths 2 --thresholds 90 --shift 3
 "${py[@]}" - "$src/model.json" "$here/presets.json" "$tmp/model.json" <<'PY'
 import json
 import sys
