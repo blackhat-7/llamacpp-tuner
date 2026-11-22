@@ -39,3 +39,5 @@ instead of starting. Runs wait until the CPU is below 80 C. The old copies in `t
 
 Not copied: one-off round scripts, logs, binaries, the routing-trace corpus (134 MB), the long-context prompts
 (`long/`, 3 MB) and `swift-profile-mix.bin` (now `gen.sh` defaults to `$STRATA_DATA/profiles/swift-1.5-iq3_xxs.bin`).
+
+`mtpfit/`: the scripts that refit the MTP drafter `rt-sd2-swift` to Swift (round 9b); see its README.

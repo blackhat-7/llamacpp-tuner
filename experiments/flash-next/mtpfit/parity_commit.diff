@@ -1,0 +1,48 @@
+diff --git a/src/core/mtp.cpp b/src/core/mtp.cpp
+index 63f1b5e2..2188d458 100644
+--- a/src/core/mtp.cpp
++++ b/src/core/mtp.cpp
+@@ -1528,7 +1528,42 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t*
+     };
+ 
+     int n = 0;
+-    if (min_p <= 0.0f && max_steps > 0) {
++    // STRATA_MTP_PARITY=FILE (mtpfit/parity.py, a test path): every round's inputs - int32 {p, a, T, steps, nv},
++    // tokens[T], window_R rows 0..T-1 (f32 [T][hc * n_embd], the cells p..p+T-1) - then per step: int32 draft, f32 probability, f32 head logits [nv]
++    // (draft-vocabulary order), f32 output residual R_ row 0 [hc * n_embd].  Every step runs, one graph at a time with
++    // a sync between: the timing changes, the values do not (the verify still decides every token).
++    static std::FILE* const parity = [] { const char* f = std::getenv("STRATA_MTP_PARITY"); return f ? std::fopen(f, "wb") : nullptr; }();
++    if (parity != nullptr && max_steps > 0) {
++        const int64_t nv = dhead_ != nullptr ? n_dvocab_ : n_vocab_, HCN = g_->hc * g_->n_embd;
++        std::vector<float> buf((size_t) std::max<int64_t>(nv, T * HCN));
++        if (cudaStreamSynchronize(cs_) != cudaSuccess ||   // stage_source_R is queued on cs_
++            cudaMemcpy(buf.data(), window_R_, (size_t) (T * HCN) * 4, cudaMemcpyDefault) != cudaSuccess) {
++            err = "mtp parity: reading the round's residual";
++            return false;
++        }
++        const int32_t hdr[5] = {(int32_t) p, a, T, max_steps, (int32_t) nv};
++        std::fwrite(hdr, 4, 5, parity);
++        std::fwrite(tokens, 4, (size_t) T, parity);
++        std::fwrite(buf.data(), 4, (size_t) (T * HCN), parity);
++        for (int j = 0; j < max_steps; ++j) {
++            cudaGraphExec_t g = j == 0 ? (cp ? round_exec_c_[T] : round_exec_[T]) : (cp ? step_exec_c_[j] : step_exec_[j]);
++            if (cudaGraphLaunch(g, cs_) != cudaSuccess || cudaStreamSynchronize(cs_) != cudaSuccess) {
++                err = std::string("mtp parity: ") + cudaGetErrorString(cudaGetLastError());
++                return false;
++            }
++            drafts[j] = ((volatile int32_t*) h_out_)[j];
++            const float pj = ((volatile float*) h_prob_)[j];
++            if (probs) probs[j] = pj;
++            std::fwrite(&drafts[j], 4, 1, parity);
++            std::fwrite(&pj, 4, 1, parity);
++            cudaMemcpy(buf.data(), head_logits_, (size_t) nv * 4, cudaMemcpyDeviceToHost);
++            std::fwrite(buf.data(), 4, (size_t) nv, parity);
++            cudaMemcpy(buf.data(), R_, (size_t) HCN * 4, cudaMemcpyDeviceToHost);
++            std::fwrite(buf.data(), 4, (size_t) HCN, parity);
++        }
++        std::fflush(parity);
++        n = max_steps;
++    } else if (min_p <= 0.0f && max_steps > 0) {
+         if (cudaGraphLaunch(cp ? round_exec_c_[T] : round_exec_[T], cs_) != cudaSuccess) {
+             err = std::string("mtp draft: ") + cudaGetErrorString(cudaGetLastError());
+             return false;
