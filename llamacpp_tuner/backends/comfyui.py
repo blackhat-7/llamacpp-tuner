@@ -131,14 +131,7 @@ def run_comfyui(
 
 def serve(model: str, options: ServeOptions, env: dict[str, str]) -> None:
     """Run ComfyUI; MODEL is its base directory (models, input, output)."""
-    if (
-        options.quant
-        or options.filename
-        or options.ctx
-        or options.mmproj
-        or options.no_mmproj
-        or options.no_mmproj_offload
-    ):
+    if options.picks_gguf:
         raise UnsupportedOptionError(
             "ComfyUI takes its base directory; models live in it."
         )

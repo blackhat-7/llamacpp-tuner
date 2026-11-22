@@ -6,6 +6,7 @@ import signal
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Protocol
 
 from llamacpp_tuner.cache import get_cache_dir, get_checkout_dir
 
@@ -24,6 +25,33 @@ class ServeOptions:
     no_mmproj_offload: bool = False
     extra_args: str = ""
     server: Path | None = None
+
+    @property
+    def picks_gguf(self) -> bool:
+        """Whether a GGUF file, context or projector was given; engines with their
+        own model format set those themselves."""
+        return any(
+            (
+                self.quant,
+                self.filename,
+                self.ctx,
+                self.mmproj,
+                self.no_mmproj,
+                self.no_mmproj_offload,
+            )
+        )
+
+
+class Backend(Protocol):
+    """What every module in BACKENDS provides; pyright checks each one."""
+
+    def serve(self, model: str, options: ServeOptions, env: dict[str, str]) -> None: ...
+
+    def setup(
+        self, force: bool, cmake_args: tuple[str, ...], torch_index: str | None
+    ) -> str: ...
+
+    def address(self, line: str) -> str: ...
 
 
 class UnsupportedOptionError(Exception):

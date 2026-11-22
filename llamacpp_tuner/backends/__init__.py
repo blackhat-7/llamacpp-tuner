@@ -9,11 +9,10 @@ Shared types and helpers are in base.py. A new engine is a module here plus a
 line in BACKENDS.
 """
 
-from types import ModuleType
-
 from llamacpp_tuner.backends import comfyui, jeeves, llama, loom, strata
+from llamacpp_tuner.backends.base import Backend
 
-BACKENDS: dict[str, ModuleType] = {
+BACKENDS: dict[str, Backend] = {
     "llama": llama,
     "jeeves": jeeves,
     "strata": strata,

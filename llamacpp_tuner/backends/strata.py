@@ -20,6 +20,10 @@ def run_strata(
     config: Path, args: list[str], env: dict[str, str] | None = None
 ) -> None:
     """Run Strata's OpenAI-compatible server for a run config in the foreground."""
+    # Strata saves Settings edits by renaming a new file over --config. Given a
+    # symlink, that would replace the link with a copy and leave the real config
+    # unserved, so pass the file the link points at.
+    config = config.resolve()
     if not config.is_file():
         raise FileNotFoundError(
             f"No Strata run config at {config}. Build one with "
@@ -50,14 +54,7 @@ def run_strata(
 
 def serve(model: str, options: ServeOptions, env: dict[str, str]) -> None:
     """Run Strata for a run config; MODEL is the config's path."""
-    if (
-        options.quant
-        or options.filename
-        or options.ctx
-        or options.mmproj
-        or options.no_mmproj
-        or options.no_mmproj_offload
-    ):
+    if options.picks_gguf:
         raise UnsupportedOptionError(
             "Strata's model, context and projector are set in its run config."
         )

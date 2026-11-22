@@ -6,6 +6,7 @@ machine and in any checkout.
 
 import json
 import re
+import shlex
 import tomllib
 
 from llamacpp_tuner.cache import get_cache_dir, get_profiles_path
@@ -17,13 +18,29 @@ class ProfileError(Exception):
     """The profiles file is invalid, or a name is not in it."""
 
 
+def _plain_cache_dir() -> str | None:
+    """The cache dir if it can stand unquoted in a profile's arguments."""
+    cache = str(get_cache_dir())
+    return cache if shlex.quote(cache) == cache else None
+
+
 def _expand(text: str) -> str:
-    return text.replace(VARIABLE, str(get_cache_dir()))
+    if VARIABLE not in text:
+        return text
+    if not (cache := _plain_cache_dir()):
+        raise ProfileError(
+            f"{VARIABLE} in {get_profiles_path()} needs a cache dir without spaces "
+            f"or quotes, not {get_cache_dir()}. Set LCT_HOME to such a path."
+        )
+    return text.replace(VARIABLE, cache)
 
 
 def _collapse(text: str) -> str:
-    # Only whole path components, so a sibling such as <cache>2/ stays as it is.
-    pattern = re.escape(str(get_cache_dir())) + r"(?=[/'\"\s]|$)"
+    if not (cache := _plain_cache_dir()):
+        return text
+    # Whole paths only: starting a value or after a space, quote, '=' or ':'
+    # (--opt=PATH, VAR=PATH, PATH:PATH), and ending at a path boundary.
+    pattern = r"(?<![^\s'\"=:])" + re.escape(cache) + r"(?=[/'\"\s:]|$)"
     return re.sub(pattern, VARIABLE, text)
 
 

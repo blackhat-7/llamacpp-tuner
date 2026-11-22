@@ -6,6 +6,7 @@ import platform
 import shlex
 import shutil
 import subprocess
+import sys
 import tempfile
 import urllib.request
 from collections.abc import Sequence
@@ -229,13 +230,13 @@ def setup(force: bool, cmake_args: tuple[str, ...], torch_index: str | None) -> 
     """Find or download llama-server; CMake arguments build it instead."""
     binary = install_llama(force=force, extra_cmake_args=cmake_args)
     devices = list_devices(binary)
-    text = f"llama-server: {binary}\n{devices}"
     if "(none)" in devices:
-        text += (
-            "\nNo GPU found: install your GPU driver (NVIDIA, or Vulkan for "
-            "AMD/Intel), then run 'lct setup --force'."
+        print(
+            "No GPU found: install your GPU driver (NVIDIA, or Vulkan for "
+            "AMD/Intel), then run 'lct setup --force'.",
+            file=sys.stderr,
         )
-    return text
+    return f"llama-server: {binary}\n{devices}"
 
 
 def address(line: str) -> str:

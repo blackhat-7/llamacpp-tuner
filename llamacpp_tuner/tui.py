@@ -331,9 +331,22 @@ def clip_row(path: Path) -> Text:
     )
 
 
+def typed(tokens: list[str], flag: str) -> str | None:
+    """The last value given for FLAG, as Click would take it."""
+    value = None
+    for i, token in enumerate(tokens):
+        if token == flag and i + 1 < len(tokens):
+            value = tokens[i + 1]
+        elif token.startswith(flag + "="):
+            value = token.split("=", 1)[1]
+    return value
+
+
 def profile(args: str) -> dict:
     """Parse a saved profile into setting values plus the tokens behind them."""
-    ctx = serve.make_context("serve", shlex.split(args), resilient_parsing=True)
+    tokens = shlex.split(args)
+    # A copy: Click consumes the list it parses.
+    ctx = serve.make_context("serve", list(tokens), resilient_parsing=True)
     p = ctx.params
     try:
         if p["backend"] == "jeeves":
@@ -354,8 +367,11 @@ def profile(args: str) -> dict:
     model_tokens += ["--backend", p["backend"]] if p["backend"] != "llama" else []
     model_tokens += ["--file", p["filename"]] if p["filename"] else []
     model_tokens += ["--quant", p["quant"]] if p["quant"] else []
-    model_tokens += ["--server", str(p["server"])] if p["server"] else []
-    mmproj_tokens = ["--mmproj", str(p["mmproj"])] if p["mmproj"] else []
+    # Parsing turns a --server or --mmproj path that is missing here into None;
+    # saving must still keep it, e.g. before the build exists on a fresh clone.
+    server, projector = typed(tokens, "--server"), typed(tokens, "--mmproj")
+    model_tokens += ["--server", server] if server else []
+    mmproj_tokens = ["--mmproj", projector] if projector else []
     mmproj_tokens += ["--no-mmproj"] if p["no_mmproj"] else []
     mmproj_tokens += ["--no-mmproj-offload"] if p["no_mmproj_offload"] else []
     # Kept as-is on every edit: the settings page does not show them.

@@ -84,7 +84,7 @@ def run_loom(
     if not (package / "model.json").is_file():
         raise FileNotFoundError(
             f"No Loom model package in {package}: model.json is missing. "
-            "Fetch one with loom-fetch."
+            "Build ours with 'lct setup --backend loom', or fetch one with loom-fetch."
         )
     binary = package.parent / "venv" / "bin" / "loom-serve"
     if not binary.is_file():
@@ -105,14 +105,7 @@ def run_loom(
 
 def serve(model: str, options: ServeOptions, env: dict[str, str]) -> None:
     """Run Loom for a model package; MODEL is the package directory."""
-    if (
-        options.quant
-        or options.filename
-        or options.ctx
-        or options.mmproj
-        or options.no_mmproj
-        or options.no_mmproj_offload
-    ):
+    if options.picks_gguf:
         raise UnsupportedOptionError(
             "Loom's model, context and drafter are set in its package preset."
         )

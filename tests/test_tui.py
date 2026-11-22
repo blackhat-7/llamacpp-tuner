@@ -15,7 +15,7 @@ from textual.widgets import Input, OptionList, RichLog, Static
 
 from llamacpp_tuner.profiles import load_profiles, write_profiles
 from llamacpp_tuner.servers import LCT
-from llamacpp_tuner.tui import LctApp, bench_row, card_summary, video_command
+from llamacpp_tuner.tui import LctApp, bench_row, card_summary, profile, video_command
 
 FAKE_SERVER = """
 import time
@@ -619,3 +619,13 @@ def test_video_page_makes_a_clip_and_lists_it(monkeypatch, workspace, tmp_path):
             )
 
     asyncio.run(run())
+
+
+def test_profile_keeps_a_server_and_projector_that_are_missing_here():
+    # A fresh clone has no builds yet; editing a profile must not drop them.
+    details = profile(
+        "model.gguf --server /not/built/llama-server --mmproj /not/here/mm.gguf"
+    )
+
+    assert details["model_tokens"][-2:] == ["--server", "/not/built/llama-server"]
+    assert details["mmproj_tokens"][:2] == ["--mmproj", "/not/here/mm.gguf"]

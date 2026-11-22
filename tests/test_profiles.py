@@ -3,10 +3,16 @@
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
 from click.testing import CliRunner
 
 from llamacpp_tuner.cli import main
-from llamacpp_tuner.profiles import load_profiles, load_stacks, write_profiles
+from llamacpp_tuner.profiles import (
+    ProfileError,
+    load_profiles,
+    load_stacks,
+    write_profiles,
+)
 
 # conftest sets LCT_HOME to tmp_path, so profiles live in tmp_path/aliases.toml.
 
@@ -72,3 +78,28 @@ def test_serve_gets_the_expanded_arguments(tmp_path):
         "-md",
         f"{tmp_path}/x.gguf",
     ]
+
+
+def test_writing_leaves_paths_that_only_end_like_the_cache_dir(tmp_path):
+    write_profiles(
+        {
+            "mounted": f"/mnt{tmp_path}/m.gguf --env LIBS={tmp_path}/lib:/opt/lib",
+        }
+    )
+
+    assert (tmp_path / "aliases.toml").read_text() == (
+        f'"mounted" = "/mnt{tmp_path}/m.gguf --env LIBS=${{LCT_HOME}}/lib:/opt/lib"\n'
+    )
+
+
+def test_a_cache_dir_that_needs_quoting_is_refused_for_lct_home(tmp_path, monkeypatch):
+    home = tmp_path / "with space"
+    home.mkdir()
+    monkeypatch.setenv("LCT_HOME", str(home))
+    (home / "aliases.toml").write_text('"a" = "${LCT_HOME}/m.gguf"\n')
+
+    with pytest.raises(ProfileError, match="Set LCT_HOME"):
+        load_profiles()
+    # Such a path is never written back as ${LCT_HOME}, so it stays readable.
+    write_profiles({"b": f"'{home}/m.gguf'"})
+    assert "${LCT_HOME}" not in (home / "aliases.toml").read_text()

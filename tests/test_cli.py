@@ -47,7 +47,8 @@ def test_setup_says_how_to_fix_a_missing_gpu():
     ):
         result = CliRunner().invoke(main, ["setup"])
 
-    assert result.exit_code == 0 and "No GPU found" in result.output
+    assert result.exit_code == 0 and "No GPU found" in result.stderr
+    assert "No GPU found" not in result.stdout
 
 
 def test_pull_requires_quant_or_file():
@@ -562,3 +563,20 @@ def test_address_reads_each_backends_ready_line():
     loom = "lct: Loom at 127.0.0.1:41000; listening on http://0.0.0.0:6868"
     assert servers.address(loom) == "http://0.0.0.0:6868"
     assert servers.address("loading model") == ""
+
+
+def test_strata_gets_the_file_a_symlinked_config_points_at(tmp_path):
+    # Strata saves Settings edits over --config; a link must not become a copy.
+    checkout = tmp_path / "Strata"
+    (checkout / ".venv" / "bin").mkdir(parents=True)
+    (checkout / ".venv" / "bin" / "python").write_text("")
+    real = checkout / "strata-x.json"
+    real.write_text(json.dumps({"cwd": str(checkout)}))
+    link = tmp_path / "configs" / "strata-x.json"
+    link.parent.mkdir()
+    link.symlink_to(real)
+    with patch("llamacpp_tuner.backends.strata.run_process") as run_process:
+        strata.run_strata(link, [])
+
+    command = run_process.call_args.args[0]
+    assert command[command.index("--config") + 1] == str(real)
