@@ -155,9 +155,11 @@ install_file "$STRATA_SRC/build-lct-vision/bin/strata-vision" "$VISION" 755
 if [[ -n $NVCC ]]; then
   install_file "$STRATA_SRC/build-lct-cuda/libstrata_nvhelper.so" "$NVHELPER" 755
 fi
-# small inputs kept in git: the Swift expert profile and the agent draft vocabulary
+# small inputs kept in git: the Swift expert profiles and the agent draft vocabulary
 install_file "$REPO/bench/strata-compare/share/swift-1.5-iq3_xxs.bin" "$STRATA_DATA/profiles/swift-1.5-iq3_xxs.bin" 644
 install_file "$REPO/bench/strata-compare/share/draft_vocab_agent.bin" "$STRATA_DATA/draft_vocab_agent.bin" 644
+install_file "$REPO/bench/strata-compare/share/swift-1.5-mixb-learned-frozen13.bin" \
+  "$STRATA_DATA/profiles/swift-1.5-mixb-learned-frozen13.bin" 644
 
 # 8. The run configs.
 render_args=()

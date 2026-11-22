@@ -161,10 +161,11 @@ Profiles and vocabulary:
 - `profiles/swift-1.5-{iq3_xxs,mixb,mixd}-learned.bin`: the engine writes them (`expert_profile_save`). Start each
   as a copy of `swift-1.5-iq3_xxs.bin`.
 - `profiles/swift-1.5-mixb-learned-frozen13.bin`: a 2026-11-17 snapshot of the mixB learned profile, for the bench
-  config. Missing: needs a published copy (or use a fresh snapshot).
+  config: in git under `bench/strata-compare/share/`; `build.sh` copies it.
 - `mtp/rt-sd2-swift` (787 MB drafter): Basalt's MTP drafter with its dense part refit to Swift by self-distillation
-  (round 9, `docs/flash-next-speed-research.md`). Missing: needs a published copy. The fit scripts are only in
-  `tmp/strata-opt/mtpfit/` and need a GPU, a parity build and their scratch layout.
+  (round 9, `docs/flash-next-speed-research.md`; the fit scripts are in `experiments/flash-next/mtpfit/`).
+  <!-- drafter-source -->Not published yet: `engines/strata/publish-drafter.sh DIR` uploads it to Hugging Face with the
+  license files Swift's and Qwen's licenses require, and writes the download command here.<!-- /drafter-source -->
 
 ## Make a new change
 
