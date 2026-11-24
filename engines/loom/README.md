@@ -1,8 +1,9 @@
 # Loom: the Inkling-2-Mini package
 
-`build.sh` makes `$LCT_HOME/loom/kv8-r2` and, from it, `$LCT_HOME/loom/kv8-r2v` (the same package with image input),
-which profile `inkling` serves (preset `xtx-r2`). The previous
-build, `kv8w4096` (changes 1-5 only, preset `xtx-kv8-196k`), is the rollback: check out commit `d8fe34f` and build.
+`build.sh` makes `$LCT_HOME/loom/kv8-r3` and, from it, `$LCT_HOME/loom/kv8-r3v` (the same package with image input),
+which profile `inkling` serves (preset `xtx-park`, elastic memory: several agents take turns, each chat parked in
+host RAM by lct's `parking.py`). The previous build, `kv8-r2v` with preset `xtx-r2` and fixed memory, is the
+rollback: it is still on disk; to rebuild it, check out commit `14a042f` and build.
 Numbers below are from `docs/inkling-loom-research.md` (7900 XTX, decode t/s).
 
 ## Upstream
@@ -28,7 +29,7 @@ Numbers below are from `docs/inkling-loom-research.md` (7900 XTX, decode t/s).
    64K with the drafter on: 98.5 / 86.4 to 114 / 104 t/s (code / prose). Output stays exact.
 5. Presets: `presets.json`. `xtx-kv8-196k` (196,608 context, drafter, prefix cache, `max_tokens` 32,768) is the one
    profile `inkling` used until round 2. `xtx-nodraft` is the same without the drafter. `xtx` (32K) is the older f16
-   preset.
+   preset. `xtx-park` (2026-11-24) serves several agents: item 15.
 
 Round 2 (2026-11-22; same-session numbers vs `kv8w4096` in `docs/inkling-loom-research.md` "Round 2"). Each tool
 edits the package in place; `build.sh` runs them in this order, because each anchors on the text the ones before
@@ -68,6 +69,15 @@ it leave:
     drafter was trained on the original); quality check 16/18 vs 17/18 (the edit task ran to its 16K cap; at
     temperature 1, 2 of 3 passed vs 3 of 3, using 6-16K tokens vs 7-9K).
 
+14. Exact top-k at temperature > 0 (`tools/spec/topk.py`, package `kv8-r3`): `g_head_select` ranks the 64 best
+    chunks of 128 ids by their maxima, then only those ids, instead of 64 passes over the vocabulary (5.5 ms ->
+    0.125 ms a call). Same candidates in the same order: seeded T=1 text is byte-identical. T=1 code / prose /
+    66K 122 / 89 / 97 -> 171 / 132 / 125 t/s; greedy unchanged.
+15. Preset `xtx-park`: 204,800 tokens a chat, `max_sessions` 1, 32 checkpoint slots, no automatic caches, prompt
+    chunk 512. Profiles pass `--pool_backing=elastic --weight_slab_bytes=32mib`. With prompt chunk 1,024 a
+    restored chat corrupts on follow-ups longer than one chunk, so it stays at 512 (research doc, "Several
+    agents taking turns").
+
 All together, short code / prose / edit 141 / 121 / 133 to 193 / 146 / 176 t/s; 64K code / prose 114 / 104 to
 148 / 108; 195K 90 / 75 to 104 / 82; 195K recall 3/3.
 
@@ -99,6 +109,6 @@ engines/loom/build.sh --output DIR --force  # another place; replace an output t
 
 1. Develop and test it in `experiments/inkling-loom/` (`gen_span.py`, `gen_spanbench.py`; round 2's in `r2/`).
 2. Put the kernel in `kernels/` or next to its tool. Add a tool in `tools/` and call it in `build.sh` after the others.
-3. Give the output a new name (for example `kv8-r3`), so the old package stays for rollback.
+3. Give the output a new name (for example `kv8-r4`), so the old package stays for rollback.
    Point the profile at it.
 4. Add one line above: what it does, the measured effect, the research doc.

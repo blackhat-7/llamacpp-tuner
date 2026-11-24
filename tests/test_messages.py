@@ -10,7 +10,13 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
 
-from llamacpp_tuner.messages import Stream, make_server, to_anthropic, to_openai
+from llamacpp_tuner.messages import (
+    DEEP_IMAGE,
+    Stream,
+    make_server,
+    to_anthropic,
+    to_openai,
+)
 
 TOOL = {
     "name": "read",
@@ -454,6 +460,37 @@ def test_server_sends_images_when_the_model_lists_image_input():
                 }
             ],
         }
+    ]
+
+
+class DeepVisionLoom(VisionLoom):
+    """Counts every chat as longer than images may go."""
+
+    def do_POST(self):
+        if self.path.endswith("/input_tokens"):
+            self.rfile.read(int(self.headers["Content-Length"]))
+            self._json({"input_tokens": 200_000})
+            return
+        super().do_POST()
+
+
+def test_images_become_a_note_deep_into_a_long_chat():
+    loom = ThreadingHTTPServer(("127.0.0.1", 0), DeepVisionLoom)
+    server = make_server("127.0.0.1", 0, f"127.0.0.1:{loom.server_address[1]}")
+    for s in (loom, server):
+        threading.Thread(target=s.serve_forever, daemon=True).start()
+    message = {
+        "model": "m",
+        "max_tokens": 9,
+        "messages": [{"role": "user", "content": [{"type": "image", "source": PNG}]}],
+    }
+    try:
+        post(f"http://127.0.0.1:{server.server_address[1]}/v1/messages", message)
+    finally:
+        server.shutdown()
+        loom.shutdown()
+    assert VisionLoom.received[-1]["messages"] == [
+        {"role": "user", "content": [{"type": "text", "text": DEEP_IMAGE}]}
     ]
 
 

@@ -6,21 +6,24 @@ tokens; the model always thinks.
 
 ## Now
 
-Stack `local-inkling` = profile `inkling` (Loom, package `tmp/loom/kv8-r2`, preset `xtx-r2`) + `embed`.
-It is the user's one-GPU stack: best quality and context on the XTX alone, with the 4070 free for the desktop and games.
+Stack `local-inkling` = profile `inkling` (Loom, package `tmp/loom/kv8-r3v`, preset `xtx-park`, elastic memory) +
+`embed`. It is the user's one-GPU stack: best quality and context on the XTX alone, with the 4070 free for the
+desktop and games. Since 2026-11-24 several agents take turns on it: each chat waits in host RAM while the others
+run ("Several agents taking turns" below).
 
 | depth | code | prose | edit | fresh prompt read |
 |---|---|---|---|---|
 | short (1.3K) | 193 (was 141) | 146 (121) | 176 (133) | - |
-| 64K | 148 (114) | 108 (104) | - | 22.0 s (28.8) |
-| 195K | 104 (90) | 82 (75) | - | 100 s (138) |
+| 64K | 148 (114) | 108 (104) | - | 26.7 s with 512-token chunks (22.0 at 1,024) |
+| 195K | 104 (90) | 82 (75) | - | ~115 s *est.* at 512 (100 s at 1,024) |
 
 - Round 2 numbers are one session each, 2026-11-22 14:09-14:20; "was" is `kv8w4096` (round 1). 195K recall 3/3.
-- The table is greedy. Clients that send no temperature get 1 from `messages.py` (greedy loops in thinking), and
-  decode is slower at 1: 92 vs 153 t/s on a 66K Claude Code turn.
-- Context 196,608 tokens. A growing chat reuses its cache (a 64K follow-up starts in 2 s, not 22 s).
-- 0.3 GB RAM, 21.6 GB VRAM idle (25.2 GB peak at 195K), idle CPU 0%. Starting it asks `sudo` once only when the
-  shell's memory-lock ceiling is below 64 MiB (see "Serving through lct").
+- The table is greedy. Clients that send no temperature get 1 from `messages.py` (greedy loops in thinking).
+  Since `kv8-r3` (exact top-k, 2026-11-24) temperature 1 costs far less: seeded code / prose / 66K 171 / 132 /
+  125 t/s (122 / 89 / 97 on `kv8-r2v`, byte-identical text).
+- Context 204,800 tokens a chat. A growing chat reuses its cache; another chat's turn parks it in host RAM.
+- 0.3 GB RAM plus parked chats (~187 MB + 21.5 KB a token each, 40 GiB cap), 20.9 GB VRAM idle, idle CPU 0%.
+  Starting it asks `sudo` once only when the shell's memory-lock ceiling is below 64 MiB.
 - Quality, reported only (no own eval yet): about Qwen3.8-27B level, below Flash-Next on average. Strengths: prose,
   fewer thinking tokens. Weaknesses: refusals and preaching, failed tool calls (92% vs 97-100% in one 37-question
   eval), giant one-shot bash commands. Thinking loops stop with temp 1.0, top-p 1.0, top-k 0, min-p 0.
@@ -184,3 +187,51 @@ generator had no `inkling2v` family, so the upstream package was text-only. `kv8
   It would also let the prompt chunk grow to 1,536-2,048 (64K read 23.4 s at 1,024 vs 21.0 s at 2,048).
 - `lct live` and the TUI's Live page do not parse Loom's log, so they show no request lanes.
 - No own quality eval yet (`tmp/ab-eval`, forseti) against the 27B and Flash-Next.
+
+## Several agents taking turns (2026-11-24)
+
+Loom serves one chat at a time; another agent's turn used to replace it, and the next turn re-read the whole
+context (100 s at 195K). Now lct keeps each chat as a Loom checkpoint and parks it in host RAM, like Strata's
+conversation cache.
+
+- **How.** `llamacpp_tuner/parking.py`: a chat is known by its messages (one digest each); a request extending a
+  parked turn continues that session. After each finished turn lct pins the state (`POST /v1/checkpoints/NAME`,
+  10-60 ms) and releases the previous pin; when another chat takes the row it moves the pin to host RAM
+  (`.../suspend`); the next turn sends `X-Loom-Checkpoint` and Loom copies it back. A history that no longer
+  extends the checkpoint gets 400 before any work: lct drops it and re-reads. Small chats (< 4,096 tokens) are not
+  kept; 30 chats or 40 GiB at most, oldest out first. `backends/loom.py` turns it on only for presets with
+  checkpoint slots and elastic memory.
+- **Loom side.** Preset `xtx-park`: 204,800 tokens a chat, `max_sessions` 1 (Loom itself queues a second
+  request instead of dropping the model), 32 checkpoint slots, no automatic caches, 512-token prompt chunks.
+  Profile flags `--pool_backing=elastic --weight_slab_bytes=32mib` (suspend needs elastic memory; 32 MiB slabs
+  save ~1 GB against the 1 GiB default: 20.9 vs 21.9 GB idle).
+- **Exact.** Greedy, 4 agents at 20K-151K, 3 turns each: alone, round robin and all at once give the same text
+  in every turn (36/36, and 24/24 with ~5K-token follow-ups at 512-token chunks). Elastic memory: same speed
+  and same tokens as fixed (short / 20K / 66K 208.8 / 147.6 / 125.3 vs 209.4 / 148.2 / 126.0).
+- **Speed.** Restore 0.7-1.2 s at 20K-151K (plus the new tokens); a 189K chat in 3.7 s vs a 96 s re-read. Round
+  robin of 4 agents: 166 s vs 161 s alone (re-reads would take ~430 s). A lone agent's next turn starts in
+  0.1-0.8 s: its pin stays in VRAM until another chat needs the row.
+- **Limits.** Prompt + `max_tokens` over 204,800 gets a clean 400. An image request at ~190K gets a clean 503 (the
+  image component needs ~0.5 GB more). Physical limit ~227K tokens (VRAM full, then Loom fails the model).
+- **Gotchas.**
+  - With 1,024-token prompt chunks a restored chat (or one that goes on while its pin is in VRAM) corrupts on a
+    follow-up longer than one chunk: the answer turns to symbols. 512 is clean on every path; the stock package at
+    512 is clean; at 1,024 not settled (our package or Loom). `experiments/inkling-loom/parking/suffix3.py`
+    reproduces it (`eager-rewind 6000`). The current fixed preset `xtx-r2` (no pins) is not affected.
+  - `--memory_bytes` makes Loom wait forever for memory near the budget (0% GPU, no error) instead of refusing;
+    without it Loom fails the model past the physical limit. Neither is used: the 204,800 limit keeps one chat
+    below the measured ~227K.
+  - Suspend copies run behind the HTTP answer; a pin or restore right after a big suspend can wait 1-4 s.
+  - Loom never pins the host copy (VmPin stays 16 MiB even with unlimited memlock), so copies run at ~1-2 GB/s.
+- **Tests.** `experiments/inkling-loom/parking/`: `agents.py` (modes alone / turns / concurrent, `--long`),
+  `suffix3.py` (restore + long follow-up vs a fresh read), `worst.py` (near the limit), `claude.sh` (real
+  `claude-local --offline -p` sessions at once), `capture.py` (records `/v1/messages` traffic).
+
+## Temperature 1 sampling (2026-11-24)
+
+At T > 0 `g_head_select` found its 64 candidates with 64 passes over the 200,058 logits: 5.5 ms on every verify
+step (greedy: 2 us). `engines/loom/tools/spec/topk.py` ranks the 64 best chunks of 128 ids by their maxima (the
+head kernels' partials), then only those ids: 0.125 ms, the same candidates in the same order. Seeded T=1 text is
+byte-identical; code / prose / 66K 122 / 89 / 97 -> 171 / 132 / 125 t/s. Coupling the drafter to the sampler's
+Gumbel noise was exact but gained -0.6% to +2.1% (`experiments/inkling-loom/sampling/`).
+

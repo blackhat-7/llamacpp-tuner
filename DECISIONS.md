@@ -166,3 +166,11 @@ Q8_0 instead of F16 keeps the 196,608 context (F16 needs 0.64 GB, which does not
 
 ## 2026-11-22: Inkling-2-Mini-Unbound v2 serves as its own profile `inkling-unbound`, not as the default
 v2 changes only 120 Q8_0 attention tensors, so `tools/unbound.py` copies them into our unsloth file: same layout, no program change. It costs code decode (179 vs 208 t/s, drafter mismatch) and thinks longer (edit task 2/3 vs 3/3 at temperature 1), so `inkling` stays on `kv8-r2v` until the user picks.
+
+## 2026-11-24: Several agents take turns on Inkling: lct parks each chat in host RAM through Loom's checkpoints
+Profile `inkling` = `kv8-r3v` + preset `xtx-park` (204,800 tokens a chat, `max_sessions` 1, 32 checkpoint slots, prompt chunk 512) + `--pool_backing=elastic --weight_slab_bytes=32mib`; `parking.py` pins every finished turn and moves it to host RAM only when another chat takes the row.
+Prompt chunk 512, not 1,024: at 1,024 restored chats corrupt on long follow-ups. No `--memory_bytes`: near its budget Loom hangs instead of refusing; the 204,800 limit keeps a chat below the measured ~227K crash.
+
+## 2026-11-24: Exact top-k sampling (`tools/spec/topk.py`) is in the package; the Gumbel-coupled drafter is not
+The fast search returns the same 64 candidates in the same order (seeded T=1 text byte-identical) at +29-48% T=1 decode. Coupling the drafter to the sampler's noise was exact but gained -0.6% to +2.1%: kept in `experiments/inkling-loom/sampling/`.
+

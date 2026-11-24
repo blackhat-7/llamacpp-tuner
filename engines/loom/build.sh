@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Rebuild our Inkling-2-Mini Loom package: the upstream package plus 8-bit KV, attention v2, a drafter window,
-# round 2 (attention, prefill, dense and MoE kernels, dynamic draft spans) and our presets, then the same
+# round 2 (attention, prefill, dense and MoE kernels, dynamic draft spans), the exact top-k sampler and our presets, then the same
 # package with image input (<output>v) and that package with Inkling-2-Mini-Unbound v2's attention (<output>vu).
 # See README.md.
 # Usage: engines/loom/build.sh [--force] [--output DIR]
@@ -24,7 +24,7 @@ unbound_sha256=7286a4b2ddc2bab543a9a795d823638b5a4ddde6699f5ff1e9ed2adea85c40ae
 die() { echo "build.sh: $*" >&2; exit 1; }
 
 force=0
-out=$LCT_HOME/loom/kv8-r2
+out=$LCT_HOME/loom/kv8-r3
 while (($#)); do
   case $1 in
     --force) force=1 ;;
@@ -66,6 +66,8 @@ patch --quiet --fuzz=0 -p1 -d "$tmp" <"$here/patches/storage-kv8.diff"
 "${py[@]}" "$here/tools/dense/dense_edit.py" "$tmp" >/dev/null
 "${py[@]}" "$here/tools/moe/moe_opt.py" "$tmp" >/dev/null
 "${py[@]}" "$here/tools/spec/dynspan.py" "$tmp" --lengths 2 --thresholds 90 --shift 3
+# 2026-11-24: exact top-k at temperature > 0 (same draws, +28-45% decode at temperature 1).
+"${py[@]}" "$here/tools/spec/topk.py" "$tmp"
 "${py[@]}" - "$src/model.json" "$here/presets.json" "$tmp/model.json" <<'PY'
 import json
 import sys

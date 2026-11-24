@@ -6,18 +6,52 @@ forwards every other request (the OpenAI API that Pi and opencode use) as is,
 except that a chat request without a temperature gets TEMPERATURE.
 """
 
+import contextlib
 import http.client
 import json
+import socket
 import threading
 import uuid
 from collections.abc import Iterator
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+from llamacpp_tuner.parking import Parking, Plan
 
 STOP_REASONS = {"stop": "end_turn", "length": "max_tokens", "tool_calls": "tool_use"}
 # A request without a temperature means 1 in both APIs, and 1 is what Inkling's GGUF
 # recommends. Loom decodes greedily instead, and greedy decoding makes Inkling's
 # thinking repeat the same paragraphs until max_tokens.
 TEMPERATURE = 1.0
+# Past this many prompt tokens images become a note: with elastic memory Loom waits
+# forever for room for the image encoder beside a long chat (hung at ~190K, 2026-11-24).
+IMAGE_TOKENS = 150_000
+DEEP_IMAGE = "[image omitted: the chat is too long for images on this server]"
+
+
+def _without_images(request: dict) -> dict:
+    messages = [
+        {
+            **m,
+            "content": [
+                {"type": "text", "text": DEEP_IMAGE}
+                if part.get("type") == "image_url"
+                else part
+                for part in m["content"]
+            ],
+        }
+        if isinstance(m.get("content"), list)
+        else m
+        for m in request["messages"]
+    ]
+    return {**request, "messages": messages}
+
+
+def _has_images(request: dict) -> bool:
+    return any(
+        isinstance(m.get("content"), list)
+        and any(part.get("type") == "image_url" for part in m["content"])
+        for m in request["messages"]
+    )
 
 
 def _text(content: str | list[dict], images: bool = False) -> str:
@@ -233,6 +267,7 @@ class Stream:
         self.kind = ""  # "thinking", "text" or "tool_use" while a block is open
         self.tools: dict[int, int] = {}  # OpenAI tool call index -> block index
         self.stop = "end_turn"
+        self.reason: str | None = None  # OpenAI's finish_reason
         self.usage: dict = {}
         message = {
             "id": f"msg_{uuid.uuid4().hex}",
@@ -315,6 +350,7 @@ class Stream:
                         self._delta(self.tools[call.get("index", 0)], json_delta)
                     )
             if choice.get("finish_reason"):
+                self.reason = choice["finish_reason"]
                 self.stop = STOP_REASONS.get(choice["finish_reason"], "end_turn")
         return events
 
@@ -332,11 +368,17 @@ class Stream:
         ]
 
 
+def _chunk(line: bytes) -> dict | None:
+    line = line.strip()
+    if line.startswith(b"data:") and line != b"data: [DONE]":
+        return json.loads(line[5:])
+    return None
+
+
 def _chunks(response: http.client.HTTPResponse) -> Iterator[dict]:
     for line in response:
-        line = line.strip()
-        if line.startswith(b"data:") and line != b"data: [DONE]":
-            yield json.loads(line[5:])
+        if chunk := _chunk(line):
+            yield chunk
 
 
 def _error(status: int, payload: bytes) -> dict:
@@ -348,9 +390,13 @@ def _error(status: int, payload: bytes) -> dict:
     return {"type": "error", "error": {"type": kind, "message": message}}
 
 
-def make_server(host: str, port: int, upstream: str) -> ThreadingHTTPServer:
+def make_server(
+    host: str, port: int, upstream: str, parking: Parking | None = None
+) -> ThreadingHTTPServer:
     """A server on host:port for the OpenAI chat server at upstream (host:port)."""
     upstream_host, upstream_port = upstream.rsplit(":", 1)
+    parking = parking or Parking(enabled=False)
+    parking.address = (upstream_host, int(upstream_port))
     # Loom serves one sequence at a time and does not queue: a second generation that
     # overlaps the first makes it reserve 4 GB more, fail and drop the model until
     # restarted. Claude Code sends side requests (titles) alongside its main one.
@@ -377,24 +423,71 @@ def make_server(host: str, port: int, upstream: str) -> ThreadingHTTPServer:
 
     class Handler(BaseHTTPRequestHandler):
         upstream_connection: http.client.HTTPConnection | None = None
+        upstream_response: http.client.HTTPResponse | None = None
         answered = False
 
         def log_message(self, format: str, *args: object) -> None:
             pass  # one line per request would drown the server log
 
         def finish(self) -> None:
-            # Closing tells Loom the client is gone, so it stops generating.
-            if self.upstream_connection:
-                self.upstream_connection.close()
+            self._close_upstream()
             super().finish()
 
-        def _upstream(self, method: str, path: str, body: bytes | None = None):
+        def _close_upstream(self) -> None:
+            # Closing tells Loom the client is gone, so it stops generating.
+            # The response holds the socket open after the connection is closed.
+            if self.upstream_response:
+                self.upstream_response.close()
+                self.upstream_response = None
+            if self.upstream_connection:
+                self.upstream_connection.close()
+                self.upstream_connection = None
+
+        def _upstream(
+            self,
+            method: str,
+            path: str,
+            body: bytes | None = None,
+            headers: dict[str, str] | None = None,
+        ):
+            self._close_upstream()
             self.upstream_connection = http.client.HTTPConnection(
                 upstream_host, int(upstream_port), timeout=3600
             )
-            headers = {"Content-Type": "application/json"} if body is not None else {}
-            self.upstream_connection.request(method, path, body=body, headers=headers)
-            return self.upstream_connection.getresponse()
+            if body is not None:
+                headers = {"Content-Type": "application/json", **(headers or {})}
+            self.upstream_connection.request(
+                method, path, body=body, headers=headers or {}
+            )
+            self.upstream_response = self.upstream_connection.getresponse()
+            return self.upstream_response
+
+        def _generate(self, request: dict) -> tuple[http.client.HTTPResponse, Plan]:
+            """Send a chat request to Loom with the headers that find its parked state."""
+            if _has_images(request):
+                count = {**request, "stream": False}
+                count.pop("stream_options", None)
+                path = "/v1/chat/completions/input_tokens"
+                counted = self._upstream("POST", path, json.dumps(count).encode())
+                if json.loads(counted.read()).get("input_tokens", 0) > IMAGE_TOKENS:
+                    request = _without_images(request)
+            plan = parking.plan(request)
+            body = json.dumps(request).encode()
+            path = "/v1/chat/completions"
+            response = self._upstream("POST", path, body, plan.headers())
+            if response.status in (400, 404) and plan.checkpoint:
+                # The history does not extend the checkpoint, or Loom lost it.
+                response.read()
+                parking.drop(plan)
+                response = self._upstream("POST", path, body, plan.headers())
+            return response, plan
+
+        def _end_stream(self) -> None:
+            # The client sees the end of the stream only when the connection closes,
+            # which waits for the handler. Parking comes after, so half-close now.
+            self.wfile.flush()
+            with contextlib.suppress(OSError):
+                self.connection.shutdown(socket.SHUT_WR)
 
         def _start(self, status: int, content_type: str) -> None:
             self.answered = True
@@ -441,14 +534,18 @@ def make_server(host: str, port: int, upstream: str) -> ThreadingHTTPServer:
         def _message(self, body: dict) -> None:
             model = loom_model()
             request = {**to_openai(body, model["images"]), "model": model["id"]}
-            response = self._upstream(
-                "POST", "/v1/chat/completions", json.dumps(request).encode()
-            )
+            response, plan = self._generate(request)
             if response.status != 200:
                 self._send(response.status, _error(response.status, response.read()))
                 return
             if not request.get("stream"):
-                self._send(200, to_anthropic(json.loads(response.read())))
+                completion = json.loads(response.read())
+                self._send(200, to_anthropic(completion))
+                parking.finish(
+                    plan,
+                    completion["choices"][0].get("finish_reason"),
+                    completion.get("usage"),
+                )
                 return
             self._start(200, "text/event-stream")
             self.send_header("Cache-Control", "no-cache")
@@ -460,14 +557,45 @@ def make_server(host: str, port: int, upstream: str) -> ThreadingHTTPServer:
                     self.wfile.write(event)
                 self.wfile.flush()
             self.wfile.write(b"".join(stream.finish()))
-            self.wfile.flush()
+            self._end_stream()
+            parking.finish(plan, stream.reason, stream.usage)
 
         def _chat(self, request: dict) -> None:
             # Loom answers only to its own model id; clients made for llama-server name
             # any model ("local"), so every request goes to the one model Loom serves.
             request = {**request, "model": loom_model()["id"]}
             request.setdefault("temperature", TEMPERATURE)
-            self._forward("POST", json.dumps(request).encode())
+            response, plan = self._generate(request)
+            self._start(
+                response.status, response.getheader("Content-Type", "application/json")
+            )
+            self.end_headers()
+            reason, usage = None, {}
+            pending = b""  # the unfinished last line of a stream, or a JSON reply
+            for piece in iter(lambda: response.read1(65536), b""):
+                self.wfile.write(piece)
+                self.wfile.flush()
+                pending += piece
+                if request.get("stream"):
+                    *lines, pending = pending.split(b"\n")
+                    for line in lines:
+                        try:
+                            chunk = _chunk(line)
+                        except ValueError:
+                            continue  # the client reads it; parking only wants the end
+                        for choice in (chunk or {}).get("choices", []):
+                            reason = choice.get("finish_reason") or reason
+                        usage = (chunk or {}).get("usage") or usage
+            if not request.get("stream") and response.status == 200:
+                try:
+                    reply = json.loads(pending)
+                    reason = reply["choices"][0].get("finish_reason")
+                    usage = reply.get("usage")
+                except (ValueError, KeyError, IndexError):
+                    pass
+            self._end_stream()
+            if response.status == 200:
+                parking.finish(plan, reason, usage)
 
         def _guarded(self, work) -> None:
             try:
@@ -491,11 +619,18 @@ def make_server(host: str, port: int, upstream: str) -> ThreadingHTTPServer:
                 self._guarded(lambda: self._count(json.loads(raw)))
             elif path == "/v1/messages":
                 with generating:
-                    self._guarded(lambda: self._message(json.loads(raw)))
+                    try:
+                        self._guarded(lambda: self._message(json.loads(raw)))
+                    finally:  # Loom must see this one end before the next starts
+                        self._close_upstream()
             elif path == "/v1/chat/completions":
                 with generating:
-                    self._guarded(lambda: self._chat(json.loads(raw)))
+                    try:
+                        self._guarded(lambda: self._chat(json.loads(raw)))
+                    finally:
+                        self._close_upstream()
             else:
+                parking.forget_live()
                 self._guarded(lambda: self._forward("POST", raw))
 
     return ThreadingHTTPServer((host, port), Handler)

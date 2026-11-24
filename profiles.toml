@@ -16,8 +16,8 @@
 "video" = "${LCT_HOME}/comfyui/data --backend comfyui --port 8188 --extra-args '--disable-pinned-memory --disable-smart-memory --reserve-vram 4'"
 "ornith" = "mradermacher/Huihui-Ornith-1.5-35B-A3B-abliterated-i1-GGUF --file Huihui-Ornith-1.5-35B-A3B-abliterated.i1-IQ4_XS.gguf --no-mmproj --server ${LCT_HOME}/llama.cpp/build-hip/bin/llama-server --env HIP_VISIBLE_DEVICES=0 --ctx 262144 --host 0.0.0.0 --port 6868 --extra-args '-ngl all -fa on -ctk q8_0 -ctv q8_0 -np 1 --jinja'"
 "ornith-vk" = "mradermacher/Huihui-Ornith-1.5-35B-A3B-abliterated-i1-GGUF --file Huihui-Ornith-1.5-35B-A3B-abliterated.i1-IQ4_XS.gguf --no-mmproj --server ${LCT_HOME}/llama.cpp-b12415-vk/llama-server --env GGML_VK_VISIBLE_DEVICES=1 --env GGML_VK_SUBALLOCATION_BLOCK_SIZE=4294967296 --ctx 262144 --host 0.0.0.0 --port 6868 --extra-args '-ngl all -fa on -ctk q8_0 -ctv q8_0 -np 1 -b 2048 -ub 256 --jinja'"
-"inkling" = "${LCT_HOME}/loom/kv8-r2v --backend loom --host 0.0.0.0 --port 6868 --extra-args '--preset=xtx-r2 --device=amdgpu --pool_backing=fixed'"
-"inkling-unbound" = "${LCT_HOME}/loom/kv8-r2vu --backend loom --host 0.0.0.0 --port 6868 --extra-args '--preset=xtx-r2 --device=amdgpu --pool_backing=fixed'"
+"inkling" = "${LCT_HOME}/loom/kv8-r3v --backend loom --host 0.0.0.0 --port 6868 --extra-args '--preset=xtx-park --device=amdgpu --pool_backing=elastic --weight_slab_bytes=32mib'"
+"inkling-unbound" = "${LCT_HOME}/loom/kv8-r3vu --backend loom --host 0.0.0.0 --port 6868 --extra-args '--preset=xtx-park --device=amdgpu --pool_backing=elastic --weight_slab_bytes=32mib'"
 
 [stacks]
 "local" = ["swift-qwen", "side", "embed"]

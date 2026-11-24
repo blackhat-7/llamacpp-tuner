@@ -53,5 +53,22 @@
       "cache_target_bytes": 0,
       "prefix_cache_capacity": 1
     }
+  },
+  "xtx-park": {
+    "service": "chat",
+    "variant": "gguf",
+    "programs": "source",
+    "execution": {
+      "rows": 1,
+      "max_sessions": 1,
+      "context_capacity": 204800,
+      "prefill_capacity": 512,
+      "max_tokens": 32768,
+      "draft_depth": 3,
+      "checkpoint_capacity": 32,
+      "session_cache_capacity": 0,
+      "prefix_cache_capacity": 0,
+      "cache_target_bytes": 0
+    }
   }
 }

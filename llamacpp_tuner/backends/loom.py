@@ -26,6 +26,7 @@ from llamacpp_tuner.backends.base import (
     run_process,
 )
 from llamacpp_tuner.messages import make_server
+from llamacpp_tuner.parking import Parking
 
 # Loom pins 16 MiB of I/O buffers through io_uring. Under Linux's 8 MiB default it
 # still reports ready, then fails every request.
@@ -50,6 +51,22 @@ def _allow_locking() -> None:
             "Loom needs to lock 64 MiB of memory, and only root can let this server "
             "lock more than 8 MiB. 'sudo prlimit' was refused or failed."
         ) from error
+
+
+def _parking(package: Path, args: list[str]) -> Parking | None:
+    """Parking for agents' chats, when the preset lets Loom move them to host RAM.
+
+    Loom pins a chat only into the preset's checkpoint slots, and moves one to host
+    RAM only with elastic memory (its default; profiles may pass fixed).
+    """
+    if "--pool_backing=fixed" in args:
+        return None
+    preset = next((a.split("=", 1)[1] for a in args if a.startswith("--preset=")), "")
+    card = json.loads((package / "model.json").read_text())
+    execution = card.get("presets", {}).get(preset, {}).get("execution", {})
+    slots = execution.get("checkpoint_capacity", 0)
+    # Two slots stay free: a turn pins its new state before releasing the old one.
+    return Parking(limit=slots - 2) if slots > 2 else None
 
 
 def _free_port() -> int:
@@ -118,7 +135,7 @@ def run_loom(
         )
     _allow_locking()
     upstream = f"127.0.0.1:{_free_port()}"
-    server = make_server(host, port, upstream)
+    server = make_server(host, port, upstream, _parking(package, args))
     threading.Thread(
         target=_serve_when_ready,
         args=(server, upstream, f"http://{host}:{port}"),

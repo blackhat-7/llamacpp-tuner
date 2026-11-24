@@ -1,5 +1,6 @@
 """Tests for starting Loom on a model package."""
 
+import json
 import os
 import resource
 import subprocess
@@ -7,7 +8,7 @@ from unittest.mock import patch
 
 import pytest
 
-from llamacpp_tuner.backends.loom import run_loom
+from llamacpp_tuner.backends.loom import _parking, run_loom
 
 MIB = 1024**2
 
@@ -35,7 +36,7 @@ def start(package, limits, sudo=None):
     ):
         run_loom(package, ["--preset=xtx"], env={"A": "1"}, host="0.0.0.0", port=6868)
     # Clients reach the translator on the public port; Loom listens privately.
-    make_server.assert_called_once_with("0.0.0.0", 6868, "127.0.0.1:41000")
+    make_server.assert_called_once_with("0.0.0.0", 6868, "127.0.0.1:41000", None)
     return setrlimit, run, run_process
 
 
@@ -83,3 +84,14 @@ def test_run_loom_needs_a_package_and_loom_serve(tmp_path):
     binary.unlink()
     with pytest.raises(FileNotFoundError, match="hrx-loom"):
         run_loom(package, [])
+
+
+def test_parking_needs_checkpoint_slots_and_elastic_memory(tmp_path):
+    card = {"presets": {"many": {"execution": {"checkpoint_capacity": 32}}, "none": {}}}
+    (tmp_path / "model.json").write_text(json.dumps(card))
+
+    parking = _parking(tmp_path, ["--preset=many", "--device=amdgpu"])
+
+    assert parking is not None and parking.limit == 30
+    assert _parking(tmp_path, ["--preset=many", "--pool_backing=fixed"]) is None
+    assert _parking(tmp_path, ["--preset=none"]) is None
