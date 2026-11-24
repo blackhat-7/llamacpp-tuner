@@ -174,3 +174,7 @@ Prompt chunk 512, not 1,024: at 1,024 restored chats corrupt on long follow-ups.
 ## 2026-11-24: Exact top-k sampling (`tools/spec/topk.py`) is in the package; the Gumbel-coupled drafter is not
 The fast search returns the same 64 candidates in the same order (seeded T=1 text byte-identical) at +29-48% T=1 decode. Coupling the drafter to the sampler's noise was exact but gained -0.6% to +2.1%: kept in `experiments/inkling-loom/sampling/`.
 
+
+## 2026-11-24: No quality traded for speed; the Flash configs drop the tail skip, the 8-bit hyper-connection read and the thinking cap
+The user, after Reddit's critique of greedy speed numbers and expert-tail skipping: no temperature-0 numbers, no tail skip, no other quality-for-speed hacks. The 2026-10-10 rule sat here and the 2026-11-17 one in the agent notes, yet `STRATA_ROUTE_TAIL_SKIP=7` (+3%) and `STRATA_HC_Q8=1` (+1-1.6%) reached the dual configs, so the rule is now in `AGENTS.md` too.
+All four `Strata/strata-swift-*.json` set both to `0` and `reasoning_budget_tokens` to `0` (ends the 2026-10-25 16K cap); rollback `*.before-noskip-2026-11-24`. The Forseti rematch of Flash runs on them.

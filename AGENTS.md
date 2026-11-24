@@ -57,6 +57,7 @@ uv run lct tui         # the terminal UI
 - **Never run long GPU benchmarks unprompted.** The host has crashed under sustained load. Short model loads are fine.
 - Never weaken a test, type or check to get green.
 - **Adopt = reproducible.** A change is adopted only when `engines/` rebuilds it and `profiles.toml` points at it, with a `DECISIONS.md` line. Experiment any way you like first.
+- **Never trade quality for speed.** A speedup must give the same tokens or differ only by rounding (summation order, GPU vs CPU math). No skipped or deferred experts, lower-precision weights, activations or KV, thinking caps or relaxed drafting. Quote speed at temperature 1, what clients get; greedy runs are only for exactness checks. A lossy setting needs the user's OK and a `DECISIONS.md` line.
 
 ## Writing rules
 

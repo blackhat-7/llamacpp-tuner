@@ -59,6 +59,7 @@ The RTX 4070 as expert helper (rounds 12-13, patches 23-33):
 24. `STRATA_NV_PRE_DRAIN=0` switch; the arena pin check samples each layer's ends.
 25. `STRATA_NV_RESERVE_MIB` (default 1536) stays free on the 4070.
 26. Tail skip beside helper GPUs (`STRATA_ROUTE_TAIL_SKIP=7`); per-layer CPU expert counts. Code +3.3%, prose +2.8%.
+    It changes the output, so our configs set it to 0 since 2026-11-24 (`DECISIONS.md`).
 27. `STRATA_NV_EXPDEC=1` turns on EXPDEC in the plugin only.
 28. Helper review fixes.
 29. `STRATA_ADAPT_PROTECT` (protected core); generate mode honours `--adapt-min-gain`; causal-profiling probes. With
