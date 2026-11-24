@@ -177,4 +177,4 @@ The fast search returns the same 64 candidates in the same order (seeded T=1 tex
 
 ## 2026-11-24: No quality traded for speed; the Flash configs drop the tail skip, the 8-bit hyper-connection read and the thinking cap
 The user, after Reddit's critique of greedy speed numbers and expert-tail skipping: no temperature-0 numbers, no tail skip, no other quality-for-speed hacks. The 2026-10-10 rule sat here and the 2026-11-17 one in the agent notes, yet `STRATA_ROUTE_TAIL_SKIP=7` (+3%) and `STRATA_HC_Q8=1` (+1-1.6%) reached the dual configs, so the rule is now in `AGENTS.md` too.
-All four `Strata/strata-swift-*.json` set both to `0` and `reasoning_budget_tokens` to `0` (ends the 2026-10-25 16K cap); rollback `*.before-noskip-2026-11-24`. The Forseti rematch of Flash runs on them.
+Every `Strata/strata-swift-*.json` sets both to `0` and `reasoning_budget_tokens` to `0` (ends the 2026-10-25 16K cap): the four served configs (rollback `*.before-noskip-2026-11-24`) and the test copies (`-mixb-base13`, `-mixb-r13*`, `-hybrid-iq4_xs-dual`). The Forseti rematch of Flash runs on them.
