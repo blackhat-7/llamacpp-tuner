@@ -80,15 +80,18 @@ PY
 
 # Replace $2 (an existing output) with $1 (a fresh build) unless they match.
 install() {
-  local new=$1 dst=$2
+  local new=$1 dst=$2 changes
   if [[ -e $dst ]]; then
-    # Files only in the old output (such as a saved copy of the card) do not make it out of date.
-    if ! diff -rq "$dst" "$new" | grep -qv "^Only in $dst"; then
+    # Files only in the old output (such as a saved copy of the card) do not make it out of date. diff exits 1
+    # on any difference, which under pipefail made the old `diff | grep -qv` test call every output up to date.
+    changes=$(diff -rq "$dst" "$new" | grep -v "^Only in $dst" || true)
+    if [[ -z $changes ]]; then
       echo "$dst is up to date"
       rm -rf "$new"
       return
     fi
-    ((force)) || die "$dst differs from this build; rerun with --force to replace it"
+    ((force)) || die "$dst differs from this build; rerun with --force to replace it:
+$changes"
     rm -rf "$dst"
   fi
   mv "$new" "$dst"
@@ -133,5 +136,19 @@ rm -rf "${out}vu.partial"
 trap 'rm -rf "${out}vu.partial"' EXIT
 cp -al "${out}v" "${out}vu.partial"
 ln -f "$unbound" "${out}vu.partial/parameter/Inkling-2-Mini-UD-Q4_K_XL.gguf"
+# Its own model id, so clients' logs and benchmarks (Forseti keys a model by its name) tell it from the original.
+# The card is a hard link into ${out}v: unlink it before writing.
+rm "${out}vu.partial/model.json"
+"${py[@]}" - "${out}v/model.json" "${out}vu.partial/model.json" <<'PY'
+import json
+import sys
+
+card = json.load(open(sys.argv[1]))
+card["model"]["id"] = "Inkling-2-Mini-Unbound"
+card["model"]["name"] = "Inkling-2-Mini-Unbound v2 (Loom port, GGUF)"
+with open(sys.argv[2], "w") as f:
+    json.dump(card, f, indent=2)
+    f.write("\n")
+PY
 install "${out}vu.partial" "${out}vu"
 trap - EXIT

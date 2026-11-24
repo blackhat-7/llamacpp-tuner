@@ -178,3 +178,7 @@ The fast search returns the same 64 candidates in the same order (seeded T=1 tex
 ## 2026-11-24: No quality traded for speed; the Flash configs drop the tail skip, the 8-bit hyper-connection read and the thinking cap
 The user, after Reddit's critique of greedy speed numbers and expert-tail skipping: no temperature-0 numbers, no tail skip, no other quality-for-speed hacks. The 2026-10-10 rule sat here and the 2026-11-17 one in the agent notes, yet `STRATA_ROUTE_TAIL_SKIP=7` (+3%) and `STRATA_HC_Q8=1` (+1-1.6%) reached the dual configs, so the rule is now in `AGENTS.md` too.
 Every `Strata/strata-swift-*.json` sets both to `0` and `reasoning_budget_tokens` to `0` (ends the 2026-10-25 16K cap): the four served configs (rollback `*.before-noskip-2026-11-24`) and the test copies (`-mixb-base13`, `-mixb-r13*`, `-hybrid-iq4_xs-dual`). The Forseti rematch of Flash runs on them.
+
+## 2026-11-24: Strata loads the patched ROCr again; inkling-unbound serves its own model id
+An unpatched-ROCr abort ended a Forseti try, so the Strata configs point `lib_dirs` at `$LCT_HOME/rocr-7.2.4-fix/lib`, rebuilt by `engines/rocr/build.sh` (the `~/rocm` copy was deleted 2026-11-17).
+`engines/loom/build.sh` gives `kv8-r3vu` the id `Inkling-2-Mini-Unbound`: Forseti keys a model by its name, so the two Inkling packages pooled. Its `install()` never replaced an output (`diff | grep -q` under pipefail); fixed, and `kv8-r3`/`kv8-r3v` then matched the recipe byte for byte.
