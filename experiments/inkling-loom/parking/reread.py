@@ -10,8 +10,8 @@ Turn 3: the client changed the last reply, so Loom must read the whole chat agai
         is released first and the turn completes.
 Then, PAUSE seconds later, Loom's status: the model must be idle or trimming, not failed.
 lct's log should say "live" for turn 2 and "replayed" for turn 3. With PAUSE 0 the status
-call races lct's next pin, and Loom drops the pin's connection: lct turns parking off
-(an open bug in PLAN.md, older than this fix).
+call races lct's next pin: on 2026-11-25 Loom dropped some of those pins (cause unknown);
+lct now sends a dropped call again once, and parking must stay on.
 
 Usage: python reread.py BASE [LINES] [PAUSE]   (BASE = a test lct serve on its own port)
 """

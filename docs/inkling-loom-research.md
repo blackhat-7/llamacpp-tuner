@@ -238,9 +238,12 @@ conversation cache.
   - Loom's row only moves forward (no automatic caches in `xtx-park`): any change in the rendered history, even one
     escaped character in a tool call, means a read from token 0 (~50 s at 108K). Tool arguments must stay as the
     model wrote them: `\u2014` for "—" reused 0 of 5,117 tokens; spaces after `:` do not matter.
-  - A request beside lct's pin right after a re-read (a `/v1/status` in the test) gets the pin's connection
-    dropped and the next DELETE reset; lct then turns parking off until the server restarts. Older than the fix;
-    open in `PLAN.md`.
+  - Loom can close a checkpoint call without an answer: 4 pins right after a re-read, each with a `/v1/status`
+    beside it, in one 20-minute window on 2026-11-25 (io_uring off), and the DELETE sent right after was reset.
+    Not seen since: 0 of 16 such flows, 0 of 80 concurrent calls after re-reads. Cause in Loom unknown. lct used to
+    turn parking off for good on the first drop; now `parking._call` sends a dropped call again once (0.5 s
+    later), and a pin that does not come back 201 is released by name. Loom answers 503 when two checkpoint calls
+    overlap; lct never sends two at once (they run under its generation lock).
 - **Tests.** `experiments/inkling-loom/parking/`: `agents.py` (modes alone / turns / concurrent, `--long`),
   `suffix3.py` (restore + long follow-up vs a fresh read), `worst.py` (near the limit), `claude.sh` (real
   `claude-local --offline -p` sessions at once), `capture.py` (records `/v1/messages` traffic), `reread.py` (the

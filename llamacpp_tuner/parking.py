@@ -20,6 +20,7 @@ from dataclasses import dataclass
 GIB = 1024**3
 FINISHED = ("stop", "tool_calls")  # a turn cut by max_tokens cannot be pinned
 TIMEOUT = 120
+RETRY_PAUSE = 0.5  # seconds before a call Loom dropped goes again
 
 
 def _digest(value: object) -> str:
@@ -172,7 +173,9 @@ class Parking:
             status, pinned = self._call("POST", path, plan.session)
         if status == 405:
             self._disable("Loom has no checkpoint API")
-        if status != 201 or self.disabled:
+            return
+        if status != 201:
+            self._release(name)  # a try Loom dropped may have pinned it anyway
             return
         if pinned.get("position", 0) < self.threshold:
             self._release(name)
@@ -229,6 +232,18 @@ class Parking:
     def _call(
         self, method: str, path: str, session: str | None = None
     ) -> tuple[int, dict]:
+        """One checkpoint call, sent again once if Loom closes it without an answer.
+
+        Loom has dropped single calls and answered the next one (2026-11-25). A
+        second drop raises: then Loom is gone.
+        """
+        try:
+            return self._request(method, path, session)
+        except ConnectionResetError:  # http.client.RemoteDisconnected is one too
+            time.sleep(RETRY_PAUSE)
+            return self._request(method, path, session)
+
+    def _request(self, method: str, path: str, session: str | None) -> tuple[int, dict]:
         headers = {"X-Loom-Model": self.model}
         if session:
             headers["X-Loom-Session"] = session

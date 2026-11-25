@@ -190,3 +190,7 @@ Same speed, io_uring off vs on: code 170-188 vs 170-188 t/s, prose 140-144 vs 14
 ## 2026-11-25: A live turn carries its own pin; tool arguments keep non-ASCII as written
 Loom reads a chat again from token 0 when its rendered history stops matching the row, and a pin held through that read is a second copy in VRAM: with Claude Code's `max_tokens` 32000 an agora chat at ~99K failed the model (reproduced at 107K, memory byte-identical). Now the live request sends its pin as `X-Loom-Checkpoint`: Loom answers 400 first, lct releases the pin, and the re-read fits (same tokens and speed on normal turns).
 The re-reads came from `json.dumps` escaping "—" in tool arguments (0 of 5,117 tokens reused, vs 5,099 of 5,105 as written); `ensure_ascii=False` fixes it.
+
+## 2026-11-25: A checkpoint call Loom drops goes again once; parking turns off only on a second drop
+Loom closed four pin calls without an answer (and reset the DELETE right after) in one 20-minute window, then never again in 16 flows and 80 concurrent calls; Loom's source shows no clear cause. lct used to turn parking off for the server's life on the first drop.
+Now `parking._call` sends a dropped call again after 0.5 s, and `_park` releases a pin that did not come back 201, since a dropped try may have pinned it and a forgotten pin holds VRAM.

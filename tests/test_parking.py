@@ -35,6 +35,8 @@ class LoomState:
     position: int = 10_000
     host_bytes: int = 1000
     suspend_status: int = 200
+    pin_drops: int = 0  # pins closed without an answer, as Loom did on 2026-11-25
+    dropped_pins_stay: bool = False  # Loom pinned before it closed the connection
     chats: list[dict] = field(default_factory=list)  # headers, messages, pins held
     calls: list[tuple[str, str]] = field(default_factory=list)  # checkpoint API
     checkpoints: dict[str, list[dict]] = field(default_factory=dict)  # history
@@ -88,6 +90,15 @@ class FakeLoom(BaseHTTPRequestHandler):
             self._json({"checkpoint": name, "host_snapshot_bytes": state.host_bytes})
         else:
             state.calls.append(("pin", name))
+            if name in state.checkpoints:
+                self._error(409, "checkpoint name is already pinned")
+                return
+            if state.pin_drops:
+                state.pin_drops -= 1
+                if state.dropped_pins_stay:
+                    state.checkpoints[name] = state.last
+                self.close_connection = True
+                return
             if state.reason == "length":
                 self._error(409, "pin requires an idle session with reusable history")
                 return
@@ -295,6 +306,47 @@ def test_a_live_chat_loom_must_read_again_loses_its_pin_before_the_read():
     }
     assert retried["headers"] == {"X-Loom-Session": session}
     assert pinned not in retried["pinned"]  # released before Loom reads it again
+
+
+def test_a_pin_loom_drops_goes_again_and_parking_stays_on(monkeypatch):
+    monkeypatch.setattr("llamacpp_tuner.parking.RETRY_PAUSE", 0)
+    parking = CountingParking()
+    with running(parking) as (base, loom):
+        loom.pin_drops = 1
+        chat(loom, "a")
+
+    name = loom.calls[0][1]
+    assert loom.calls == [("pin", name), ("pin", name)]
+    assert [e.checkpoint for e in parking.entries.values()] == [name]
+    assert not parking.disabled
+
+
+def test_a_pin_loom_made_but_dropped_is_released_and_parking_stays_on(monkeypatch):
+    monkeypatch.setattr("llamacpp_tuner.parking.RETRY_PAUSE", 0)
+    parking = CountingParking()
+    with running(parking) as (base, loom):
+        loom.pin_drops, loom.dropped_pins_stay = 1, True
+        chat(loom, "a")
+        kept = list(loom.calls)
+        chat(loom, "b")
+
+    # The retry finds the name taken, so the pin it cannot account for goes.
+    name = kept[0][1]
+    assert kept == [("pin", name), ("pin", name), ("delete", name)]
+    assert name not in loom.checkpoints
+    assert not parking.disabled
+    assert len(parking.entries) == 1  # the next chat is parked as usual
+
+
+def test_parking_turns_off_when_loom_drops_a_call_twice(monkeypatch):
+    monkeypatch.setattr("llamacpp_tuner.parking.RETRY_PAUSE", 0)
+    parking = CountingParking()
+    with running(parking) as (base, loom):
+        loom.pin_drops = 2
+        chat(loom, "a")
+
+    assert parking.disabled
+    assert parking.entries == {}
 
 
 def test_small_chats_are_not_kept_but_continue_in_loom_s_row():
