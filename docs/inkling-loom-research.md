@@ -238,6 +238,10 @@ conversation cache.
   - Loom's row only moves forward (no automatic caches in `xtx-park`): any change in the rendered history, even one
     escaped character in a tool call, means a read from token 0 (~50 s at 108K). Tool arguments must stay as the
     model wrote them: `\u2014` for "—" reused 0 of 5,117 tokens; spaces after `:` do not matter.
+  - A restore of a chat whose row is past its pin (a cut or stopped turn) makes Loom keep that newer state beside
+    the new reservation, under any session name. Claude Code retries a cut turn with max_tokens 128,000: at 20:27
+    85K + 181K failed the model. lct releases the pin of a turn cut by max_tokens (the retry reads afresh). Esc
+    mid-reply is still open (`PLAN.md`): releasing the pin while that stream ends made Loom hang the next pin.
   - Loom can close a checkpoint call without an answer: 4 pins right after a re-read, each with a `/v1/status`
     beside it, in one 20-minute window on 2026-11-25 (io_uring off), and the DELETE sent right after was reset.
     Not seen since: 0 of 16 such flows, 0 of 80 concurrent calls after re-reads. Cause in Loom unknown. lct used to

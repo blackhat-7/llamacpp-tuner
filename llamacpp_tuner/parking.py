@@ -6,6 +6,11 @@ state as a checkpoint, and moves it to host RAM when another chat takes the row 
 restore takes seconds).
 A conversation is known by its messages: a request that extends the messages of a
 parked turn continues that turn's session.
+A turn cut by max_tokens (or whose pin is refused) leaves Loom's row past the chat's
+pin, and a restore of that pin would make Loom keep the row's newer state beside the
+new request's reservation (2026-11-25: Claude Code retried a cut 85K turn with
+max_tokens 128,000 and Loom failed). So such a turn releases the pin; the next one
+reads afresh.
 """
 
 import contextlib
@@ -160,6 +165,8 @@ class Parking:
         try:
             if finish_reason in FINISHED:
                 self._park(plan)
+            elif finish_reason:  # cut: Loom's row is past the chat's pin now
+                self._forget(plan.session)
         except (OSError, http.client.HTTPException) as error:
             self._disable(f"Loom is not reachable ({error})")
         self._log(plan, usage or {})
@@ -174,11 +181,10 @@ class Parking:
         if status == 405:
             self._disable("Loom has no checkpoint API")
             return
-        if status != 201:
-            self._release(name)  # a try Loom dropped may have pinned it anyway
-            return
-        if pinned.get("position", 0) < self.threshold:
+        # A refused pin is released too: a try Loom dropped may have pinned it anyway.
+        if status != 201 or pinned.get("position", 0) < self.threshold:
             self._release(name)
+            self._forget(plan.session)  # the row is past the chat's old pin
             return
         old = self.entries.get(plan.session)
         entry = Entry(plan.session, name, plan.digests, 0, time.monotonic())
@@ -200,8 +206,7 @@ class Parking:
             entry.host_bytes = parked.get("host_snapshot_bytes") or 1
             self._trim()
             return
-        del self.entries[entry.session]
-        self._release(entry.checkpoint)
+        self._forget(entry.session)
         if status == 400:
             self._disable("Loom's memory is fixed, so states cannot leave VRAM")
 
@@ -212,10 +217,13 @@ class Parking:
         ):
             self._evict_oldest()
 
+    def _forget(self, session: str) -> None:
+        entry = self.entries.pop(session, None)
+        if entry:
+            self._release(entry.checkpoint)
+
     def _evict_oldest(self) -> None:
-        entry = min(self.entries.values(), key=lambda e: e.used)
-        del self.entries[entry.session]
-        self._release(entry.checkpoint)
+        self._forget(min(self.entries.values(), key=lambda e: e.used).session)
 
     def _release(self, name: str) -> None:
         # If this fails, Loom frees it at restart; the table no longer lists it.

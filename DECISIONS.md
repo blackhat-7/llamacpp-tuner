@@ -194,3 +194,7 @@ The re-reads came from `json.dumps` escaping "—" in tool arguments (0 of 5,117
 ## 2026-11-25: A checkpoint call Loom drops goes again once; parking turns off only on a second drop
 Loom closed four pin calls without an answer (and reset the DELETE right after) in one 20-minute window, then never again in 16 flows and 80 concurrent calls; Loom's source shows no clear cause. lct used to turn parking off for the server's life on the first drop.
 Now `parking._call` sends a dropped call again after 0.5 s, and `_park` releases a pin that did not come back 201, since a dropped try may have pinned it and a forgotten pin holds VRAM.
+
+## 2026-11-25: A turn cut by max_tokens releases its chat's pin, so a retry reads afresh
+Loom failed again at 20:27: Claude Code retried a turn cut at 32,000 output tokens (85K row) with max_tokens 128,000; lct restored the chat's older pin (52K), and Loom kept the row's newer state beside the 181K reservation. A fresh read lets Loom drop the row first (near the 204,800 cap: peak 25.21 vs 25.35 GB, the gap being the cut output).
+Rejected: restoring under a new session name (Loom still kept the row: 25.35 GB) and releasing the pin when a client leaves mid-stream (Loom then hung or reset the next pin call, 4 of 4 through lct).

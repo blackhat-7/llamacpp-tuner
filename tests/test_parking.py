@@ -36,6 +36,7 @@ class LoomState:
     host_bytes: int = 1000
     suspend_status: int = 200
     pin_drops: int = 0  # pins closed without an answer, as Loom did on 2026-11-25
+    pin_refusals: int = 0  # pins answered 409, as for a busy session
     dropped_pins_stay: bool = False  # Loom pinned before it closed the connection
     chats: list[dict] = field(default_factory=list)  # headers, messages, pins held
     calls: list[tuple[str, str]] = field(default_factory=list)  # checkpoint API
@@ -98,6 +99,10 @@ class FakeLoom(BaseHTTPRequestHandler):
                 if state.dropped_pins_stay:
                     state.checkpoints[name] = state.last
                 self.close_connection = True
+                return
+            if state.pin_refusals:
+                state.pin_refusals -= 1
+                self._error(409, "pin requires an idle session with reusable history")
                 return
             if state.reason == "length":
                 self._error(409, "pin requires an idle session with reusable history")
@@ -236,21 +241,41 @@ def test_a_chat_moves_to_host_ram_when_another_takes_the_row():
     assert [e.host_bytes for e in parking.entries.values()] == [1000, 0]
 
 
-def test_a_turn_cut_by_length_is_not_pinned_and_the_old_state_stays():
+def test_a_cut_turn_releases_the_chat_s_pin_so_a_retry_reads_afresh():
     parking = CountingParking()
     with running(parking) as (base, loom):
         chat(loom, "a")
         loom.reason = "length"
-        chat(loom, "a", "cut")
-        kept = list(loom.calls)
+        chat(loom, "a", "more")  # cut: Loom's row is past the first turn's pin now
+        released = list(loom.calls)
         loom.reason = "stop"
-        chat(loom, "a", "again")
+        chat(loom, "a", "more")  # Claude Code retries a cut turn, max_tokens 128,000
 
-    pinned = loom.calls[0][1]
-    assert kept == [("pin", pinned)]  # the cut turn is not pinned at all
-    # The edited chat goes back to the first turn's state, still pinned in VRAM.
-    assert sent(loom)["X-Loom-Checkpoint"] == pinned
-    assert ("suspend", pinned) not in loom.calls
+    pinned = released[0][1]
+    assert released == [("pin", pinned), ("delete", pinned)]
+    first, _, retry = loom.chats
+    # A restore of that pin made Loom keep the cut turn's state beside the retry's
+    # reservation (2026-11-25: 85K + 181K failed the model). A fresh read lets it go.
+    assert retry["headers"]["X-Loom-Session"] != first["headers"]["X-Loom-Session"]
+    assert "X-Loom-Checkpoint" not in retry["headers"]
+    assert retry["pinned"] == set()
+
+
+def test_a_refused_pin_releases_the_chat_s_older_pin():
+    parking = CountingParking()
+    with running(parking) as (base, loom):
+        chat(loom, "a")
+        loom.pin_refusals = 1
+        chat(loom, "a", "more")
+
+    first, second = loom.calls[0][1], loom.calls[1][1]
+    assert loom.calls == [
+        ("pin", first),
+        ("pin", second),
+        ("delete", second),
+        ("delete", first),
+    ]
+    assert parking.entries == {}
 
 
 def test_a_checkpoint_loom_refuses_is_dropped_and_the_request_retried():

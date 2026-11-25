@@ -17,5 +17,6 @@ for example `lct serve $LCT_HOME/loom/kv8-r3v --backend loom --port 6890 --extra
 - `reread.py BASE [LINES] [PAUSE]` (2026-11-25): the crash path through `/v1/messages`. A ~108K chat ends in a
   tool call with "—"; the tool result must reuse the row (cached ~ all); then an edited reply forces a full re-read
   with `max_tokens` 32000, which must complete (the old lct held the pin through it and Loom failed the model).
+- `esc.py BASE` (2026-11-25): Esc mid-reply, then a follow-up; parking must stay on. Open in `PLAN.md`.
 - `capture.py OUTDIR`: a proxy on :6891 that saves each `/v1/messages` request and reply, to check replies for
   garbage or compare what a client sends back with what the model wrote.
