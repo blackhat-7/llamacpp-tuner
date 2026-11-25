@@ -89,11 +89,16 @@ def _assistant(blocks: list[dict]) -> dict:
     thinking = "".join(b["thinking"] for b in blocks if b.get("type") == "thinking")
     if thinking:
         message["reasoning_content"] = thinking
+    # Loom compares the history with the tokens the model wrote, which keep "—".
+    # Escaped as "\u2014" it does not match, and Loom reads the whole chat again.
     calls = [
         {
             "id": b["id"],
             "type": "function",
-            "function": {"name": b["name"], "arguments": json.dumps(b["input"])},
+            "function": {
+                "name": b["name"],
+                "arguments": json.dumps(b["input"], ensure_ascii=False),
+            },
         }
         for b in blocks
         if b.get("type") == "tool_use"

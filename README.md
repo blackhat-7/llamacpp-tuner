@@ -143,7 +143,7 @@ uv venv --python 3.12 ~/loom/venv && uv pip install --python ~/loom/venv/bin/pyt
 lct serve ~/loom/Inkling-2-Mini --backend loom --port 6868 --extra-args '--preset=chat --device=amdgpu'
 ```
 
-- Loom pins 16 MiB for its I/O, but Linux lets a program lock only 8 MiB, and only root can raise that. So lct runs `sudo prlimit` on its own process just before it starts Loom: one approval per start, for that server only, and nothing is written to system files.
+- Loom's AMD driver pins 16 MiB of file-reading buffers through io_uring, but Linux lets a program lock only 8 MiB. So lct starts Loom with io_uring turned off (a seccomp filter on that server only): Loom then reads files with plain calls, pins nothing and runs at the same speed. No sudo, and nothing is written to system files.
 - Loom serves only the OpenAI API, under the package's model id. lct runs Loom on a private port and serves the public one itself: it adds Anthropic's `/v1/messages` and `/v1/messages/count_tokens` (for Claude Code) and llama.cpp's `meta.n_ctx` in `/v1/models`, and forwards everything else.
 - Loom generates one sequence at a time and drops its model when two generations overlap, so lct sends it one at a time and queues the rest.
 

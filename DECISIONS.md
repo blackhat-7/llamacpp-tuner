@@ -182,3 +182,11 @@ Every `Strata/strata-swift-*.json` sets both to `0` and `reasoning_budget_tokens
 ## 2026-11-24: Strata loads the patched ROCr again; inkling-unbound serves its own model id
 An unpatched-ROCr abort ended a Forseti try, so the Strata configs point `lib_dirs` at `$LCT_HOME/rocr-7.2.4-fix/lib`, rebuilt by `engines/rocr/build.sh` (the `~/rocm` copy was deleted 2026-11-17).
 `engines/loom/build.sh` gives `kv8-r3vu` the id `Inkling-2-Mini-Unbound`: Forseti keys a model by its name, so the two Inkling packages pooled. Its `install()` never replaced an output (`diff | grep -q` under pipefail); fixed, and `kv8-r3`/`kv8-r3v` then matched the recipe byte for byte.
+
+## 2026-11-25: Loom runs without io_uring, so starting it needs no sudo
+Loom's AMD driver pins 16 MiB of file-staging buffers through io_uring (8 × 2 MiB, fixed in hrx-system 0.2.0), past Linux's 8 MiB default. `backends/loom.py` gives Loom a seccomp filter that fails `io_uring_setup` with ENOSYS; its runtime then uses plain I/O and pins nothing.
+Same speed, io_uring off vs on: code 170-188 vs 170-188 t/s, prose 140-144 vs 140-144, a 16K read 6.94 vs 6.95 s. Replaces the 2026-11-22 `sudo prlimit` at every start; system files stay untouched.
+
+## 2026-11-25: A live turn carries its own pin; tool arguments keep non-ASCII as written
+Loom reads a chat again from token 0 when its rendered history stops matching the row, and a pin held through that read is a second copy in VRAM: with Claude Code's `max_tokens` 32000 an agora chat at ~99K failed the model (reproduced at 107K, memory byte-identical). Now the live request sends its pin as `X-Loom-Checkpoint`: Loom answers 400 first, lct releases the pin, and the re-read fits (same tokens and speed on normal turns).
+The re-reads came from `json.dumps` escaping "—" in tool arguments (0 of 5,117 tokens reused, vs 5,099 of 5,105 as written); `ensure_ascii=False` fixes it.

@@ -1,16 +1,14 @@
 """Tests for starting Loom on a model package."""
 
+import errno
 import json
-import os
-import resource
 import subprocess
+import sys
 from unittest.mock import patch
 
 import pytest
 
 from llamacpp_tuner.backends.loom import _parking, run_loom
-
-MIB = 1024**2
 
 
 def make_package(root):
@@ -23,12 +21,10 @@ def make_package(root):
     return package, binary
 
 
-def start(package, limits, sudo=None):
-    """run_loom with the given (soft, hard) memory-lock limits; nothing real runs."""
+def start(package):
+    """run_loom with nothing real running."""
     with (
-        patch("llamacpp_tuner.backends.loom.resource.getrlimit", return_value=limits),
-        patch("llamacpp_tuner.backends.loom.resource.setrlimit") as setrlimit,
-        patch("llamacpp_tuner.backends.loom.subprocess.run", side_effect=sudo) as run,
+        patch("llamacpp_tuner.backends.loom._without_io_uring") as without_io_uring,
         patch("llamacpp_tuner.backends.loom._free_port", return_value=41000),
         patch("llamacpp_tuner.backends.loom.make_server") as make_server,
         patch("llamacpp_tuner.backends.loom.threading.Thread"),
@@ -37,17 +33,15 @@ def start(package, limits, sudo=None):
         run_loom(package, ["--preset=xtx"], env={"A": "1"}, host="0.0.0.0", port=6868)
     # Clients reach the translator on the public port; Loom listens privately.
     make_server.assert_called_once_with("0.0.0.0", 6868, "127.0.0.1:41000", None)
-    return setrlimit, run, run_process
+    return without_io_uring, run_process
 
 
-def test_run_loom_serves_the_package_with_its_venv(tmp_path):
+def test_run_loom_serves_the_package_with_its_venv_without_io_uring(tmp_path):
     package, binary = make_package(tmp_path)
 
-    setrlimit, sudo, run_process = start(package, (8 * MIB, 64 * MIB))
+    without_io_uring, run_process = start(package)
 
-    # A high enough ceiling needs no sudo: only this server's soft limit goes up.
-    setrlimit.assert_called_once_with(resource.RLIMIT_MEMLOCK, (64 * MIB, 64 * MIB))
-    sudo.assert_not_called()
+    without_io_uring.assert_called_once_with()
     assert run_process.call_args.args[0] == [
         str(binary),
         f"--model={package}",
@@ -57,24 +51,27 @@ def test_run_loom_serves_the_package_with_its_venv(tmp_path):
     assert run_process.call_args.kwargs == {"env": {"A": "1"}, "cwd": tmp_path}
 
 
-def test_run_loom_asks_sudo_to_raise_its_own_low_ceiling(tmp_path):
-    package, _ = make_package(tmp_path)
-
-    _, sudo, run_process = start(package, (8 * MIB, 8 * MIB))
-
-    sudo.assert_called_once_with(
-        ["sudo", "prlimit", "--pid", str(os.getpid()), "--memlock=67108864:67108864"],
-        check=True,
+def test_the_programs_lct_starts_get_enosys_from_io_uring_setup_only():
+    # The filter cannot be taken off, so a child process sets it and starts the probe,
+    # as lct serve starts Loom.
+    probe = (
+        "import ctypes, os\n"
+        "libc = ctypes.CDLL(None, use_errno=True)\n"
+        "result = libc.syscall(425, 1, ctypes.create_string_buffer(120))\n"
+        "print(result, ctypes.get_errno(), os.getpid() > 0)\n"
     )
-    run_process.assert_called_once()
+    parent = (
+        "import subprocess, sys\n"
+        "from llamacpp_tuner.backends.loom import _without_io_uring\n"
+        "_without_io_uring()\n"
+        f"subprocess.run([sys.executable, '-c', {probe!r}], check=True)\n"
+    )
 
+    out = subprocess.run(
+        [sys.executable, "-c", parent], capture_output=True, text=True, check=True
+    )
 
-def test_run_loom_stops_when_sudo_is_refused(tmp_path):
-    package, _ = make_package(tmp_path)
-    refused = subprocess.CalledProcessError(1, "sudo")
-
-    with pytest.raises(RuntimeError, match="refused"):
-        start(package, (8 * MIB, 8 * MIB), sudo=refused)
+    assert out.stdout.split() == ["-1", str(errno.ENOSYS), "True"]
 
 
 def test_run_loom_needs_a_package_and_loom_serve(tmp_path):

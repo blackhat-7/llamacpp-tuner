@@ -164,10 +164,12 @@ generator had no `inkling2v` family, so the upstream package was text-only. `kv8
 - **Two overlapping generations make Loom reserve 4 GB more, fail and drop its model until restart** (reproduced
   with two plain requests). Claude Code sends side requests beside the main one, so the translator queues
   generations. Token counting beside a generation is safe.
-- Loom pins 16 MiB through io_uring. Under Linux's 8 MiB default it reports ready and then fails every request.
-  lct runs `sudo prlimit` on its own process when the ceiling is below 64 MiB: one approval per start, nothing on
-  disk (the user wants no system-file edits). A capability on `loom-serve` does not work: it loads its libraries
-  through `$ORIGIN`.
+- Loom's AMD driver pins 16 MiB of file-staging buffers through io_uring (`file_staging_allocate(..., 8, 2 MiB)` in
+  hrx-system 0.2.0's `gpu/device.c`, no flag). Under Linux's 8 MiB default the pin fails with ENOMEM on the first
+  request and Loom fails the model (`RESOURCE_EXHAUSTED`). Since 2026-11-25 lct starts Loom under a seccomp filter
+  that fails `io_uring_setup` with ENOSYS; IREE then falls back to plain I/O, pins nothing (VmPin 0) and runs at
+  the same speed. No sudo, no system-file edits (the user's rule). Until then lct ran `sudo prlimit` at each start.
+  A capability on `loom-serve` does not work: it loads its libraries through `$ORIGIN`.
 - Loom accepts only its own model id (`Inkling-2-Mini`) and lists it about 5 s after its own ready line. Clients made
   for llama-server name any model (birbot's Hermes sent `local` and got 404), so the translator sends every request to
   the one model Loom serves.
@@ -197,8 +199,9 @@ conversation cache.
 - **How.** `llamacpp_tuner/parking.py`: a chat is known by its messages (one digest each); a request extending a
   parked turn continues that session. After each finished turn lct pins the state (`POST /v1/checkpoints/NAME`,
   10-60 ms) and releases the previous pin; when another chat takes the row it moves the pin to host RAM
-  (`.../suspend`); the next turn sends `X-Loom-Checkpoint` and Loom copies it back. A history that no longer
-  extends the checkpoint gets 400 before any work: lct drops it and re-reads. Small chats (< 4,096 tokens) are not
+  (`.../suspend`); the next turn sends `X-Loom-Checkpoint` and Loom copies it back. A turn that goes on in the row
+  sends its own pin too (2026-11-25). A history that no longer extends the checkpoint gets 400 before any work:
+  lct releases it and re-reads. Small chats (< 4,096 tokens) are not
   kept; 30 chats or 40 GiB at most, oldest out first. `backends/loom.py` turns it on only for presets with
   checkpoint slots and elastic memory.
 - **Loom side.** Preset `xtx-park`: 204,800 tokens a chat, `max_sessions` 1 (Loom itself queues a second
@@ -212,7 +215,14 @@ conversation cache.
   robin of 4 agents: 166 s vs 161 s alone (re-reads would take ~430 s). A lone agent's next turn starts in
   0.1-0.8 s: its pin stays in VRAM until another chat needs the row.
 - **Limits.** Prompt + `max_tokens` over 204,800 gets a clean 400. An image request at ~190K gets a clean 503 (the
-  image component needs ~0.5 GB more). Physical limit ~227K tokens (VRAM full, then Loom fails the model).
+  image component needs ~0.5 GB more). Physical limit ~227-232K tokens (20.78 GB idle of a 25.75 GB pool, 21.4 KB a
+  token; VRAM full, then Loom fails the model). Loom reserves prompt + `max_tokens` before the first token (30K of
+  output: +0.67 GB at once), so Claude Code's 32,000 counts in full.
+- **Two copies of one chat (fixed 2026-11-25).** A pin held while Loom reads the same chat again keeps the old
+  state: +0.74 GB at 28K. An agora chat at ~99K (pin ~99K + re-read ~99K + 32K reserved) failed the model, the
+  503 "model is unavailable" until a restart; reproduced at 107K with byte-identical pool numbers (committed /
+  cached / peak 25.501 / 25.166 / 25.549 GB). The live turn's pin now goes with it, so Loom refuses first and lct
+  releases the pin: the re-read peaks at one copy. Check: `experiments/inkling-loom/parking/reread.py`.
 - **Gotchas.**
   - With 1,024-token prompt chunks a restored chat (or one that goes on while its pin is in VRAM) corrupts on a
     follow-up longer than one chunk: the answer turns to symbols. 512 is clean on every path; the stock package at
@@ -221,11 +231,20 @@ conversation cache.
   - `--memory_bytes` makes Loom wait forever for memory near the budget (0% GPU, no error) instead of refusing;
     without it Loom fails the model past the physical limit. Neither is used: the 204,800 limit keeps one chat
     below the measured ~227K.
-  - Suspend copies run behind the HTTP answer; a pin or restore right after a big suspend can wait 1-4 s.
-  - Loom never pins the host copy (VmPin stays 16 MiB even with unlimited memlock), so copies run at ~1-2 GB/s.
+  - Suspend copies run behind the HTTP answer; a pin or restore right after a big suspend can wait 1-4 s. A suspend
+    still copying does not add to the next chat's peak (measured at 28K).
+  - Loom never pins the host copy (VmPin was 16 MiB with io_uring even with unlimited memlock, 0 without), so
+    copies run at ~1-2 GB/s.
+  - Loom's row only moves forward (no automatic caches in `xtx-park`): any change in the rendered history, even one
+    escaped character in a tool call, means a read from token 0 (~50 s at 108K). Tool arguments must stay as the
+    model wrote them: `\u2014` for "—" reused 0 of 5,117 tokens; spaces after `:` do not matter.
+  - A request beside lct's pin right after a re-read (a `/v1/status` in the test) gets the pin's connection
+    dropped and the next DELETE reset; lct then turns parking off until the server restarts. Older than the fix;
+    open in `PLAN.md`.
 - **Tests.** `experiments/inkling-loom/parking/`: `agents.py` (modes alone / turns / concurrent, `--long`),
   `suffix3.py` (restore + long follow-up vs a fresh read), `worst.py` (near the limit), `claude.sh` (real
-  `claude-local --offline -p` sessions at once), `capture.py` (records `/v1/messages` traffic).
+  `claude-local --offline -p` sessions at once), `capture.py` (records `/v1/messages` traffic), `reread.py` (the
+  2026-11-25 crash path: a non-ASCII tool call, then a forced re-read at ~108K).
 
 ## Temperature 1 sampling (2026-11-24)
 

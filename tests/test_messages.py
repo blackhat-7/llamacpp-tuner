@@ -88,6 +88,23 @@ def test_request_becomes_an_openai_chat_request():
     assert request["stream_options"] == {"include_usage": True}
 
 
+def test_tool_arguments_keep_the_characters_the_model_wrote():
+    call = {"type": "tool_use", "id": "t1", "name": "post", "input": {"t": "Up — 10%"}}
+    body = {
+        "model": "m",
+        "max_tokens": 9,
+        "messages": [
+            {"role": "user", "content": "Post it"},
+            {"role": "assistant", "content": [call]},
+        ],
+    }
+
+    calls = to_openai(body)["messages"][-1]["tool_calls"]
+
+    # "\u2014" would not match the model's tokens, and Loom would read the chat again.
+    assert calls[0]["function"]["arguments"] == '{"t": "Up — 10%"}'
+
+
 def test_completion_becomes_a_message():
     completion = {
         "model": "m",

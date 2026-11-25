@@ -93,7 +93,7 @@ UD-Q4_K_XL (16.4 GiB), greedy, decode t/s over all generated tokens (the model a
   - New decode attention kernel `g_ink_attn_split_v2` that loads each key once for all 3 query heads. At 195K it reads 855 GB/s with f16 (was 541) and 750 GB/s with int8. Decode and verify both use it.
   - The drafter attends only to the last 4,096 tokens: 13.45 → 0.19 ms per pass at 195K, with acceptance unchanged. 64K drafter on: 114 / 104.
   - Kernels and benches are in `tmp/loom/attn-bench/`.
-- Serving the tuned package needs `sudo prlimit --pid <shell pid> --memlock=unlimited:unlimited` first; the 8 MB default fails the load. It uses 25.17 of 25.75 GB at 196K.
+- Loom pins 16 MiB through io_uring, and the 8 MiB memlock default fails the first request. `lct serve` turns io_uring off for Loom (same speed, no sudo); a bare `loom-serve` needs the same, e.g. `systemd-run --user -p SystemCallFilter=~io_uring_setup -p SystemCallErrorNumber=ENOSYS ...`. It uses 25.17 of 25.75 GB at 196K.
 - The prefix cache reuses a growing chat (a 64K follow-up starts in 2 s, not 29 s), but not a new question on the same document.
 - The shipped package fits 196K only with f16 KV, no drafter and the prefix cache off.
 - Not integrated: `attn-bench/spa_p4.loom`, a verify kernel that shares K/V loads across 2 tokens (~0.2 ms/layer less at 195K, about +8%).

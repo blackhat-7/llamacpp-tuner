@@ -7,12 +7,12 @@ Loom listens on a private port; lct serves the public one through messages.py,
 which adds the Anthropic API that Claude Code needs.
 """
 
+import ctypes
+import errno
 import json
-import os
-import resource
 import shlex
 import socket
-import subprocess
+import struct
 import threading
 import time
 import urllib.request
@@ -28,29 +28,40 @@ from llamacpp_tuner.backends.base import (
 from llamacpp_tuner.messages import make_server
 from llamacpp_tuner.parking import Parking
 
-# Loom pins 16 MiB of I/O buffers through io_uring. Under Linux's 8 MiB default it
-# still reports ready, then fails every request.
-MIN_MEMLOCK = 64 * 1024**2
+IO_URING_SETUP = 425  # the same number on every architecture
+PR_SET_NO_NEW_PRIVS, PR_SET_SECCOMP, SECCOMP_MODE_FILTER = 38, 22, 2
 
 
-def _allow_locking() -> None:
-    """Let this process, and the server it starts, lock MIN_MEMLOCK of memory."""
-    _, ceiling = resource.getrlimit(resource.RLIMIT_MEMLOCK)
-    if ceiling == resource.RLIM_INFINITY or ceiling >= MIN_MEMLOCK:
-        resource.setrlimit(resource.RLIMIT_MEMLOCK, (MIN_MEMLOCK, ceiling))
-        return
-    # Only root may raise the ceiling. prlimit changes this process alone, until it
-    # exits, so no system file has to allow more for every program.
-    limit = f"--memlock={MIN_MEMLOCK}:{MIN_MEMLOCK}"
-    try:
-        subprocess.run(
-            ["sudo", "prlimit", "--pid", str(os.getpid()), limit], check=True
+def _without_io_uring() -> None:
+    """Make io_uring_setup fail with ENOSYS in this thread and what it starts.
+
+    Loom's AMD driver pins 16 MiB of file-reading buffers through io_uring, past
+    Linux's 8 MiB default, and then fails every request. Without io_uring it reads
+    with plain calls and pins nothing, at the same speed (2026-11-25), so no sudo is
+    needed to raise the limit.
+    """
+
+    def instruction(code: int, true: int, false: int, k: int) -> bytes:
+        return struct.pack("=HBBI", code, true, false, k)
+
+    program = b"".join(
+        (
+            instruction(0x20, 0, 0, 0),  # load the syscall number
+            instruction(0x15, 0, 1, IO_URING_SETUP),  # if io_uring_setup:
+            instruction(0x06, 0, 0, 0x00050000 | errno.ENOSYS),  # fail with ENOSYS
+            instruction(0x06, 0, 0, 0x7FFF0000),  # else allow
         )
-    except (OSError, subprocess.CalledProcessError) as error:
-        raise RuntimeError(
-            "Loom needs to lock 64 MiB of memory, and only root can let this server "
-            "lock more than 8 MiB. 'sudo prlimit' was refused or failed."
-        ) from error
+    )
+
+    class Program(ctypes.Structure):
+        _fields_ = [("length", ctypes.c_ushort), ("filter", ctypes.c_char_p)]
+
+    libc = ctypes.CDLL(None, use_errno=True)
+    filter_ = Program(len(program) // 8, program)
+    if libc.prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) or libc.prctl(
+        PR_SET_SECCOMP, SECCOMP_MODE_FILTER, ctypes.byref(filter_), 0, 0
+    ):
+        raise OSError(ctypes.get_errno(), "Could not turn off io_uring for Loom")
 
 
 def _parking(package: Path, args: list[str]) -> Parking | None:
@@ -133,7 +144,6 @@ def run_loom(
         raise FileNotFoundError(
             f"loom-serve is missing: install hrx-loom into the venv {binary.parents[1]}."
         )
-    _allow_locking()
     upstream = f"127.0.0.1:{_free_port()}"
     server = make_server(host, port, upstream, _parking(package, args))
     threading.Thread(
@@ -142,6 +152,7 @@ def run_loom(
         daemon=True,
     ).start()
     command = [str(binary), f"--model={package}", f"--listen={upstream}", *args]
+    _without_io_uring()  # this thread starts Loom, which inherits the filter
     run_process(command, env=env, cwd=package.parent)
 
 

@@ -66,7 +66,7 @@ class Plan:
     session: str
     how: str  # new, live (still in Loom's row), restored or replayed
     digests: list[str]
-    checkpoint: str | None = None  # sent only when the state is not in the row
+    checkpoint: str | None = None  # the parked state this request must extend
 
     def headers(self) -> dict[str, str]:
         if not self.session:
@@ -128,7 +128,11 @@ class Parking:
         if best and best.session not in self.entries:  # evicted to make room
             best = None
         if live and in_row:
-            return Plan(live, "live", digests)
+            # The chat's own pin goes along. If Loom would have to read the chat again
+            # (its rendered history changed), it refuses first, and lct releases the
+            # pin before the re-read: a pin held through it is a second copy in VRAM.
+            own = self.entries.get(live)
+            return Plan(live, "live", digests, own.checkpoint if own else None)
         if not best:
             return Plan(f"lct-{uuid.uuid4().hex[:16]}", "new", digests)
         return Plan(best.session, "restored", digests, best.checkpoint)

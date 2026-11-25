@@ -14,5 +14,8 @@ for example `lct serve $LCT_HOME/loom/kv8-r3v --backend loom --port 6890 --extra
 - `worst.py BASE FRACTION`: near the 204,800 limit: a ~190K chat parked and restored, an image at full depth, a
   request over the limit.
 - `claude.sh [N]`: N real `claude-local --offline -p` sessions at once on :6890, read-only tools.
+- `reread.py BASE [LINES] [PAUSE]` (2026-11-25): the crash path through `/v1/messages`. A ~108K chat ends in a
+  tool call with "—"; the tool result must reuse the row (cached ~ all); then an edited reply forces a full re-read
+  with `max_tokens` 32000, which must complete (the old lct held the pin through it and Loom failed the model).
 - `capture.py OUTDIR`: a proxy on :6891 that saves each `/v1/messages` request and reply, to check replies for
   garbage or compare what a client sends back with what the model wrote.

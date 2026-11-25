@@ -35,7 +35,7 @@ class LoomState:
     position: int = 10_000
     host_bytes: int = 1000
     suspend_status: int = 200
-    chats: list[dict] = field(default_factory=list)  # headers and messages
+    chats: list[dict] = field(default_factory=list)  # headers, messages, pins held
     calls: list[tuple[str, str]] = field(default_factory=list)  # checkpoint API
     checkpoints: dict[str, list[dict]] = field(default_factory=dict)  # history
     last: list[dict] = field(default_factory=list)
@@ -97,7 +97,13 @@ class FakeLoom(BaseHTTPRequestHandler):
     def _chat(self, body):
         state = self.state
         headers = {k: v for k, v in self.headers.items() if k.startswith("X-Loom")}
-        state.chats.append({"headers": headers, "messages": body["messages"]})
+        state.chats.append(
+            {
+                "headers": headers,
+                "messages": body["messages"],
+                "pinned": set(state.checkpoints),
+            }
+        )
         name = headers.get("X-Loom-Checkpoint")
         if name:
             history = state.checkpoints.get(name)
@@ -187,12 +193,13 @@ def test_a_chat_is_new_then_live_then_restored():
         chat(loom, "a", "more", "again")
 
     first, second, other, restored = (c["headers"] for c in loom.chats)
+    pins = [name for call, name in loom.calls if call == "pin"]
     assert "X-Loom-Checkpoint" not in first
     assert second["X-Loom-Session"] == first["X-Loom-Session"]
-    assert "X-Loom-Checkpoint" not in second  # still in Loom's row
+    # Still in Loom's row; its own pin goes along, so Loom refuses a re-read first.
+    assert second["X-Loom-Checkpoint"] == pins[0]
     assert other["X-Loom-Session"] != first["X-Loom-Session"]
     assert restored["X-Loom-Session"] == first["X-Loom-Session"]
-    pins = [name for call, name in loom.calls if call == "pin"]
     assert restored["X-Loom-Checkpoint"] == pins[1]  # the second turn's state
 
 
@@ -262,6 +269,32 @@ def test_a_checkpoint_loom_refuses_is_dropped_and_the_request_retried():
     assert retried["headers"]["X-Loom-Session"] == refused["headers"]["X-Loom-Session"]
     assert reply["choices"][0]["message"] == REPLY
     assert ("delete", refused["headers"]["X-Loom-Checkpoint"]) in loom.calls
+
+
+def test_a_live_chat_loom_must_read_again_loses_its_pin_before_the_read():
+    parking = CountingParking()
+    with running(parking) as (base, loom):
+        chat(loom, "a")
+        # Same messages for lct, but the reply differs from what Loom holds, so Loom
+        # would read the whole chat again. A pin held through that read is a second
+        # copy of the chat in VRAM (2026-11-25: Loom failed at ~99K tokens).
+        changed = [
+            {"role": "user", "content": "a"},
+            {"role": "assistant", "content": "Changed"},
+            {"role": "user", "content": "more"},
+        ]
+        post(f"{base}/v1/chat/completions", {"model": "local", "messages": changed})
+        settle(loom)
+
+    pinned = loom.calls[0][1]
+    first, refused, retried = loom.chats
+    session = first["headers"]["X-Loom-Session"]
+    assert refused["headers"] == {
+        "X-Loom-Session": session,
+        "X-Loom-Checkpoint": pinned,
+    }
+    assert retried["headers"] == {"X-Loom-Session": session}
+    assert pinned not in retried["pinned"]  # released before Loom reads it again
 
 
 def test_small_chats_are_not_kept_but_continue_in_loom_s_row():
