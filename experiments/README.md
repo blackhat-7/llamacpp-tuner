@@ -15,3 +15,4 @@ Adopted results do not live here; they go to `engines/` and `profiles.toml` (`do
 | `flash-next/` | Strata decode harness for Qwen3.8 Flash-Next (`docs/flash-next-speed-research.md`) |
 | `dual-gpu/` | the 4070 as the XTX engine's expert helper: agent replay and coding tests (`docs/dual-gpu-research.md`) |
 | `inkling-loom/` | Loom kernels and benchmarks for Inkling-2-Mini (`docs/inkling-loom-research.md`) |
+| `benchmarks/` | public benchmarks against a served model: GPQA Diamond (`docs/gpqa-diamond-2026-11-26.md`) |
